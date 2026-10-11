@@ -9,6 +9,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_webrtc: ^1.6.2+hotfix.4
+  web_socket_channel: ^2.4.0
   google_fonts: ^6.2.1
   cupertino_icons: ^1.0.8
   flutter_svg: ^2.0.10+1
