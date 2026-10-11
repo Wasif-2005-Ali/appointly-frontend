@@ -1,0 +1,40 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1B5EA8"/>
+      <stop offset="100%" stop-color="#0B2447"/>
+    </linearGradient>
+    <linearGradient id="header" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3D8EE8"/>
+      <stop offset="100%" stop-color="#1B5EA8"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3D8EE8"/>
+      <stop offset="100%" stop-color="#1B5EA8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Calendar rings / pins at top -->
+  <rect x="29" y="7" width="11" height="22" rx="5.5" fill="url(#ring)"/>
+  <rect x="60" y="7" width="11" height="22" rx="5.5" fill="url(#ring)"/>
+
+  <!-- Calendar body -->
+  <rect x="7" y="18" width="86" height="72" rx="13" fill="url(#body)"/>
+
+  <!-- Header strip -->
+  <rect x="7" y="18" width="86" height="29" rx="13" fill="url(#header)"/>
+  <!-- Cover bottom-curve of header strip -->
+  <rect x="7" y="35" width="86" height="12" fill="url(#header)"/>
+
+  <!-- Thin divider line -->
+  <rect x="7" y="46" width="86" height="1.5" fill="white" opacity="0.15"/>
+
+  <!-- Bold white checkmark -->
+  <path d="M27 60 L42 76 L73 43"
+        stroke="white"
+        stroke-width="9"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        fill="none"
+        opacity="0.95"/>
+</svg>
