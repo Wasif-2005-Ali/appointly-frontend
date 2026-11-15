@@ -41,7 +41,7 @@ class _AppointlyRootState extends State<AppointlyRoot> {
   void initState() {
     super.initState();
     _appState.addListener(() => setState(() {}));
-    // Load all appointments from SQLite into AppState
+    // Load appointments from the backend (falls back to SQLite when offline)
     _appState.loadAppointments();
   }
 

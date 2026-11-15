@@ -3,7 +3,8 @@ import 'package:flutter/material.dart';
 import 'user_session.dart';
 import 'database/bd_helper.dart';
 import 'models/appointment.dart';
-import 'models/personal_task.dart';
+import 'services/api_client.dart';
+import 'services/appointment_service.dart';
 
 /// Available app themes — 5 preset pairs + 1 fully-custom slot
 enum AppThemeMode {
@@ -499,10 +500,56 @@ class AppState extends ChangeNotifier {
   int _maxPerDay     = 8;
   int _bufferMinutes = 15;
 
+  /// IANA time zone of my published schedule. The API needs one but the
+  /// UI has no time-zone picker, so this defaults to the user's zone and
+  /// is refreshed from the server whenever the schedule loads.
+  String _availabilityTimezone = 'Asia/Karachi';
+
   Map<String, bool> get availabilityDays    => Map.unmodifiable(_availDays);
   Map<String, List<List<String>>> get availabilitySlots => Map.unmodifiable(_availSlots);
   int get maxPerDay      => _maxPerDay;
   int get bufferMinutes  => _bufferMinutes;
+
+  /// "9:00 AM" (or 24-hour "9:00") → "09:00" for the API.
+  static String _to24h(String t) {
+    final m = RegExp(r'(\d{1,2}):(\d{2})\s*([AaPp][Mm])?').firstMatch(t.trim());
+    if (m == null) return '09:00';
+    var h = int.parse(m.group(1)!);
+    final min = m.group(2)!;
+    final period = m.group(3)?.toUpperCase();
+    if (period == 'PM' && h != 12) h += 12;
+    if (period == 'AM' && h == 12) h = 0;
+    return '${h.toString().padLeft(2, '0')}:$min';
+  }
+
+  /// "09:00" → "9:00 AM" for the UI.
+  static String _to12h(String t) {
+    final parts = t.split(':');
+    final h24 = int.tryParse(parts[0]) ?? 9;
+    final min = parts.length > 1 ? parts[1] : '00';
+    final period = h24 < 12 ? 'AM' : 'PM';
+    final h12 = h24 == 0 ? 12 : (h24 > 12 ? h24 - 12 : h24);
+    return '$h12:$min $period';
+  }
+
+  static const _weekdayKeys = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+  /// Applies a schedule fetched from the API to the local day/slot maps.
+  void _applyApiSchedule(WeeklySchedule schedule) {
+    if (schedule.timezone != null && schedule.timezone!.isNotEmpty) {
+      _availabilityTimezone = schedule.timezone!;
+    }
+    for (final day in _weekdayKeys) {
+      _availDays[day] = false;
+      _availSlots[day] = [];
+    }
+    for (final rule in schedule.rules) {
+      if (rule.weekday < 0 || rule.weekday > 6) continue;
+      final day = _weekdayKeys[rule.weekday];
+      _availDays[day] = true;
+      _availSlots[day]!.add([_to12h(rule.startsAt), _to12h(rule.endsAt)]);
+    }
+  }
 
   Future<void> updateAvailability({
     required Map<String, bool> days,
@@ -510,6 +557,28 @@ class AppState extends ChangeNotifier {
     int maxPerDay     = 8,
     int bufferMinutes = 15,
   }) async {
+    // Publish to the backend first — the server validates the rules
+    // (no overlaps per weekday, end after start). Throws [ApiException]
+    // on failure so the screen can show the error instead of "saved".
+    // Note: maxPerDay / bufferMinutes have no backend fields and stay
+    // local-only, as before.
+    final rules = <AvailabilityRule>[];
+    for (var i = 0; i < _weekdayKeys.length; i++) {
+      final day = _weekdayKeys[i];
+      if (days[day] != true) continue;
+      for (final slot in slots[day] ?? const <List<String>>[]) {
+        if (slot.length < 2) continue;
+        rules.add(AvailabilityRule(
+          weekday: i,
+          startsAt: _to24h(slot[0]),
+          endsAt: _to24h(slot[1]),
+        ));
+      }
+    }
+    await AppointmentService.instance.setMyAvailability(
+      timezone: _availabilityTimezone,
+      rules: rules,
+    );
     _availDays = Map.from(days);
     _availSlots = {};
     slots.forEach((k, v) =>
@@ -533,19 +602,31 @@ class AppState extends ChangeNotifier {
     if (userId == null) return;
     final savedTheme = UserSession.instance.themeMode;
     _applyEncodedTheme(savedTheme);
-    _appointments = await DBHelper.instance.getAllAppointments(userId);
-    // Load persisted availability
-    final avail = await DBHelper.instance.loadAvailability(userId);
-    if (avail != null) {
-      try {
-        final dMap = jsonDecode(avail['days']!) as Map<String, dynamic>;
-        dMap.forEach((k, v) { if (_availDays.containsKey(k)) _availDays[k] = v as bool; });
-        final sMap = jsonDecode(avail['slots']!) as Map<String, dynamic>;
-        sMap.forEach((k, v) {
-          _availSlots[k] = (v as List).map<List<String>>((r) =>
-              (r as List).map<String>((e) => e.toString()).toList()).toList();
-        });
-      } catch (_) { /* keep defaults if parse fails */ }
+    // Appointments come from the backend now (falls back to the local
+    // SQLite cache when offline — see loadAppointments).
+    await loadAppointments();
+    // Availability comes from the backend too; fall back to the local
+    // SQLite cache when the request fails.
+    bool availLoaded = false;
+    try {
+      _applyApiSchedule(await AppointmentService.instance.fetchMyAvailability());
+      availLoaded = true;
+    } on ApiException {
+      // Fall through to the SQLite cache below.
+    }
+    if (!availLoaded) {
+      final avail = await DBHelper.instance.loadAvailability(userId);
+      if (avail != null) {
+        try {
+          final dMap = jsonDecode(avail['days']!) as Map<String, dynamic>;
+          dMap.forEach((k, v) { if (_availDays.containsKey(k)) _availDays[k] = v as bool; });
+          final sMap = jsonDecode(avail['slots']!) as Map<String, dynamic>;
+          sMap.forEach((k, v) {
+            _availSlots[k] = (v as List).map<List<String>>((r) =>
+                (r as List).map<String>((e) => e.toString()).toList()).toList();
+          });
+        } catch (_) { /* keep defaults if parse fails */ }
+      }
     }
     await autoCompleteExpired();
     notifyListeners();
@@ -566,32 +647,17 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> loadAppointments() async {
-    final userId = UserSession.instance.userId;
-    if (userId == null) return;
-    _appointments = await DBHelper.instance.getAllAppointments(userId);
-    // ── Heal any existing conflicts in DB ──────────────────────────────
-    // If two confirmed appointments overlap, the earlier-inserted one wins
-    // (lower id = booked first). Downgrade the later one to pending.
-    _appointments.sort((a, b) => (a.id ?? 0).compareTo(b.id ?? 0));
-    final healed = <int>{};
-    for (int i = 0; i < _appointments.length; i++) {
-      final a = _appointments[i];
-      if (a.status == ApptStatus.cancelled || healed.contains(a.id)) continue;
-      final aStart = a.dateTime.millisecondsSinceEpoch;
-      final aEnd   = aStart + _durationMins(a.duration) * 60000;
-      for (int j = i + 1; j < _appointments.length; j++) {
-        final b = _appointments[j];
-        if (b.status == ApptStatus.cancelled || healed.contains(b.id)) continue;
-        final bStart = b.dateTime.millisecondsSinceEpoch;
-        final bEnd   = bStart + _durationMins(b.duration) * 60000;
-        if (aStart < bEnd && aEnd > bStart) {
-          // b was booked later — downgrade to pending
-          if (b.id != null) {
-            healed.add(b.id!);
-            await DBHelper.instance.updateAppointmentStatus(b.id!, ApptStatus.pending);
-            _appointments[j] = _appointments[j].copyWith(status: ApptStatus.pending);
-          }
-        }
+    try {
+      // The backend is the source of truth now. It already rejects
+      // overlapping active appointments, so the old local conflict
+      // healing is no longer needed.
+      _appointments = await AppointmentService.instance.listAppointments();
+    } on ApiException {
+      // Offline or server error — fall back to the local SQLite cache
+      // so the app still shows the previously stored appointments.
+      final userId = UserSession.instance.userId;
+      if (userId != null) {
+        _appointments = await DBHelper.instance.getAllAppointments(userId);
       }
     }
     _appointments.sort((a, b) => a.dateTime.compareTo(b.dateTime));
@@ -616,56 +682,35 @@ class AppState extends ChangeNotifier {
     if (parsed != null) _themeMode = parsed;
   }
 
-  // Returns list of appointment names that were auto-cancelled due to conflict
+  /// Books a new appointment through the backend. [appt.providerId] is
+  /// required (the provider being booked with); the new appointment
+  /// starts as `pending` until the provider accepts it.
+  ///
+  /// Returns an empty list on success. Throws [ApiException] on failure
+  /// (e.g. a 409 when the time conflicts, or a 400 when the time is
+  /// outside the provider's availability) — the booking screen shows
+  /// the message and keeps the form open.
+  ///
+  /// The old local conflict downgrade is gone: the server is the one
+  /// that rejects overlapping times now.
   Future<List<String>> addAppointment(Appointment appt) async {
-    final userId = UserSession.instance.userId ?? 0;
-    final id     = await DBHelper.instance.insertAppointment(appt, userId);
-    appt.id = id;
-    // appt_number was computed inside insertAppointment — reload it from DB
-    // so the in-memory object shows the ordinal badge immediately
-    final fresh = await DBHelper.instance.getAppointmentById(id);
-    if (fresh != null) appt.apptNumber = fresh.apptNumber;
-    _appointments.add(appt);
+    final providerId = appt.providerId;
+    if (providerId == null || providerId.isEmpty) {
+      throw const ApiException(
+          'Enter the provider\'s user ID to book an appointment.');
+    }
+    final endsAt =
+        appt.dateTime.add(Duration(minutes: _durationMins(appt.duration)));
+    final created = await AppointmentService.instance.createAppointment(
+      providerId: providerId,
+      startsAt: appt.dateTime,
+      endsAt: endsAt,
+      notes: appt.note,
+    );
+    _appointments.add(created);
     _appointments.sort((a, b) => a.dateTime.compareTo(b.dateTime));
-
-    // ── Conflict detection ─────────────────────────────────────────────
-    // The FIRST (existing) confirmed appointment always wins.
-    // If the new appointment overlaps an existing one, downgrade the NEW one to pending.
-    final cancelled = <String>[];
-    final newStartDt = appt.dateTime;
-    final newEndDt   = newStartDt.add(Duration(minutes: _durationMins(appt.duration)));
-    final newStart   = newStartDt.millisecondsSinceEpoch;
-    final newEnd     = newEndDt.millisecondsSinceEpoch;
-
-    bool hasConflict = false;
-    for (final existing in _appointments) {
-      if (existing.id == appt.id) continue;
-      if (existing.status == ApptStatus.cancelled) continue;
-      final exStart = existing.dateTime.millisecondsSinceEpoch;
-      final exEnd   = exStart + _durationMins(existing.duration) * 60000;
-      if (newStart < exEnd && newEnd > exStart) {
-        hasConflict = true;
-        cancelled.add(existing.name); // report the conflict name
-      }
-    }
-
-    // Also check personal tasks
-    final taskBlock = PersonalTaskStore.instance.conflictFor(newStartDt, newEndDt);
-    if (taskBlock != null) {
-      hasConflict = true;
-      cancelled.add('Task: ${taskBlock.title}');
-    }
-
-    // If conflict found, downgrade the NEW appointment to pending (existing stays confirmed)
-    if (hasConflict) {
-      appt.status = ApptStatus.pending;
-      await DBHelper.instance.updateAppointmentStatus(appt.id!, ApptStatus.pending);
-      final idx = _appointments.indexWhere((a) => a.id == appt.id);
-      if (idx != -1) _appointments[idx].status = ApptStatus.pending;
-    }
-
     notifyListeners();
-    return cancelled;
+    return const [];
   }
 
   int _durationMins(String d) {
@@ -678,20 +723,92 @@ class AppState extends ChangeNotifier {
     return 30;
   }
 
-  Future<void> updateAppointment(Appointment appt) async {
-    await DBHelper.instance.updateAppointment(appt);
-    final idx = _appointments.indexWhere((a) => a.id == appt.id);
-    if (idx != -1) _appointments[idx] = appt;
+  void _replaceInMemory(Appointment updated) {
+    final idx = _appointments.indexWhere((a) => a.id == updated.id);
+    if (idx != -1) _appointments[idx] = updated;
     notifyListeners();
   }
 
+  /// Updates an appointment. The backend decides what is allowed:
+  /// - a changed start time → PATCH reschedule (requester only, and only
+  ///   while the appointment is pending or accepted; the status is NOT
+  ///   changed by a reschedule, so a `confirmed` status passed in by the
+  ///   reschedule screens is ignored);
+  /// - a changed status → the matching status endpoint (see
+  ///   [updateAppointmentStatus]);
+  /// - anything else (e.g. the cancellation note) is local-only and is
+  ///   kept in SQLite + memory, since the API has no such field.
+  /// Throws [ApiException] when the backend rejects the change.
+  Future<void> updateAppointment(Appointment appt) async {
+    final stored = appt.id == null
+        ? null
+        : _appointments
+            .where((a) => a.id == appt.id)
+            .firstOrNull;
+    if (stored != null && appt.dateTime != stored.dateTime) {
+      final updated = await AppointmentService.instance.rescheduleAppointment(
+        id: appt.id!,
+        startsAt: appt.dateTime,
+        endsAt: appt.dateTime.add(
+            Duration(minutes: _durationMins(appt.duration))),
+      );
+      // Server is authoritative for times/status; keep the local note.
+      _replaceInMemory(
+          updated.copyWith(cancellationNote: appt.cancellationNote));
+      return;
+    }
+    if (stored != null && appt.status != stored.status) {
+      await updateAppointmentStatus(appt.id!, appt.status);
+    }
+    // Local-only fields (notes): persist to SQLite and keep in memory.
+    await DBHelper.instance.updateAppointment(appt);
+    final idx = _appointments.indexWhere((a) => a.id == appt.id);
+    if (idx != -1) {
+      _appointments[idx] = _appointments[idx].copyWith(
+        note: appt.note,
+        cancellationNote: appt.cancellationNote,
+      );
+    }
+    notifyListeners();
+  }
+
+  /// Changes an appointment's status through the backend:
+  /// - `cancelled` → POST cancel (either participant, pending/accepted);
+  /// - `confirmed` → POST accept (provider only, pending only).
+  /// `pending`, `completed` and `rejected` have no API transition and
+  /// stay local-only (the backend has no "complete" endpoint, so
+  /// [autoCompleteExpired] remains a local display state).
+  /// Throws [ApiException] when the backend rejects the change.
   Future<void> updateAppointmentStatus(int id, ApptStatus status) async {
+    if (status == ApptStatus.cancelled) {
+      _replaceInMemory(await AppointmentService.instance.cancelAppointment(id));
+      return;
+    }
+    if (status == ApptStatus.confirmed) {
+      _replaceInMemory(await AppointmentService.instance.acceptAppointment(id));
+      return;
+    }
     await DBHelper.instance.updateAppointmentStatus(id, status);
     final idx = _appointments.indexWhere((a) => a.id == id);
     if (idx != -1) _appointments[idx].status = status;
     notifyListeners();
   }
 
+  /// Accepts an incoming request (provider only, pending only).
+  /// Throws [ApiException] when the backend rejects it.
+  Future<void> acceptAppointment(int id) async {
+    _replaceInMemory(await AppointmentService.instance.acceptAppointment(id));
+  }
+
+  /// Declines an incoming request (provider only, pending only).
+  /// Throws [ApiException] when the backend rejects it.
+  Future<void> rejectAppointment(int id) async {
+    _replaceInMemory(await AppointmentService.instance.rejectAppointment(id));
+  }
+
+  /// Removes an appointment from the local list only. The backend has
+  /// no delete endpoint, so a removed appointment comes back on the
+  /// next reload from the server.
   Future<void> deleteAppointment(int id) async {
     await DBHelper.instance.deleteAppointment(id);
     _appointments.removeWhere((a) => a.id == id);
