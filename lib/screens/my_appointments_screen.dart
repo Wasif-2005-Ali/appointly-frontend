@@ -5,6 +5,7 @@ import '../theme/app_theme.dart';
 import '../app_state.dart';
 import '../theme/dark_theme.dart';
 import '../models/appointment.dart';
+import '../services/api_client.dart';
 import '../models/personal_task.dart' show PersonalTaskStore;
 import 'action_screens.dart';
 
@@ -46,9 +47,9 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
     final all = _allAppts;
     switch (_selectedFilter) {
       case 1: return all.where((a) => a.isToday).toList();
-      case 2: return all.where((a) => a.isFuture && a.status != ApptStatus.cancelled && a.status != ApptStatus.completed).toList();
-      case 3: return all.where((a) => a.status == ApptStatus.completed || (a.isPast && a.status != ApptStatus.cancelled)).toList();
-      case 4: return all.where((a) => a.status == ApptStatus.cancelled).toList();
+      case 2: return all.where((a) => a.isFuture && a.status != ApptStatus.cancelled && a.status != ApptStatus.rejected && a.status != ApptStatus.completed).toList();
+      case 3: return all.where((a) => a.status == ApptStatus.completed || (a.isPast && a.status != ApptStatus.cancelled && a.status != ApptStatus.rejected)).toList();
+      case 4: return all.where((a) => a.status == ApptStatus.cancelled || a.status == ApptStatus.rejected).toList();
       default: return all;
     }
   }
@@ -78,11 +79,11 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
     final todayAppts = appState.appointments.where((a) => a.isToday).toList();
     final confirmed  = todayAppts.where((a) => a.status == ApptStatus.confirmed).length;
 
-    // Per-day sequential numbers; cancelled appointments get null (no number badge).
+    // Per-day sequential numbers; cancelled/rejected appointments get null (no number badge).
     final items = _filtered;
     final Map<String, int> _dayCounts = {};
     final List<int?> dayNumbers = items.map((appt) {
-      if (appt.status == ApptStatus.cancelled) return null;
+      if (appt.status == ApptStatus.cancelled || appt.status == ApptStatus.rejected) return null;
       _dayCounts[appt.displayDate] = (_dayCounts[appt.displayDate] ?? 0) + 1;
       return _dayCounts[appt.displayDate];
     }).toList();
@@ -117,8 +118,20 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
                         index: i,
                         dayNumber: dayNumbers[i],
                         onStatusChanged: (id, newStatus) async {
-                          await AppStateProvider.of(context)
-                              .updateAppointmentStatus(id, newStatus);
+                          try {
+                            await AppStateProvider.of(context)
+                                .updateAppointmentStatus(id, newStatus);
+                          } on ApiException catch (e) {
+                            if (!context.mounted) return;
+                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                              content: Text(e.message,
+                                  style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                              backgroundColor: const Color(0xFFE05C5C),
+                              behavior: SnackBarBehavior.floating,
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14)),
+                            ));
+                          }
                         },
                         onDelete: (id) async {
                           await AppStateProvider.of(context).deleteAppointment(id);
@@ -466,6 +479,7 @@ class _ApptCardState extends State<_ApptCard>
       case ApptStatus.pending:   return const Color(0xFFF4A24A);
       case ApptStatus.cancelled: return const Color(0xFFE05C5C);
       case ApptStatus.completed: return const Color(0xFF2E7D32);
+      case ApptStatus.rejected:  return const Color(0xFFC62828);
     }
   }
 
@@ -475,6 +489,7 @@ class _ApptCardState extends State<_ApptCard>
       case ApptStatus.pending:   return 'Pending';
       case ApptStatus.cancelled: return 'Cancelled';
       case ApptStatus.completed: return 'Completed';
+      case ApptStatus.rejected:  return 'Rejected';
     }
   }
 
@@ -487,23 +502,39 @@ class _ApptCardState extends State<_ApptCard>
         appointment: widget.appointment,
         onCancel: (String note) async {
           final id = widget.appointment.id;
-          if (id == null) return;
-          // Cancel with note
-          await widget.onStatusChanged(id, ApptStatus.cancelled);
-          // Also persist the cancellation note
+          if (id == null) return false;
+          try {
+            await AppStateProvider.of(context)
+                .updateAppointmentStatus(id, ApptStatus.cancelled);
+          } on ApiException catch (e) {
+            // The backend rejected the cancel (e.g. the appointment was
+            // already cancelled). Show the reason and keep the sheet open.
+            if (!context.mounted) return false;
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text(e.message,
+                  style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+              backgroundColor: const Color(0xFFE05C5C),
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14)),
+            ));
+            return false;
+          }
+          // Persist the cancellation note (local-only: the API has no
+          // such field) and show the confirmation banner.
           final updated = widget.appointment.copyWith(
             status: ApptStatus.cancelled,
             cancellationNote: note,
           );
-          // Update via onReschedule pathway (reuse update mechanism)
-          // We fire a status change then update note via reschedule callback
-          if (!context.mounted) return;
+          await AppStateProvider.of(context).updateAppointment(updated);
+          if (!context.mounted) return false;
           _showNotificationBanner(
             context,
             clientName: widget.appointment.name,
             action: 'cancellation',
             note: note,
           );
+          return true;
         },
         onReschedule: () {
           Navigator.pop(context); // close the sheet
@@ -518,7 +549,7 @@ class _ApptCardState extends State<_ApptCard>
     super.build(context); // required by AutomaticKeepAliveClientMixin
     AppStateProvider.of(context);
     final a = widget.appointment;
-    final isCancelled = a.status == ApptStatus.cancelled;
+    final isCancelled = a.status == ApptStatus.cancelled || a.status == ApptStatus.rejected;
     final isCompleted = a.status == ApptStatus.completed;
 
     return SlideTransition(
@@ -1261,7 +1292,24 @@ class _RescheduleScreenState extends State<RescheduleScreen> with DarkMode {
             ),
             GestureDetector(
               onTap: () async {
-                await widget.onConfirm(_newDateTime, note: _noteCtrl.text.trim());
+                try {
+                  await widget.onConfirm(_newDateTime, note: _noteCtrl.text.trim());
+                } on ApiException catch (e) {
+                  // The backend rejected the reschedule (e.g. the other
+                  // party already booked that time, or this appointment
+                  // can no longer be rescheduled). Stay on the screen
+                  // and show the reason instead of popping.
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                    content: Text(e.message,
+                        style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                    backgroundColor: const Color(0xFFE05C5C),
+                    behavior: SnackBarBehavior.floating,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                  ));
+                  return;
+                }
                 if (mounted) {
                   Navigator.pop(context);
                   ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -1314,7 +1362,9 @@ class _RescheduleScreenState extends State<RescheduleScreen> with DarkMode {
 
 class _EmergencyActionSheet extends StatefulWidget {
   final Appointment                  appointment;
-  final Future<void> Function(String note) onCancel;
+  /// Returns true when the cancellation succeeded (sheet may close),
+  /// false when it failed (sheet stays open).
+  final Future<bool> Function(String note) onCancel;
   final VoidCallback                 onReschedule;
 
   const _EmergencyActionSheet({
@@ -1698,8 +1748,15 @@ class _EmergencyActionSheetState extends State<_EmergencyActionSheet> with DarkM
                 Expanded(child: GestureDetector(
                   onTap: _saving ? null : () async {
                     setState(() => _saving = true);
-                    await widget.onCancel(_effectiveNote);
-                    if (mounted) Navigator.pop(context);
+                    final ok = await widget.onCancel(_effectiveNote);
+                    if (!mounted) return;
+                    if (ok) {
+                      Navigator.pop(context);
+                    } else {
+                      // Cancellation failed (the error was already shown);
+                      // keep the sheet open so the user can retry.
+                      setState(() => _saving = false);
+                    }
                   },
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 180),

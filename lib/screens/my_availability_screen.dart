@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../theme/app_theme.dart';
 import '../app_state.dart';
+import '../services/api_client.dart';
 import '../theme/dark_theme.dart';
 import '../widgets/save_icon_button.dart';
 
@@ -745,7 +746,26 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
   }
 
   Future<void> _showSaved() async {
-    await _persistToAppState();
+    try {
+      await _persistToAppState();
+    } on ApiException catch (e) {
+      // The backend rejected the schedule (e.g. overlapping slots on
+      // the same day). Show the reason instead of "saved".
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: const Color(0xFFE05C5C),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        content: Row(children: [
+          const Icon(Icons.error_outline_rounded, color: Colors.white, size: 18),
+          const SizedBox(width: 10),
+          Expanded(child: Text(e.message, style: GoogleFonts.dmSans(
+              fontWeight: FontWeight.w700, color: Colors.white))),
+        ]),
+      ));
+      return;
+    }
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       behavior: SnackBarBehavior.floating,
       backgroundColor: dmAccent,

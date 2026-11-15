@@ -4,6 +4,7 @@ import '../app_state.dart';
 import '../theme/app_theme.dart';
 import '../theme/dark_theme.dart';
 import '../models/appointment.dart';
+import '../services/api_client.dart';
 import '../models/personal_task.dart' show PersonalTaskStore;
 import 'incoming_requests_screen.dart';
 import 'my_appointments_screen.dart' show RescheduleScreen;
@@ -83,7 +84,26 @@ class _RequestDetailScreenState extends State<RequestDetailScreen> with DarkMode
               const SizedBox(height: 24),
               Row(children: [
                 Expanded(child: GestureDetector(
-                  onTap: () { setState(() => _req.status = RequestStatus.declined); Navigator.pop(context); },
+                  onTap: () async {
+                    final id = _req.appointmentId;
+                    if (id != null) {
+                      try {
+                        await AppStateProvider.of(context).rejectAppointment(id);
+                      } on ApiException catch (e) {
+                        if (!context.mounted) return;
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                          content: Text(e.message,
+                              style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                          backgroundColor: AppColors.danger,
+                          behavior: SnackBarBehavior.floating,
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14))));
+                        return;
+                      }
+                    }
+                    setState(() => _req.status = RequestStatus.declined);
+                    if (context.mounted) Navigator.pop(context);
+                  },
                   child: Container(padding: const EdgeInsets.symmetric(vertical: 16),
                     decoration: BoxDecoration(color: AppColors.danger.withOpacity(0.08),
                         borderRadius: BorderRadius.circular(16), border: Border.all(color: AppColors.danger.withOpacity(0.25))),
@@ -94,7 +114,23 @@ class _RequestDetailScreenState extends State<RequestDetailScreen> with DarkMode
                 )),
                 const SizedBox(width: 12),
                 Expanded(child: GestureDetector(
-                  onTap: () {
+                  onTap: () async {
+                    final id = _req.appointmentId;
+                    if (id != null) {
+                      try {
+                        await AppStateProvider.of(context).acceptAppointment(id);
+                      } on ApiException catch (e) {
+                        if (!context.mounted) return;
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                          content: Text(e.message,
+                              style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                          backgroundColor: AppColors.danger,
+                          behavior: SnackBarBehavior.floating,
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14))));
+                        return;
+                      }
+                    }
                     setState(() => _req.status = RequestStatus.accepted);
                     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                       content: Text('${_req.clientName}\'s request accepted!', style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
@@ -201,14 +237,30 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
         appointment: _appt,
         onCancel: (String note) async {
           final id = _appt.id;
-          if (id == null) return;
-          await appState.updateAppointmentStatus(id, ApptStatus.cancelled);
+          if (id == null) return false;
+          try {
+            await appState.updateAppointmentStatus(id, ApptStatus.cancelled);
+          } on ApiException catch (e) {
+            // The backend rejected the cancel (e.g. the appointment was
+            // already cancelled). Show the reason and keep the sheet open.
+            if (!mounted) return false;
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text(e.message,
+                  style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+              backgroundColor: const Color(0xFFE05C5C),
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14)),
+            ));
+            return false;
+          }
           final updated = _appt.copyWith(
               status: ApptStatus.cancelled, cancellationNote: note);
           await appState.updateAppointment(updated);
-          if (!mounted) return;
+          if (!mounted) return false;
           setState(() => _appt = updated);
           _showNotificationBanner(clientName: _appt.name, note: note);
+          return true;
         },
         onReschedule: () {
           Navigator.pop(context); // close reason sheet
@@ -224,7 +276,17 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
                       cancellationNote: note);
                   await appState.updateAppointment(updated);
                   if (!mounted) return;
-                  setState(() => _appt = updated);
+                  // The server is authoritative for the status: a
+                  // reschedule does NOT confirm a pending appointment,
+                  // so re-read it from AppState instead of assuming
+                  // the local copy's status.
+                  final fresh = appState.appointments
+                      .where((a) => a.id == _appt.id)
+                      .firstOrNull;
+                  if (fresh != null) {
+                    setState(() => _appt =
+                        fresh.copyWith(cancellationNote: note));
+                  }
                   final h  = newDt.hour == 0 ? 12 : (newDt.hour > 12 ? newDt.hour - 12 : newDt.hour);
                   final m  = newDt.minute.toString().padLeft(2, '0');
                   final ap = newDt.hour < 12 ? 'AM' : 'PM';
@@ -312,6 +374,7 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
       case ApptStatus.pending:   return AppColors.warning;
       case ApptStatus.cancelled: return AppColors.danger;
       case ApptStatus.completed: return const Color(0xFF2E7D32);
+      case ApptStatus.rejected:  return const Color(0xFFC62828);
     }
   }
   String get _statusLabel {
@@ -320,6 +383,7 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
       case ApptStatus.pending:   return 'Pending';
       case ApptStatus.cancelled: return 'Cancelled';
       case ApptStatus.completed: return 'Completed';
+      case ApptStatus.rejected:  return 'Rejected';
     }
   }
   IconData get _statusIcon {
@@ -328,6 +392,7 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
       case ApptStatus.pending:   return Icons.hourglass_top_rounded;
       case ApptStatus.cancelled: return Icons.cancel_rounded;
       case ApptStatus.completed: return Icons.task_alt_rounded;
+      case ApptStatus.rejected:  return Icons.block_rounded;
     }
   }
 
@@ -407,7 +472,8 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
             const SizedBox(height: 14),
             // ── Action buttons ───────────────────────────────────────────
             if (_appt.status != ApptStatus.cancelled &&
-                _appt.status != ApptStatus.completed) ...[ 
+                _appt.status != ApptStatus.completed &&
+                _appt.status != ApptStatus.rejected) ...[ 
               Row(children: [
                 Expanded(child: _actionBtn(
                   'Cancel Appt.', Icons.cancel_outlined, AppColors.danger,
@@ -417,7 +483,22 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
                 Expanded(child: _actionBtn(
                   'Confirm', Icons.check_circle_outline_rounded, AppColors.green,
                   () async {
-                    await appState.updateAppointmentStatus(_appt.id!, ApptStatus.confirmed);
+                    try {
+                      await appState.updateAppointmentStatus(
+                          _appt.id!, ApptStatus.confirmed);
+                    } on ApiException catch (e) {
+                      // Accept is provider-only — a requester tapping
+                      // Confirm gets a 403, which we surface here.
+                      if (!context.mounted) return;
+                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                        content: Text(e.message,
+                            style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                        backgroundColor: AppColors.danger,
+                        behavior: SnackBarBehavior.floating,
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14))));
+                      return;
+                    }
                     setState(() => _appt = _appt.copyWith(status: ApptStatus.confirmed));
                   },
                   filled: _appt.status != ApptStatus.confirmed,
@@ -522,7 +603,9 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
 
 class _CancelReasonSheet extends StatefulWidget {
   final Appointment                    appointment;
-  final Future<void> Function(String)  onCancel;
+  /// Returns true when the cancellation succeeded (sheet may close),
+  /// false when it failed (sheet stays open).
+  final Future<bool> Function(String)  onCancel;
   final VoidCallback                   onReschedule;
   const _CancelReasonSheet({
     required this.appointment,
@@ -830,8 +913,15 @@ class _CancelReasonSheetState extends State<_CancelReasonSheet> with DarkMode {
                 Expanded(child: GestureDetector(
                   onTap: _saving ? null : () async {
                     setState(() => _saving = true);
-                    await widget.onCancel(_effectiveNote);
-                    if (mounted) Navigator.pop(context);
+                    final ok = await widget.onCancel(_effectiveNote);
+                    if (!mounted) return;
+                    if (ok) {
+                      Navigator.pop(context);
+                    } else {
+                      // Cancellation failed (the error was already shown);
+                      // keep the sheet open so the user can retry.
+                      setState(() => _saving = false);
+                    }
                   },
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 180),
