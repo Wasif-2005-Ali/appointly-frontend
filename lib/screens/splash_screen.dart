@@ -11,8 +11,10 @@
 import 'package:flutter/material.dart';
 import 'package:path_drawing/path_drawing.dart';
 import '../database/bd_helper.dart';
+import '../services/auth_service.dart';
 import '../app_state.dart';
 import '../user_session.dart';
+import 'dashboard_screen.dart';
 import 'login_signup_screen.dart';
 import 'package:google_fonts/google_fonts.dart';
 
@@ -108,15 +110,20 @@ class _SplashScreenState extends State<SplashScreen>
       if (!mounted) return;
       // Ensure DB is ready (runs in background during the 4 s animation — fast)
       await DBHelper.instance.database;
-      // Restore saved session for data pre-loading only — login is always required
-      final savedUser = await DBHelper.instance.restoreSession();
+      // Try to restore the backend session (stored JWT tokens).
+      // If valid, skip the login screen and go straight to the dashboard.
+      Widget next = const WelcomeScreen();
+      final savedUser = await AuthService.instance.restoreSession();
       if (savedUser != null && mounted) {
         UserSession.instance.setFromMap(savedUser);
+        await AppStateProvider.of(context).loadUserData();
+        if (!mounted) return;
+        next = const DashboardScreen();
       }
       if (!mounted) return;
       // Crossfade directly — no pre-fade so no black flash
       Navigator.of(context).pushReplacement(PageRouteBuilder(
-        pageBuilder: (_, __, ___) => const WelcomeScreen(),
+        pageBuilder: (_, __, ___) => next,
         transitionDuration: const Duration(milliseconds: 700),
         reverseTransitionDuration: const Duration(milliseconds: 400),
         transitionsBuilder: (_, anim, __, child) {
