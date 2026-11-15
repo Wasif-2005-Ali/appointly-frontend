@@ -81,6 +81,36 @@ class ApiClient {
     );
   }
 
+  Future<http.Response> patch(
+    String path, {
+    Map<String, dynamic>? body,
+    bool auth = true,
+  }) {
+    return _send(
+      () async => _http.patch(
+        Uri.parse('${ApiConfig.baseUrl}$path'),
+        headers: auth ? await _authHeaders() : _jsonHeaders,
+        body: body == null ? null : jsonEncode(body),
+      ),
+      retryOnAuth: auth,
+    );
+  }
+
+  Future<http.Response> put(
+    String path, {
+    Map<String, dynamic>? body,
+    bool auth = true,
+  }) {
+    return _send(
+      () async => _http.put(
+        Uri.parse('${ApiConfig.baseUrl}$path'),
+        headers: auth ? await _authHeaders() : _jsonHeaders,
+        body: body == null ? null : jsonEncode(body),
+      ),
+      retryOnAuth: auth,
+    );
+  }
+
   /// Runs [request] once; on a 401 (and only for authenticated calls)
   /// refreshes the token and retries once.
   Future<http.Response> _send(
