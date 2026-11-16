@@ -1,10 +1,37 @@
 import 'package:flutter/material.dart';
 
+import '../../services/chat_service.dart';
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENUMS
 // ─────────────────────────────────────────────────────────────────────────────
 enum MessageType   { text, emoji, voice, appointment, image }
 enum MessageStatus { sent, delivered, read }
+
+// Deterministic avatar palette for API rooms (no avatar data on the
+// backend), following the Appointment model's approach.
+const _apiAvatarColors = [
+  Color(0xFF4A90D9),
+  Color(0xFF7C5CBF),
+  Color(0xFF2ECC96),
+  Color(0xFFE8805A),
+  Color(0xFF3B73C0),
+  Color(0xFF2A6AB5),
+];
+
+Color _avatarColorFor(String seed) {
+  var hash = 0;
+  for (final unit in seed.codeUnits) {
+    hash = (hash * 31 + unit) & 0x7fffffff;
+  }
+  return _apiAvatarColors[hash % _apiAvatarColors.length];
+}
+
+/// "9:05 PM" — the same time format the thread screen uses locally.
+String _fmtTime(DateTime dt) {
+  final h = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
+  return '$h:${dt.minute.toString().padLeft(2, '0')} ${dt.hour < 12 ? "AM" : "PM"}';
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  CONVERSATION MODEL
@@ -16,6 +43,9 @@ class ChatConversation {
   String lastMsg, time;
   int unread;
   bool isPinned, isMuted, isArchived;
+  // API-only fields (not in SQLite): group flag + member user IDs.
+  final bool isGroup;
+  final List<String> participantIds;
 
   ChatConversation({
     required this.id,
@@ -29,7 +59,25 @@ class ChatConversation {
     this.isPinned = false,
     this.isMuted  = false,
     this.isArchived = false,
+    this.isGroup = false,
+    this.participantIds = const [],
   });
+
+  /// Maps a backend room to the local conversation model. The room
+  /// list carries no last message, unread count, or presence, so
+  /// those start empty/false and are filled in when a thread opens.
+  factory ChatConversation.fromApi(ChatRoomInfo room) => ChatConversation(
+    id: room.roomId,
+    name: room.name,
+    service: room.isGroup ? 'Group chat' : 'Direct message',
+    avatarColor: _avatarColorFor(room.roomId),
+    online: false,
+    lastMsg: 'No messages yet',
+    time: '',
+    unread: 0,
+    isGroup: room.isGroup,
+    participantIds: room.participants,
+  );
 
   String get initials {
     final parts = name.split(' ');
@@ -78,6 +126,33 @@ class ChatMessage {
     this.appointmentTime,
     this.imageColor,
   }) : reactions = reactions ?? {};
+
+  /// Maps a backend message to the local model. [currentUserId] is
+  /// the logged-in user's ID (as a string) — it decides [fromMe].
+  /// The backend has no replies, reactions, stars, or voice notes,
+  /// so those stay at their local defaults.
+  factory ChatMessage.fromApi(
+    ChatApiMessage msg, {
+    required String? currentUserId,
+  }) {
+    final fromMe = currentUserId != null && msg.senderId == currentUserId;
+    // read_by always contains the sender; anyone else means read.
+    final read = fromMe && msg.readBy.any((id) => id != msg.senderId);
+    return ChatMessage(
+      id: msg.id.isNotEmpty
+          ? msg.id
+          : '${msg.roomId}_${msg.createdAt.millisecondsSinceEpoch}',
+      text: msg.content,
+      fromMe: fromMe,
+      time: _fmtTime(msg.createdAt.toLocal()),
+      type: msg.messageType == 'image'
+          ? MessageType.image
+          : MessageType.text,
+      status: fromMe
+          ? (read ? MessageStatus.read : MessageStatus.delivered)
+          : MessageStatus.delivered,
+    );
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
