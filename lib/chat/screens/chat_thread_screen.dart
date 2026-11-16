@@ -4,6 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../../app_state.dart';
+import '../../services/api_client.dart';
+import '../../services/chat_service.dart';
+import '../../user_session.dart';
 import '../data/chat_db.dart';
 import '../models/chat_models.dart';
 import '../widgets/voice_bubble.dart';
@@ -35,8 +38,19 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   final List<ChatMessage>     _msgs       = [];
 
   bool _typing = false, _showEmoji = false, _clientTyping = false;
-  bool _recording = false, _loadedFromDb = false;
+  bool _recording = false;
   ChatMessage? _replyTo;
+
+  // ── Live chat state ────────────────────────────────────────────────────────
+  ChatRoomConnection? _connection;
+  StreamSubscription? _msgSub, _errSub, _stateSub;
+  bool _loadingHistory = true;
+  bool _wsLive = false;
+  String? _loadError;
+  // Server message IDs already shown (dedupe for the send echo).
+  final Set<String> _seenIds = {};
+  // Optimistic copies of my sends, replaced when the echo arrives.
+  final List<ChatMessage> _pending = [];
 
   late AnimationController _typCtrl, _sendCtrl, _recCtrl;
   int _emojiTab    = 0;
@@ -73,39 +87,117 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   }
 
   Future<void> _initMessages() async {
+    final myId = UserSession.instance.userId?.toString();
     try {
-      final saved = await ChatDB.load(_convId);
-      if (saved.isNotEmpty) {
-        setState(() { _msgs.addAll(saved); _loadedFromDb = true; });
-      } else {
-        _loadHistory();
+      // REST first: it also refreshes an expired access token, which
+      // the WebSocket connection then reuses.
+      final page = await ChatService.instance.listMessages(_convId);
+      if (!mounted) return;
+      final apiMsgs = page.messages
+          .map((m) => ChatMessage.fromApi(m, currentUserId: myId))
+          .toList();
+      setState(() {
+        _msgs.addAll(apiMsgs);
+        _seenIds.addAll(apiMsgs.map((m) => m.id));
+        _loadingHistory = false;
+      });
+      // Fill in the inbox tile preview from the latest message.
+      if (apiMsgs.isNotEmpty) {
+        widget.conversation.lastMsg = apiMsgs.last.text;
+        widget.conversation.time = apiMsgs.last.time;
       }
-    } catch (_) {
-      _loadHistory();
+      // Cache for offline use.
+      for (final m in apiMsgs) {
+        ChatDB.save(_convId, m).catchError((_) {});
+      }
+      _connectLive();
+    } on ApiException catch (e) {
+      // Offline fallback: show locally cached messages.
+      List<ChatMessage> saved = [];
+      try {
+        saved = await ChatDB.load(_convId);
+      } catch (_) {}
+      if (!mounted) return;
+      setState(() {
+        _msgs.addAll(saved);
+        _seenIds.addAll(saved.map((m) => m.id));
+        _loadingHistory = false;
+        _loadError = saved.isEmpty ? e.message : null;
+      });
+      if (saved.isNotEmpty) {
+        _toast('Offline — showing saved messages.');
+        _connectLive();
+      }
     }
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollDown());
   }
 
-  void _loadHistory() {
-    final now = DateTime.now();
-    final t1  = _fmt(now.subtract(const Duration(hours: 2)));
-    final t2  = _fmt(now.subtract(const Duration(hours: 1)));
-    final t3  = _fmt(now.subtract(const Duration(minutes: 15)));
-    final c   = widget.conversation;
-    final day = ['Monday','Tuesday','Wednesday','Thursday','Friday'][now.weekday % 5];
+  /// Open the live WebSocket connection for this room.
+  Future<void> _connectLive() async {
+    try {
+      _connection = await ChatService.instance.connectRoom(_convId);
+    } on ApiException catch (e) {
+      if (mounted) _toast('${e.message} Live updates are off.');
+      return;
+    }
+    _msgSub = _connection!.messages.listen(_onLiveMessage);
+    _errSub = _connection!.errors.listen((e) {
+      if (mounted) _toast(e);
+    });
+    _stateSub = _connection!.states.listen((s) {
+      if (!mounted) return;
+      setState(() => _wsLive = s == ChatConnectionState.connected);
+      if (s == ChatConnectionState.failed) {
+        _toast('Live connection lost. Reopen the chat to reconnect.');
+      }
+    });
+  }
 
-    final m1 = ChatMessage(id:'1', text:'Hi! I wanted to confirm my appointment for $day.', fromMe:false, time:t1, type:MessageType.text, status:MessageStatus.read);
-    final m2 = ChatMessage(id:'2', text:'Hello ${c.name.split(" ").first}! Yes, your ${c.service} appointment is confirmed ✓', fromMe:true, time:t1, type:MessageType.text, status:MessageStatus.read);
-    final m3 = ChatMessage(id:'3', text:'Perfect, thank you! Should I bring anything special?', fromMe:false, time:t2, type:MessageType.text, status:MessageStatus.read);
-    final m4 = ChatMessage(id:'4', text:'Nothing special needed. Just arrive 5 minutes early 😊', fromMe:true, time:t2, type:MessageType.text, status:MessageStatus.read, replyTo:m3);
-    final m5 = ChatMessage(id:'5', text:c.lastMsg, fromMe:false, time:t3, type:MessageType.text, status:MessageStatus.delivered);
-
-    setState(() => _msgs.addAll([m1, m2, m3, m4, m5]));
-    for (final m in _msgs) ChatDB.save(_convId, m).catchError((_) {});
+  /// A message arrived over the WebSocket (from the other side, or the
+  /// server echo of my own send).
+  void _onLiveMessage(ChatApiMessage apiMsg) {
+    if (_seenIds.contains(apiMsg.id)) return;
+    final myId = UserSession.instance.userId?.toString();
+    final msg = ChatMessage.fromApi(apiMsg, currentUserId: myId);
+    ChatMessage? toSave;
+    setState(() {
+      _seenIds.add(apiMsg.id);
+      if (msg.fromMe) {
+        // Replace my optimistic copy (same text, still pending).
+        final idx = _msgs.indexWhere(
+          (m) => _pending.contains(m) && m.text == msg.text,
+        );
+        if (idx >= 0) {
+          final old = _msgs[idx];
+          _pending.remove(old);
+          // Keep the local rendering (e.g. big emoji) of my message.
+          _msgs[idx] = ChatMessage(
+            id: msg.id,
+            text: msg.text,
+            fromMe: true,
+            time: msg.time,
+            type: old.type,
+            status: MessageStatus.delivered,
+          );
+          toSave = _msgs[idx];
+          return;
+        }
+      }
+      _msgs.add(msg);
+      widget.conversation.lastMsg = msg.text;
+      widget.conversation.time = msg.time;
+      toSave = msg;
+    });
+    if (toSave != null) ChatDB.save(_convId, toSave!).catchError((_) {});
+    _scrollDown();
   }
 
   @override
   void dispose() {
+    _msgSub?.cancel();
+    _errSub?.cancel();
+    _stateSub?.cancel();
+    _connection?.close();
     _msgCtrl.dispose(); _scrollCtrl.dispose();
     _typCtrl.dispose(); _sendCtrl.dispose(); _recCtrl.dispose();
     _recTimer?.cancel();
@@ -113,50 +205,55 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   }
 
   // ── Message sending ────────────────────────────────────────────────────────
-  void _send() {
+  // Sends go over the WebSocket; the server broadcasts the saved message
+  // back to the room (including us) and [_onLiveMessage] renders it. The
+  // message below is optimistic — it is replaced by the server echo.
+  // Note: the backend has no reply threading, so a reply quote only
+  // shows on this device until the echo arrives.
+  Future<void> _send() async {
     final text = _msgCtrl.text.trim();
     if (text.isEmpty) return;
+    if (_connection == null || !_wsLive) {
+      _toast('Not connected yet — please wait a moment and try again.');
+      return;
+    }
     _sendCtrl.forward().then((_) => _sendCtrl.reverse());
     final msg = ChatMessage(
       id: _mkId(), text: text, fromMe: true,
       time: _fmt(DateTime.now()), type: MessageType.text,
       replyTo: _replyTo, status: MessageStatus.sent,
     );
-    setState(() { _msgs.add(msg); _msgCtrl.clear(); _typing = false; _showEmoji = false; _replyTo = null; });
-    ChatDB.save(_convId, msg).catchError((_) {});
+    setState(() { _msgs.add(msg); _pending.add(msg); _msgCtrl.clear(); _typing = false; _showEmoji = false; _replyTo = null; });
     _scrollDown();
-    // Simulate delivery + read
-    Future.delayed(const Duration(milliseconds: 600), () {
+    try {
+      await _connection!.sendText(text);
+    } on ApiException catch (e) {
       if (!mounted) return;
-      setState(() => msg.status = MessageStatus.delivered);
-      ChatDB.update(_convId, msg).catchError((_) {});
-    });
-    // Simulate reply
-    Future.delayed(const Duration(milliseconds: 900), () {
-      if (!mounted) return;
-      setState(() => _clientTyping = true);
-      _scrollDown();
-      Future.delayed(const Duration(seconds: 2), () {
-        if (!mounted) return;
-        final reply = ChatMessage(
-          id: _mkId(), text: 'Got it, thanks! 👍', fromMe: false,
-          time: _fmt(DateTime.now()), type: MessageType.text, status: MessageStatus.delivered,
-        );
-        setState(() { _clientTyping = false; msg.status = MessageStatus.read; _msgs.add(reply); });
-        ChatDB.update(_convId, msg).catchError((_) {});
-        ChatDB.save(_convId, reply).catchError((_) {});
-        _scrollDown();
-      });
-    });
+      setState(() { _msgs.remove(msg); _pending.remove(msg); });
+      _toast(e.message);
+    }
   }
 
-  void _sendEmoji(String e) {
+  Future<void> _sendEmoji(String e) async {
+    if (_connection == null || !_wsLive) {
+      _toast('Not connected yet — please wait a moment and try again.');
+      return;
+    }
     final msg = ChatMessage(id: _mkId(), text: e, fromMe: true, time: _fmt(DateTime.now()), type: MessageType.emoji);
-    setState(() { _msgs.add(msg); _showEmoji = false; });
-    ChatDB.save(_convId, msg).catchError((_) {});
+    setState(() { _msgs.add(msg); _pending.add(msg); _showEmoji = false; });
     _scrollDown();
+    try {
+      // Emoji travel as plain text; the server has no emoji type.
+      await _connection!.sendText(e);
+    } on ApiException catch (err) {
+      if (!mounted) return;
+      setState(() { _msgs.remove(msg); _pending.remove(msg); });
+      _toast(err.message);
+    }
   }
 
+  /// Voice notes are device-only: the backend has no audio upload and
+  /// no voice message type, so the other side never sees these.
   void _sendVoice(String dur) {
     final msg = ChatMessage(id: _mkId(), text: dur, fromMe: true, time: _fmt(DateTime.now()), type: MessageType.voice, voiceDuration: dur, status: MessageStatus.sent);
     setState(() => _msgs.add(msg));
@@ -169,7 +266,8 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     });
   }
 
-  /// Send a shared appointment card
+  /// Send a shared appointment card. Device-only: the backend has no
+  /// appointment message type, so the other side never sees these.
   void _sendAppointment(String title, String date, String time) {
     final msg = ChatMessage(
       id: _mkId(), text: 'Appointment shared', fromMe: true,
@@ -223,9 +321,34 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       resizeToAvoidBottomInset: true,
       body: Column(children: [
         _buildHeader(c),
-        Expanded(child: Stack(children: [
-          Positioned.fill(child: CustomPaint(painter: DotBackgroundPainter(_accent.withOpacity(0.025)))),
-          ListView.builder(
+        if (_loadError != null && _msgs.isEmpty)
+          Expanded(child: Center(child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+              Icon(Icons.cloud_off_rounded, size: 52, color: _txtSub.withOpacity(0.4)),
+              const SizedBox(height: 14),
+              Text(_loadError!,
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.dmSans(fontSize: 14, color: _txtSub)),
+              const SizedBox(height: 16),
+              FilledButton(
+                onPressed: () {
+                  setState(() {
+                    _loadingHistory = true;
+                    _loadError = null;
+                  });
+                  _initMessages();
+                },
+                child: const Text('Try again'),
+              ),
+            ]),
+          )))
+        else if (_loadingHistory)
+          const Expanded(child: Center(child: CircularProgressIndicator()))
+        else
+          Expanded(child: Stack(children: [
+            Positioned.fill(child: CustomPaint(painter: DotBackgroundPainter(_accent.withOpacity(0.025)))),
+            ListView.builder(
             controller: _scrollCtrl,
             physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
             padding: const EdgeInsets.fromLTRB(12, 16, 12, 16),
@@ -971,11 +1094,14 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   }
 
   // ── Clear chat ─────────────────────────────────────────────────────────────
+  // Local only: the backend has no delete endpoint, so the server
+  // history stays and reloads next time the chat is opened.
   void _clearChat() => showDialog(context: context, builder: (_) => AlertDialog(
     backgroundColor: _cardBg,
     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
     title: Text('Clear Chat?', style: GoogleFonts.dmSans(fontWeight: FontWeight.w800, color: _txtMain)),
-    content: Text('All messages will be deleted.', style: GoogleFonts.dmSans(color: _txtSub)),
+    content: Text('Messages will be cleared on this device only. They stay on the server and reload next time.',
+        style: GoogleFonts.dmSans(color: _txtSub)),
     actions: [
       TextButton(onPressed: () => Navigator.pop(context),
           child: Text('Cancel', style: GoogleFonts.dmSans(color: _txtSub, fontWeight: FontWeight.w600))),
@@ -1061,7 +1187,10 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
                       ChatDB.save(_convId, fwd).catchError((_) {});
                       _scrollDown();
                     } else {
-                      _showForwardSuccess(c.name);
+                      // Forwarding to another room needs a second live
+                      // connection; not wired yet — say so honestly
+                      // instead of showing a fake success dialog.
+                      _toast('Forwarding to other chats is not available yet.');
                     }
                   },
                   child: Container(margin: const EdgeInsets.only(bottom: 8), padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
@@ -1091,31 +1220,6 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
             )),
           ]),
         ));
-  }
-
-  void _showForwardSuccess(String name) {
-    showDialog(context: context, barrierColor: Colors.black26, builder: (_) => Dialog(
-      backgroundColor: Colors.transparent,
-      child: Container(padding: const EdgeInsets.all(28),
-          decoration: BoxDecoration(color: _cardBg, borderRadius: BorderRadius.circular(24),
-              border: Border.all(color: _border, width: 1.2),
-              boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.15), blurRadius: 30, offset: const Offset(0, 12))]),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Container(width: 64, height: 64, decoration: BoxDecoration(gradient: LinearGradient(colors: _btnGrad), borderRadius: BorderRadius.circular(20),
-                boxShadow: [BoxShadow(color: _btnShadow.withOpacity(0.4), blurRadius: 14, offset: const Offset(0, 4))]),
-                child: const Icon(Icons.check_rounded, color: Colors.white, size: 32)),
-            const SizedBox(height: 18),
-            Text('Message Forwarded', style: GoogleFonts.dmSans(fontSize: 18, fontWeight: FontWeight.w800, color: _txtMain)),
-            const SizedBox(height: 8),
-            Text('Forwarded to $name', style: GoogleFonts.dmSans(fontSize: 13.5, color: _txtSub, height: 1.4), textAlign: TextAlign.center),
-            const SizedBox(height: 22),
-            GestureDetector(onTap: () => Navigator.pop(context),
-                child: Container(width: double.infinity, height: 50,
-                    decoration: BoxDecoration(gradient: LinearGradient(colors: _btnGrad), borderRadius: BorderRadius.circular(16),
-                        boxShadow: [BoxShadow(color: _btnShadow.withOpacity(0.35), blurRadius: 10, offset: const Offset(0, 3))]),
-                    child: Center(child: Text('Done', style: GoogleFonts.dmSans(fontSize: 15, fontWeight: FontWeight.w700, color: Colors.white))))),
-          ])),
-    ));
   }
 
   // ── Delete menu ────────────────────────────────────────────────────────────
