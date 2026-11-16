@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
 import '../app_state.dart';
+import '../services/user_service.dart';
 import '../theme/app_theme.dart';
 import '../theme/dark_theme.dart';
 import '../user_session.dart';
@@ -243,6 +244,17 @@ class _ProfileScreenState extends State<ProfileScreen>
             UserSession.instance.bio           = _bioCtrl.text.trim();
             UserSession.instance.profileStatus = _selectedStatus;
             UserSession.instance.privacyMode   = _privacyMode;
+            // Sync the name to the server so other users see it in
+            // search and chat. Best-effort: the local save above
+            // already ran, so a failure here only leaves the server
+            // copy as it was.
+            try {
+              await UserService.instance.updateProfile(
+                fullName: _nameCtrl.text.trim(),
+              );
+            } catch (_) {
+              // Offline or server error — local profile is saved.
+            }
           },
         ),
       ]),
@@ -679,7 +691,50 @@ class _ProfileScreenState extends State<ProfileScreen>
     _editField('Email Address', _emailCtrl, Icons.email_outlined),
     const SizedBox(height: 12),
     _editField('Phone Number', _phoneCtrl, Icons.phone_outlined),
+    const SizedBox(height: 12),
+    _buildIdRow(),
   ]));
+
+  /// The user's own numeric ID, with a copy button — other users need
+  /// this ID to start a chat, call, or book with you (or they can
+  /// just search your name in the picker).
+  Widget _buildIdRow() {
+    final id = UserSession.instance.userId;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: dmCard2,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(children: [
+        Icon(Icons.badge_outlined, color: dmAccent, size: 20),
+        const SizedBox(width: 12),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Your ID', style: GoogleFonts.dmSans(fontSize: 11, color: dmTxtSub,
+              fontWeight: FontWeight.w700, letterSpacing: 0.5)),
+          const SizedBox(height: 2),
+          Text(id == null ? '—' : '$id',
+              style: GoogleFonts.dmSans(fontSize: 15, color: dmTxtMain,
+                  fontWeight: FontWeight.w800)),
+        ])),
+        IconButton(
+          onPressed: id == null ? null : () async {
+            await Clipboard.setData(ClipboardData(text: '$id'));
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text('Your ID ($id) copied — share it with anyone who wants to reach you.',
+                  style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+              backgroundColor: const Color(0xFF2ECC96),
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+            ));
+          },
+          icon: Icon(Icons.copy_rounded, color: dmAccent, size: 20),
+          tooltip: 'Copy ID',
+        ),
+      ]),
+    );
+  }
 
   Widget _buildBioCard() => _card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
     _cardTitle('About Me', Icons.info_outline_rounded, dmAccent),

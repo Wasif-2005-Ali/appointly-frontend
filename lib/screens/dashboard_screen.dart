@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../app_state.dart';
 import '../services/api_client.dart';
+import '../services/chat_service.dart';
 import '../widgets/drawer_widget.dart';
 import '../widgets/appointly_hand_icon.dart';
 import '../models/appointment.dart';
@@ -58,6 +59,10 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   int    _selectedDayIndex = 0; // set in initState to today
   bool   _showNotifications = false;
+
+  // Real total unread chat messages (header badge). Loaded in
+  // initState and refreshed when returning from the inbox.
+  int _unreadChats = 0;
 
   // ── Chart filters ──────────────────────────────────────────────────────────
   String _chartPeriod = 'This Week';
@@ -376,6 +381,9 @@ class _DashboardScreenState extends State<DashboardScreen>
     // Load persisted FAB position
     _loadFabPosition();
 
+    // Real unread-chat total for the header badge.
+    _loadUnreadChats();
+
     // Add scroll listeners
     void addListener(ScrollController ctrl) => ctrl.addListener(() => _onScroll(ctrl));
     addListener(_homeScrollCtrl);
@@ -422,6 +430,19 @@ class _DashboardScreenState extends State<DashboardScreen>
     });
     // Sync the ValueNotifier so the lightweight FAB overlay shows the correct position
     _fabPosNotifier.value = Offset(_fabRight, _fabBottom);
+  }
+
+  /// Real unread-chat total for the header badge. Silent: on any
+  /// failure (offline, logged out, server asleep) the badge just
+  /// stays hidden instead of showing a wrong number.
+  Future<void> _loadUnreadChats() async {
+    try {
+      final total = await ChatService.instance.fetchTotalUnread();
+      if (!mounted) return;
+      setState(() => _unreadChats = total);
+    } catch (_) {
+      // Leave the badge hidden.
+    }
   }
 
   Future<void> _saveFabPosition() async {
@@ -947,7 +968,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Widget _buildTopRow() {
-    final unreadChats = 6; // sum of inbox unread
+    final unreadChats = _unreadChats;
     return Padding(
       padding: const EdgeInsets.fromLTRB(18, 14, 18, 0),
       child: Row(children: [
@@ -961,7 +982,12 @@ class _DashboardScreenState extends State<DashboardScreen>
 
         // ── Chat icon with unread badge ────────────────────────────────────
         GestureDetector(
-          onTap: () => Navigator.push(context, _route(const ChatInboxScreen())),
+          onTap: () async {
+            await Navigator.push(context, _route(const ChatInboxScreen()));
+            // Refresh the badge — chats read in the inbox no longer
+            // count as unread.
+            _loadUnreadChats();
+          },
           child: Stack(clipBehavior: Clip.none, children: [
             _glassBox(
               child: const Icon(Icons.chat_bubble_outline_rounded,

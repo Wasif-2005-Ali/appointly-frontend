@@ -4,6 +4,8 @@ import '../app_state.dart';
 import '../models/appointment.dart' as appt_model;
 import '../services/api_client.dart';
 import '../services/appointment_service.dart';
+import '../services/user_service.dart';
+import 'user_picker_screen.dart';
 import '../theme/app_theme.dart';
 import '../theme/dark_theme.dart';
 import '../widgets/save_icon_button.dart';
@@ -114,8 +116,10 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
 
   final _nameCtrl  = TextEditingController();
   final _notesCtrl = TextEditingController();
-  /// The provider being booked with. The backend has no provider
-  /// directory, so the user must know (and enter) their user ID.
+  /// The provider being booked with, picked from the user directory.
+  /// The ID is mirrored into [_providerIdCtrl] because the calendar
+  /// dialog and the submit path read it from there.
+  AppUser? _selectedProvider;
   final _providerIdCtrl = TextEditingController();
   String? _service;
   String _selectedDuration = '30 min';
@@ -284,12 +288,12 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
             _dmCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               _dmCardTitle('Provider', Icons.badge_rounded, const Color(0xFF1A5EA8)),
               const SizedBox(height: 16),
-              _dmLabel('Provider User ID'),
-              _dmField(_providerIdCtrl, 'e.g. 12', Icons.badge_outlined),
+              _dmLabel('Choose provider'),
+              _buildProviderPicker(),
               const SizedBox(height: 8),
-              Text('Ask your provider for their user ID — the booking is '
-                  'sent to them for approval. Entering it also shows their '
-                  'real available slots in the calendar below.',
+              Text('Choose the provider you want to book with — the booking '
+                  'is sent to them for approval. Choosing one also shows '
+                  'their real available slots in the calendar below.',
                   style: GoogleFonts.dmSans(fontSize: 11.5, color: dmTxtSub,
                       fontWeight: FontWeight.w500, height: 1.4)),
             ])),
@@ -511,6 +515,60 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
     // Throws ApiException when the provider ID is missing or the
     // backend rejects the booking.
     await AppStateProvider.of(context).addAppointment(appointment);
+  }
+
+  /// Provider picker (replaces the old numeric user-ID field): search
+  /// the user directory by name or email, tap a provider. The picked
+  /// provider's ID is mirrored into [_providerIdCtrl] for the
+  /// calendar dialog and the submit path.
+  Widget _buildProviderPicker() {
+    final provider = _selectedProvider;
+    return GestureDetector(
+      onTap: () async {
+        final user = await Navigator.push<AppUser?>(
+          context,
+          MaterialPageRoute(
+            builder: (_) => const UserPickerScreen(title: 'Choose provider'),
+          ),
+        );
+        if (user == null || !mounted) return;
+        setState(() {
+          _selectedProvider = user;
+          _providerIdCtrl.text = user.id.toString();
+        });
+      },
+      child: _dmFieldBox(Row(children: [
+        Container(
+          width: 34, height: 34,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: dmAccent.withOpacity(0.15),
+          ),
+          child: Center(
+            child: provider == null
+                ? Icon(Icons.person_search_rounded, color: dmAccent, size: 18)
+                : Text(provider.initials,
+                    style: GoogleFonts.dmSans(fontSize: 12, fontWeight: FontWeight.w900, color: dmAccent)),
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: provider == null
+              ? Text('Tap to choose a provider…',
+                  style: GoogleFonts.dmSans(fontSize: 13, color: dmTxtSub))
+              : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(provider.fullName,
+                      style: GoogleFonts.dmSans(fontSize: 14, color: dmTxtMain,
+                          fontWeight: FontWeight.w700)),
+                  if (provider.email.isNotEmpty)
+                    Text(provider.email,
+                        maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.dmSans(fontSize: 11.5, color: dmTxtSub)),
+                ]),
+        ),
+        Icon(Icons.chevron_right_rounded, color: dmTxtSub.withOpacity(0.6)),
+      ])),
+    );
   }
 
   Widget _buildClientAutocomplete(BuildContext context) {
