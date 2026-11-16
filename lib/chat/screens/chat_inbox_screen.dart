@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../../app_state.dart';
+import '../../services/api_client.dart';
+import '../../services/chat_service.dart';
 import '../models/chat_models.dart';
 import '../widgets/chat_popup_menus.dart';
 import 'chat_thread_screen.dart';
@@ -36,16 +38,63 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
     const StatusStory('Hina Raza',   Color(0xFFE8805A)),
   ];
 
-  final List<ChatConversation> _convos = [
-    ChatConversation(id:'1', name:'Aisha Khan',     service:'Consultation',  avatarColor:const Color(0xFF4A90D9), online:true,  lastMsg:'See you tomorrow at 9 AM 👍',           time:'2m',        unread:2, isPinned:true),
-    ChatConversation(id:'2', name:'Omar Farooq',    service:'Consultation',  avatarColor:const Color(0xFF7C5CBF), online:true,  lastMsg:'Can we reschedule to next week?',        time:'18m',       unread:1),
-    ChatConversation(id:'3', name:'Zara Malik',     service:'Hair Coloring', avatarColor:const Color(0xFF2ECC96), online:false, lastMsg:'Thank you! The session was great.',      time:'1h',        unread:0),
-    ChatConversation(id:'4', name:'Bilal Chaudhry', service:'Physiotherapy', avatarColor:const Color(0xFF2A6AB5), online:false, lastMsg:'Your appointment is confirmed',          time:'3h',        unread:0),
-    ChatConversation(id:'5', name:'Hina Raza',      service:'Skin Care',     avatarColor:const Color(0xFFE8805A), online:false, lastMsg:'Is 2:30 PM still available Thursday?',  time:'Yesterday', unread:3),
-    ChatConversation(id:'6', name:'Tariq Ahmed',    service:'Sports Massage',avatarColor:const Color(0xFF3B73C0), online:true,  lastMsg:'Looking forward to the session!',       time:'Yesterday', unread:0, isMuted:true),
-    ChatConversation(id:'7', name:'Sana Qureshi',   service:'Nail Art',      avatarColor:const Color(0xFF4A8FD4), online:false, lastMsg:'I might need to cancel, will confirm.', time:'Mon',       unread:0),
-    ChatConversation(id:'8', name:'Imran Shah',     service:'Consultation',  avatarColor:const Color(0xFF0B3D91), online:false, lastMsg:'Reminder: appointment at 8:30 AM',      time:'Mon',       unread:0),
-  ];
+  final List<ChatConversation> _convos = [];
+  bool _loading = true;
+  String? _loadError;
+
+  // ── Load rooms from the API ────────────────────────────────────────────────
+  Future<void> _loadRooms({bool silent = false}) async {
+    if (!silent) {
+      setState(() {
+        _loading = true;
+        _loadError = null;
+      });
+    }
+    try {
+      final rooms = await ChatService.instance.listRooms();
+      if (!mounted) return;
+      // Keep local-only flags (pin/mute/archive) across reloads.
+      final old = {for (final c in _convos) c.id: c};
+      setState(() {
+        _convos
+          ..clear()
+          ..addAll(rooms.map((r) {
+            final convo = ChatConversation.fromApi(r);
+            final prev = old[r.roomId];
+            if (prev != null) {
+              convo.isPinned = prev.isPinned;
+              convo.isMuted = prev.isMuted;
+              convo.isArchived = prev.isArchived;
+              // Keep the preview filled in by an opened thread.
+              if (prev.lastMsg != 'No messages yet') {
+                convo.lastMsg = prev.lastMsg;
+                convo.time = prev.time;
+              }
+            }
+            return convo;
+          }));
+        _loading = false;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _loadError = e.message;
+      });
+    }
+  }
+
+  Future<void> _leaveRoom(ChatConversation c) async {
+    try {
+      await ChatService.instance.leaveRoom(c.id);
+      if (!mounted) return;
+      setState(() => _convos.remove(c));
+      _toast('You left the chat');
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      _toast(e.message);
+    }
+  }
 
   // ── Theme helpers ──────────────────────────────────────────────────────────
   Color get _bg        => AppStateProvider.of(context).bg;
@@ -83,6 +132,7 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
     _headerFade = CurvedAnimation(parent: _headerCtrl, curve: Curves.easeOut);
     _headerCtrl.forward();
     _listCtrl.forward();
+    _loadRooms();
   }
 
   @override
@@ -299,6 +349,26 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
 
   // ── Conversation list ──────────────────────────────────────────────────────
   Widget _buildList() {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_loadError != null) {
+      return Center(child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Icon(Icons.cloud_off_rounded, size: 52, color: _txtSub.withOpacity(0.4)),
+          const SizedBox(height: 14),
+          Text(_loadError!,
+              textAlign: TextAlign.center,
+              style: GoogleFonts.dmSans(fontSize: 14, color: _txtSub)),
+          const SizedBox(height: 16),
+          FilledButton(
+            onPressed: _loadRooms,
+            child: const Text('Try again'),
+          ),
+        ]),
+      ));
+    }
     final all = _filtered;
     if (all.isEmpty) {
       return Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
@@ -306,6 +376,9 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
         const SizedBox(height: 16),
         Text('No conversations',
             style: GoogleFonts.dmSans(fontSize: 17, fontWeight: FontWeight.w700, color: _txtSub)),
+        const SizedBox(height: 8),
+        Text('Tap + to start a new chat',
+            style: GoogleFonts.dmSans(fontSize: 13, color: _txtSub)),
       ]));
     }
     final pinned   = all.where((c) => c.isPinned).toList();
@@ -318,25 +391,28 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
     }
     for (var c in unpinned) items.add(_dismissible(c));
 
-    return ListView.builder(
-      physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-      padding: const EdgeInsets.fromLTRB(16, 6, 16, 100),
-      itemCount: items.length,
-      itemBuilder: (_, i) {
-        final delay = (i * 0.06).clamp(0.0, 0.6);
-        return AnimatedBuilder(
-          animation: _listCtrl,
-          builder: (_, child) {
-            final t  = ((_listCtrl.value - delay) / (1.0 - delay)).clamp(0.0, 1.0);
-            final cv = Curves.easeOutCubic.transform(t);
-            return Transform.translate(
-              offset: Offset(0, (1 - cv) * 28),
-              child: Opacity(opacity: cv, child: child),
-            );
-          },
-          child: items[i],
-        );
-      },
+    return RefreshIndicator(
+      onRefresh: () => _loadRooms(silent: true),
+      child: ListView.builder(
+        physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+        padding: const EdgeInsets.fromLTRB(16, 6, 16, 100),
+        itemCount: items.length,
+        itemBuilder: (_, i) {
+          final delay = (i * 0.06).clamp(0.0, 0.6);
+          return AnimatedBuilder(
+            animation: _listCtrl,
+            builder: (_, child) {
+              final t  = ((_listCtrl.value - delay) / (1.0 - delay)).clamp(0.0, 1.0);
+              final cv = Curves.easeOutCubic.transform(t);
+              return Transform.translate(
+                offset: Offset(0, (1 - cv) * 28),
+                child: Opacity(opacity: cv, child: child),
+              );
+            },
+            child: items[i],
+          );
+        },
+      ),
     );
   }
 
@@ -369,23 +445,27 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
         _toast('Chat archived');
         return false;
       }
-      return await showDialog<bool>(
+      // Swipe left: leave the room (no delete endpoint exists).
+      final leave = await showDialog<bool>(
         context: context,
         builder: (_) => AlertDialog(
           backgroundColor: _cardBg,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          title: Text('Delete Chat?', style: GoogleFonts.dmSans(fontWeight: FontWeight.w800, color: _txtMain)),
-          content: Text('Delete chat with ${c.name}?', style: GoogleFonts.dmSans(color: _txtSub)),
+          title: Text('Leave Chat?', style: GoogleFonts.dmSans(fontWeight: FontWeight.w800, color: _txtMain)),
+          content: Text('Leave the chat with ${c.name}? You will stop receiving its messages.',
+              style: GoogleFonts.dmSans(color: _txtSub)),
           actions: [
             TextButton(onPressed: () => Navigator.pop(context, false),
                 child: Text('Cancel', style: GoogleFonts.dmSans(color: _txtSub, fontWeight: FontWeight.w600))),
             TextButton(
-              onPressed: () { Navigator.pop(context, true); setState(() => _convos.remove(c)); },
-              child: Text('Delete', style: GoogleFonts.dmSans(color: const Color(0xFFE05C5C), fontWeight: FontWeight.w700)),
+              onPressed: () => Navigator.pop(context, true),
+              child: Text('Leave', style: GoogleFonts.dmSans(color: const Color(0xFFE05C5C), fontWeight: FontWeight.w700)),
             ),
           ],
         ),
       );
+      if (leave == true) _leaveRoom(c);
+      return false;
     },
     child: _tile(c),
   );
@@ -534,95 +614,118 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
         child: const Icon(Icons.edit_rounded, color: Colors.white, size: 22)),
   );
 
+  // ── New chat ───────────────────────────────────────────────────────────────
+  // No user directory exists on the backend, so starting a chat needs the
+  // other person's numeric user ID (same as booking an appointment).
   void _showNewMsg() {
-    final contacts = [
-      const NewContact('Fatima Malik',  'Dermatology',   Color(0xFF4A90D9), true),
-      const NewContact('Usman Raza',    'Physiotherapy', Color(0xFF7C5CBF), false),
-      const NewContact('Nadia Sheikh',  'Nutrition',     Color(0xFF2ECC96), true),
-      const NewContact('Kamran Baig',   'Cardiology',    Color(0xFFE8805A), false),
-      const NewContact('Saira Qureshi', 'Dental',        Color(0xFF3B73C0), true),
-    ];
-    final sc = TextEditingController();
-    var q = '';
+    final nameCtrl = TextEditingController();
+    final idCtrl = TextEditingController();
+    var isGroup = false;
+    var busy = false;
     showModalBottomSheet(
       context: context, isScrollControlled: true, backgroundColor: Colors.transparent,
       builder: (ctx) => StatefulBuilder(builder: (ctx, set) {
-        final fl = q.isEmpty ? contacts : contacts.where((c) => c.name.toLowerCase().contains(q.toLowerCase())).toList();
-        return Container(
-          height: MediaQuery.of(ctx).size.height * 0.78,
-          decoration: BoxDecoration(color: _bg, borderRadius: const BorderRadius.vertical(top: Radius.circular(26)),
-              border: Border.all(color: _border, width: 1.2)),
-          child: Column(children: [
-            _handle(),
-            Padding(padding: const EdgeInsets.fromLTRB(20, 4, 20, 12),
-                child: Row(children: [
-                  Container(width: 40, height: 40, decoration: BoxDecoration(gradient: LinearGradient(colors: _btnGrad), borderRadius: BorderRadius.circular(13)),
-                      child: const Icon(Icons.edit_rounded, color: Colors.white, size: 18)),
-                  const SizedBox(width: 14),
-                  Expanded(child: Text('New Message', style: GoogleFonts.dmSans(fontSize: 20, fontWeight: FontWeight.w900, color: _txtMain, letterSpacing: -0.5))),
-                  GestureDetector(onTap: () => Navigator.pop(ctx),
-                      child: Container(width: 36, height: 36, decoration: BoxDecoration(color: _border.withOpacity(0.5), borderRadius: BorderRadius.circular(12)),
-                          child: Icon(Icons.close_rounded, color: _txtSub, size: 18))),
-                ])),
-            Padding(padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
-                child: Container(height: 46,
-                    decoration: BoxDecoration(color: _cardBg, borderRadius: BorderRadius.circular(16), border: Border.all(color: _border, width: 1.5)),
-                    child: Row(children: [
-                      const SizedBox(width: 14), Icon(Icons.search_rounded, color: _txtSub, size: 18), const SizedBox(width: 10),
-                      Expanded(child: TextField(controller: sc, onChanged: (v) => set(() => q = v),
-                          style: GoogleFonts.dmSans(fontSize: 14, color: _txtMain),
-                          decoration: InputDecoration(hintText: 'Search contacts...',
-                              hintStyle: GoogleFonts.dmSans(color: _txtSub), border: InputBorder.none, isDense: true, contentPadding: EdgeInsets.zero))),
-                    ]))),
-            Divider(color: _border, height: 1),
-            Expanded(child: ListView.builder(
-              padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
-              itemCount: fl.length,
-              itemBuilder: (_, i) {
-                final c = fl[i];
-                return GestureDetector(
-                  onTap: () { Navigator.pop(ctx); _openNewThread(c); },
-                  child: Container(
-                    margin: const EdgeInsets.only(bottom: 8), padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(color: _cardBg, borderRadius: BorderRadius.circular(16), border: Border.all(color: _border, width: 1.2)),
-                    child: Row(children: [
-                      Stack(children: [
-                        Container(width: 46, height: 46,
-                            decoration: BoxDecoration(shape: BoxShape.circle, gradient: LinearGradient(colors: [c.color.withOpacity(0.7), c.color])),
-                            child: Center(child: Text(c.initials, style: GoogleFonts.dmSans(fontSize: 14, fontWeight: FontWeight.w900, color: Colors.white)))),
-                        if (c.online) Positioned(bottom: 0, right: 0,
-                            child: Container(width: 13, height: 13, decoration: BoxDecoration(color: const Color(0xFF2ECC96), shape: BoxShape.circle, border: Border.all(color: _cardBg, width: 2)))),
-                      ]),
-                      const SizedBox(width: 12),
-                      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Text(c.name, style: GoogleFonts.dmSans(fontSize: 14.5, fontWeight: FontWeight.w700, color: _txtMain)),
-                        Text(c.service, style: GoogleFonts.dmSans(fontSize: 12, color: _txtSub)),
-                      ])),
-                      Container(width: 32, height: 32,
-                          decoration: BoxDecoration(gradient: LinearGradient(colors: _btnGrad), borderRadius: BorderRadius.circular(10)),
-                          child: const Icon(Icons.send_rounded, color: Colors.white, size: 15)),
-                    ]),
+        Future<void> submit() async {
+          final name = nameCtrl.text.trim();
+          final otherId = idCtrl.text.trim();
+          if (name.isEmpty) {
+            _toast('Please enter a name for the chat.');
+            return;
+          }
+          if (otherId.isEmpty) {
+            _toast('Please enter the other person\'s user ID.');
+            return;
+          }
+          set(() => busy = true);
+          try {
+            final room = await ChatService.instance.createRoom(
+              name: name,
+              participantIds: [otherId],
+              isGroup: isGroup,
+            );
+            if (!mounted) return;
+            Navigator.pop(ctx);
+            final convo = ChatConversation.fromApi(room);
+            setState(() => _convos.insert(0, convo));
+            _openThread(convo);
+          } on ApiException catch (e) {
+            set(() => busy = false);
+            _toast(e.message);
+          }
+        }
+
+        return Padding(
+          padding: EdgeInsets.only(
+            bottom: MediaQuery.of(ctx).viewInsets.bottom,
+          ),
+          child: Container(
+            decoration: BoxDecoration(color: _bg, borderRadius: const BorderRadius.vertical(top: Radius.circular(26)),
+                border: Border.all(color: _border, width: 1.2)),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              _handle(),
+              Padding(padding: const EdgeInsets.fromLTRB(20, 4, 20, 12),
+                  child: Row(children: [
+                    Container(width: 40, height: 40, decoration: BoxDecoration(gradient: LinearGradient(colors: _btnGrad), borderRadius: BorderRadius.circular(13)),
+                        child: const Icon(Icons.edit_rounded, color: Colors.white, size: 18)),
+                    const SizedBox(width: 14),
+                    Expanded(child: Text('New Message', style: GoogleFonts.dmSans(fontSize: 20, fontWeight: FontWeight.w900, color: _txtMain, letterSpacing: -0.5))),
+                    GestureDetector(onTap: () => Navigator.pop(ctx),
+                        child: Container(width: 36, height: 36, decoration: BoxDecoration(color: _border.withOpacity(0.5), borderRadius: BorderRadius.circular(12)),
+                            child: Icon(Icons.close_rounded, color: _txtSub, size: 18))),
+                  ])),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+                child: Column(children: [
+                  TextField(
+                    controller: nameCtrl,
+                    textCapitalization: TextCapitalization.words,
+                    style: GoogleFonts.dmSans(fontSize: 14.5, color: _txtMain),
+                    decoration: InputDecoration(
+                      labelText: 'Chat name',
+                      hintText: 'e.g. Dr. Aisha',
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+                    ),
                   ),
-                );
-              },
-            )),
-          ]),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: idCtrl,
+                    keyboardType: TextInputType.number,
+                    style: GoogleFonts.dmSans(fontSize: 14.5, color: _txtMain),
+                    decoration: InputDecoration(
+                      labelText: 'Other person\'s user ID',
+                      hintText: 'e.g. 3',
+                      helperText: 'Ask them for their numeric user ID.',
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  SwitchListTile(
+                    title: Text('Group chat',
+                        style: GoogleFonts.dmSans(fontSize: 14, fontWeight: FontWeight.w600, color: _txtMain)),
+                    subtitle: Text('More people can be added later.',
+                        style: GoogleFonts.dmSans(fontSize: 12, color: _txtSub)),
+                    value: isGroup,
+                    activeColor: _accent,
+                    contentPadding: EdgeInsets.zero,
+                    onChanged: (v) => set(() => isGroup = v),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity, height: 50,
+                    child: FilledButton(
+                      onPressed: busy ? null : submit,
+                      child: busy
+                          ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                          : const Text('Start chat'),
+                    ),
+                  ),
+                ]),
+              ),
+            ]),
+          ),
         );
       }),
     );
-  }
-
-  void _openNewThread(NewContact contact) {
-    final ex = _convos.where((c) => c.name == contact.name).toList();
-    if (ex.isNotEmpty) { _openThread(ex.first); return; }
-    final n = ChatConversation(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
-      name: contact.name, service: contact.service,
-      avatarColor: contact.color, online: contact.online,
-      lastMsg: 'New conversation', time: 'Now', unread: 0,
-    );
-    setState(() => _convos.insert(0, n));
-    _openThread(n);
   }
 
   void _toast(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(
