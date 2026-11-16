@@ -65,7 +65,8 @@ class ChatConversation {
 
   /// Maps a backend room to the local conversation model. The room
   /// list carries no last message, unread count, or presence, so
-  /// those start empty/false and are filled in when a thread opens.
+  /// those start empty/false and are filled in by the inbox's
+  /// preview fetch (and by an opened thread).
   factory ChatConversation.fromApi(ChatRoomInfo room) => ChatConversation(
     id: room.roomId,
     name: room.name,

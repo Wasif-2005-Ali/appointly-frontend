@@ -110,6 +110,9 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       for (final m in apiMsgs) {
         ChatDB.save(_convId, m).catchError((_) {});
       }
+      // Mark the room read server-side so the unread badge stays
+      // cleared across devices and app restarts (best-effort).
+      await ChatService.instance.markRoomRead(_convId);
       _connectLive();
     } on ApiException catch (e) {
       // Offline fallback: show locally cached messages.

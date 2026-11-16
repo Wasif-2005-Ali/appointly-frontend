@@ -1,4 +1,3 @@
-import 'dart:ui';
 import 'package:flutter/material.dart';
 import '../app_state.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -137,7 +136,7 @@ class WelcomeScreen extends StatelessWidget {
                     child: Column(children: [
                       _socialBtn(context, 'Continue with Google',
                           isGoogle: true, accent: accent, border: border, txtMain: txtMain,
-                          onTap: () => _showGoogleDialog(context, appState)),
+                          onTap: () => _signInWithGoogle(context)),
                       const SizedBox(height: 16),
                       _socialBtn(context, 'Continue with email',
                           icon: Icons.email_outlined, accent: accent, border: border, txtMain: txtMain,
@@ -170,75 +169,48 @@ class WelcomeScreen extends StatelessWidget {
     );
   }
 
-  void _showGoogleDialog(BuildContext context, AppState appState) {
+  /// Real Google Sign-In: opens the Google account picker, exchanges
+  /// the ID token at POST /api/v1/auth/google/, then goes to the
+  /// dashboard — the same landing as email login. When Google Sign-In
+  /// is not configured yet (empty client ID), the service throws a
+  /// friendly message shown in the snackbar below.
+  Future<void> _signInWithGoogle(BuildContext context) async {
     showDialog(
       context: context,
-      barrierColor: Colors.black.withOpacity(0.45),
-      builder: (ctx) => Dialog(
-        backgroundColor: Colors.transparent,
-        insetPadding: const EdgeInsets.symmetric(horizontal: 32),
-        child: Container(
-          padding: const EdgeInsets.all(30),
-          decoration: BoxDecoration(
-            color: appState.cardBg,
-            borderRadius: BorderRadius.circular(28),
-            border: Border.all(color: appState.border),
-            boxShadow: [BoxShadow(
-              color: Colors.black.withOpacity(appState.isDarkMode ? 0.4 : 0.12),
-              blurRadius: 40, offset: const Offset(0, 16),
-            )],
-          ),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Container(
-              width: 72, height: 72,
-              decoration: BoxDecoration(
-                color: const Color(0xFF4285F4).withOpacity(0.08),
-                borderRadius: BorderRadius.circular(22),
-                border: Border.all(color: const Color(0xFF4285F4).withOpacity(0.18), width: 1.5),
-              ),
-              child: const Center(child: _GoogleLogo(size: 34)),
-            ),
-            const SizedBox(height: 22),
-            Text('Coming Soon!', style: GoogleFonts.poppins(
-                fontSize: 24, fontWeight: FontWeight.w800, color: appState.txtMain)),
-            const SizedBox(height: 10),
-            Text(
-              'Google Sign-In will be available in an upcoming update. Stay tuned!',
-              textAlign: TextAlign.center,
-              style: GoogleFonts.poppins(fontSize: 13.5, color: appState.txtSub, height: 1.6),
-            ),
-            const SizedBox(height: 6),
-            Row(mainAxisAlignment: MainAxisAlignment.center, children: const [
-              _Dot(Color(0xFF4285F4)), SizedBox(width: 5),
-              _Dot(Color(0xFF34A853)), SizedBox(width: 5),
-              _Dot(Color(0xFFEA4335)), SizedBox(width: 5),
-              _Dot(Color(0xFFFBBC05)),
-            ]),
-            const SizedBox(height: 26),
-            GestureDetector(
-              onTap: () => Navigator.pop(ctx),
-              child: Container(
-                width: double.infinity, height: 54,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [appState.accent,
-                      HSLColor.fromColor(appState.accent).withLightness(
-                          (HSLColor.fromColor(appState.accent).lightness + 0.10).clamp(0.1, 0.65)).toColor()],
-                    begin: Alignment.topLeft, end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(18),
-                  boxShadow: [BoxShadow(
-                    color: appState.accent.withOpacity(0.35), blurRadius: 14, offset: const Offset(0, 5),
-                  )],
-                ),
-                child: Center(child: Text('Got it',
-                    style: GoogleFonts.poppins(fontSize: 15.5, fontWeight: FontWeight.w700, color: Colors.white))),
-              ),
-            ),
-          ]),
-        ),
-      ),
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator()),
     );
+    try {
+      final user = await AuthService.instance.signInWithGoogle();
+      if (!context.mounted) return;
+      Navigator.pop(context); // Dismiss the loading indicator.
+      UserSession.instance.setFromMap(user);
+      await AppStateProvider.of(context).loadUserData();
+      if (!context.mounted) return;
+      Navigator.pushAndRemoveUntil(
+        context,
+        _slide(const DashboardScreen()),
+        (r) => false,
+      );
+    } on ApiException catch (e) {
+      if (!context.mounted) return;
+      Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(e.message),
+          backgroundColor: const Color(0xFFE05C5C),
+        ),
+      );
+    } catch (_) {
+      if (!context.mounted) return;
+      Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Something went wrong. Please try again.'),
+          backgroundColor: Color(0xFFE05C5C),
+        ),
+      );
+    }
   }
 
   Widget _socialBtn(BuildContext ctx, String text, {
@@ -264,14 +236,6 @@ class WelcomeScreen extends StatelessWidget {
           ]),
         ),
       );
-}
-
-class _Dot extends StatelessWidget {
-  final Color color;
-  const _Dot(this.color);
-  @override
-  Widget build(BuildContext context) =>
-      Container(width: 6, height: 6, decoration: BoxDecoration(color: color, shape: BoxShape.circle));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

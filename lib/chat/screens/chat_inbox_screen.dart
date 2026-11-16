@@ -4,6 +4,9 @@ import 'package:google_fonts/google_fonts.dart';
 import '../../app_state.dart';
 import '../../services/api_client.dart';
 import '../../services/chat_service.dart';
+import '../../services/user_service.dart';
+import '../../user_session.dart';
+import '../../screens/user_picker_screen.dart';
 import '../models/chat_models.dart';
 import '../widgets/chat_popup_menus.dart';
 import 'chat_thread_screen.dart';
@@ -55,24 +58,43 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
       if (!mounted) return;
       // Keep local-only flags (pin/mute/archive) across reloads.
       final old = {for (final c in _convos) c.id: c};
+      final convos = rooms.map((r) {
+        final convo = ChatConversation.fromApi(r);
+        final prev = old[r.roomId];
+        if (prev != null) {
+          convo.isPinned = prev.isPinned;
+          convo.isMuted = prev.isMuted;
+          convo.isArchived = prev.isArchived;
+          // Keep the preview filled in by an opened thread as a
+          // fallback — the fresh previews below overwrite it.
+          if (prev.lastMsg != 'No messages yet') {
+            convo.lastMsg = prev.lastMsg;
+            convo.time = prev.time;
+          }
+        }
+        return convo;
+      }).toList();
+      // WhatsApp-style previews: last message + unread count per room.
+      final previews = await ChatService.instance.fetchRoomPreviews(rooms);
+      if (!mounted) return;
+      final myId = UserSession.instance.userId?.toString();
+      for (final convo in convos) {
+        final preview = previews[convo.id];
+        if (preview == null) continue;
+        if (preview.lastMessage != null) {
+          final last = ChatMessage.fromApi(
+            preview.lastMessage!,
+            currentUserId: myId,
+          );
+          convo.lastMsg = last.text;
+          convo.time = last.time;
+        }
+        convo.unread = preview.unreadCount;
+      }
       setState(() {
         _convos
           ..clear()
-          ..addAll(rooms.map((r) {
-            final convo = ChatConversation.fromApi(r);
-            final prev = old[r.roomId];
-            if (prev != null) {
-              convo.isPinned = prev.isPinned;
-              convo.isMuted = prev.isMuted;
-              convo.isArchived = prev.isArchived;
-              // Keep the preview filled in by an opened thread.
-              if (prev.lastMsg != 'No messages yet') {
-                convo.lastMsg = prev.lastMsg;
-                convo.time = prev.time;
-              }
-            }
-            return convo;
-          }));
+          ..addAll(convos);
         _loading = false;
       });
     } on ApiException catch (e) {
@@ -581,6 +603,10 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
 
   // ── Navigation ─────────────────────────────────────────────────────────────
   void _openThread(ChatConversation c) {
+    // The backend never marks messages read, so stamp the room read
+    // locally — otherwise the unread badge would come back on the
+    // next reload (see ChatService.markRoomReadLocally).
+    ChatService.instance.markRoomReadLocally(c.id);
     setState(() => c.unread = 0);
     Navigator.push(context, PageRouteBuilder(
       pageBuilder: (_, __, ___) => ChatThreadScreen(conversation: c, allConversations: _convos),
@@ -615,32 +641,50 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
   );
 
   // ── New chat ───────────────────────────────────────────────────────────────
-  // No user directory exists on the backend, so starting a chat needs the
-  // other person's numeric user ID (same as booking an appointment).
+  // Pick the other person from the user directory (search by name or
+  // email); the chat name defaults to their name and stays editable.
   void _showNewMsg() {
     final nameCtrl = TextEditingController();
-    final idCtrl = TextEditingController();
+    AppUser? picked;
     var isGroup = false;
     var busy = false;
     showModalBottomSheet(
       context: context, isScrollControlled: true, backgroundColor: Colors.transparent,
       builder: (ctx) => StatefulBuilder(builder: (ctx, set) {
+        Future<void> pickPerson() async {
+          final user = await Navigator.push<AppUser?>(
+            context,
+            MaterialPageRoute(
+              builder: (_) => const UserPickerScreen(title: 'Choose a person'),
+            ),
+          );
+          if (user == null || !mounted) return;
+          set(() {
+            picked = user;
+            // Pre-fill the chat name from a real directory hit (a
+            // manual ID entry has no name to use).
+            if (nameCtrl.text.trim().isEmpty && user.email.isNotEmpty) {
+              nameCtrl.text = user.fullName;
+            }
+          });
+        }
+
         Future<void> submit() async {
           final name = nameCtrl.text.trim();
-          final otherId = idCtrl.text.trim();
-          if (name.isEmpty) {
-            _toast('Please enter a name for the chat.');
+          final other = picked;
+          if (other == null) {
+            _toast('Please choose a person to chat with.');
             return;
           }
-          if (otherId.isEmpty) {
-            _toast('Please enter the other person\'s user ID.');
+          if (name.isEmpty) {
+            _toast('Please enter a name for the chat.');
             return;
           }
           set(() => busy = true);
           try {
             final room = await ChatService.instance.createRoom(
               name: name,
-              participantIds: [otherId],
+              participantIds: [other.id.toString()],
               isGroup: isGroup,
             );
             if (!mounted) return;
@@ -687,15 +731,44 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
                     ),
                   ),
                   const SizedBox(height: 12),
-                  TextField(
-                    controller: idCtrl,
-                    keyboardType: TextInputType.number,
-                    style: GoogleFonts.dmSans(fontSize: 14.5, color: _txtMain),
-                    decoration: InputDecoration(
-                      labelText: 'Other person\'s user ID',
-                      hintText: 'e.g. 3',
-                      helperText: 'Ask them for their numeric user ID.',
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+                  // Person picker (replaces the old numeric user-ID field).
+                  GestureDetector(
+                    onTap: busy ? null : pickPerson,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      decoration: BoxDecoration(
+                        color: _cardBg,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(color: _border, width: 1.2),
+                      ),
+                      child: Row(children: [
+                        Container(
+                          width: 40, height: 40,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _accent.withOpacity(0.15),
+                          ),
+                          child: Center(
+                            child: picked == null
+                                ? Icon(Icons.person_add_alt_rounded, color: _accent, size: 20)
+                                : Text(picked!.initials,
+                                    style: GoogleFonts.dmSans(fontSize: 13, fontWeight: FontWeight.w900, color: _accent)),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(child: picked == null
+                            ? Text('Choose a person…',
+                                style: GoogleFonts.dmSans(fontSize: 14.5, color: _txtSub))
+                            : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                Text(picked!.fullName,
+                                    style: GoogleFonts.dmSans(fontSize: 14.5, fontWeight: FontWeight.w700, color: _txtMain)),
+                                if (picked!.email.isNotEmpty)
+                                  Text(picked!.email,
+                                      maxLines: 1, overflow: TextOverflow.ellipsis,
+                                      style: GoogleFonts.dmSans(fontSize: 12, color: _txtSub)),
+                              ])),
+                        Icon(Icons.chevron_right_rounded, color: _txtSub.withOpacity(0.6)),
+                      ]),
                     ),
                   ),
                   const SizedBox(height: 4),

@@ -1,8 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:google_sign_in/google_sign_in.dart';
+
 import '../user_session.dart';
 import 'api_client.dart';
+import 'api_config.dart';
 import 'call_service.dart';
 import 'token_storage.dart';
 
@@ -71,6 +74,57 @@ class AuthService {
       );
     }
     final data = jsonDecode(res.body) as Map<String, dynamic>;
+    return Map<String, dynamic>.from(data['user'] as Map);
+  }
+
+  /// POST /google/ — Google Sign-In. Gets an ID token from the Google
+  /// SDK and exchanges it for the JWT pair. Returns the user map, like
+  /// [login]. Throws [ApiException] when the user cancels or when the
+  /// backend rejects the token.
+  Future<Map<String, dynamic>> signInWithGoogle() async {
+    if (ApiConfig.googleServerClientId.isEmpty) {
+      throw const ApiException(
+        'Google Sign-In is not set up yet. Please sign in with email for now.',
+      );
+    }
+    final googleSignIn = GoogleSignIn(
+      serverClientId: ApiConfig.googleServerClientId,
+    );
+    GoogleSignInAccount? account;
+    try {
+      account = await googleSignIn.signIn();
+    } catch (_) {
+      throw const ApiException(
+        'Google Sign-In failed. Check your connection and try again.',
+      );
+    }
+    if (account == null) {
+      throw const ApiException('Google Sign-In was cancelled.');
+    }
+    final idToken = (await account.authentication).idToken;
+    if (idToken == null || idToken.isEmpty) {
+      throw const ApiException(
+        'Could not get a Google ID token. Please try again.',
+      );
+    }
+    final res = await ApiClient.instance.post(
+      '$_auth/google/',
+      body: {'id_token': idToken},
+      auth: false,
+    );
+    if (res.statusCode != 200) {
+      throw ApiException(
+        ApiClient.errorMessage(res, 'Google Sign-In failed. Please try again.'),
+        statusCode: res.statusCode,
+      );
+    }
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    await TokenStorage.instance.saveTokens(
+      access: data['access'] as String,
+      refresh: data['refresh'] as String,
+    );
+    // Start listening for incoming calls now that we are logged in.
+    unawaited(CallService.instance.connectNotify());
     return Map<String, dynamic>.from(data['user'] as Map);
   }
 

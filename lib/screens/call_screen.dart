@@ -5,6 +5,8 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../services/api_client.dart';
 import '../services/call_service.dart';
+import '../services/user_service.dart';
+import 'user_picker_screen.dart';
 
 /// Full-screen voice/video call.
 ///
@@ -20,18 +22,21 @@ import '../services/call_service.dart';
 /// call ended cleanly.
 class CallScreen extends StatefulWidget {
   final String? calleeId;
+  final String calleeName;
   final IncomingCall? incoming;
   final String callType;
 
   const CallScreen.outgoing({
     super.key,
     required this.calleeId,
+    this.calleeName = '',
     this.callType = 'video',
   }) : incoming = null;
 
   const CallScreen.incoming({super.key, required this.incoming})
-      : calleeId = null,
-        callType = 'video';
+    : calleeId = null,
+      calleeName = '',
+      callType = 'video';
 
   @override
   State<CallScreen> createState() => _CallScreenState();
@@ -80,6 +85,7 @@ class _CallScreenState extends State<CallScreen> {
           ? await CallService.instance.answerCall(widget.incoming!)
           : await CallService.instance.startCall(
               calleeId: widget.calleeId!,
+              calleeName: widget.calleeName,
               callType: widget.callType,
             );
       if (!mounted) {
@@ -426,8 +432,9 @@ class _CallScreenState extends State<CallScreen> {
           _controlButton(
             icon: Icons.switch_camera,
             label: 'Switch',
-            onPressed:
-                connection == null ? null : () => connection.switchCamera(),
+            onPressed: connection == null
+                ? null
+                : () => connection.switchCamera(),
           ),
         _controlButton(
           icon: Icons.call_end,
@@ -473,12 +480,8 @@ class _CallScreenState extends State<CallScreen> {
   }
 }
 
-/// Start a call: asks for the other person's numeric user ID and
-/// whether it is a video or voice call, then opens [CallScreen].
-///
-/// (There is no user directory API yet, so the caller must know the
-/// other person's user ID — the same known gap as appointments and
-/// chat.)
+/// Start a call: pick the other person from the user directory and
+/// choose video or voice, then open [CallScreen].
 class StartCallScreen extends StatefulWidget {
   const StartCallScreen({super.key});
 
@@ -487,34 +490,36 @@ class StartCallScreen extends StatefulWidget {
 }
 
 class _StartCallScreenState extends State<StartCallScreen> {
-  final _userIdController = TextEditingController();
+  AppUser? _selectedUser;
   String _callType = 'video';
 
-  @override
-  void dispose() {
-    _userIdController.dispose();
-    super.dispose();
+  Future<void> _pickUser() async {
+    final user = await Navigator.push<AppUser?>(
+      context,
+      MaterialPageRoute(
+        builder: (_) =>
+            const UserPickerScreen(title: 'Choose a person to call'),
+      ),
+    );
+    if (user != null && mounted) setState(() => _selectedUser = user);
   }
 
   Future<void> _startCall() async {
-    final userId = _userIdController.text.trim();
-    if (userId.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter the user ID to call.')),
-      );
-      return;
-    }
-    if (int.tryParse(userId) == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('User ID must be a number.')),
-      );
+    final user = _selectedUser;
+    if (user == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Choose a person to call.')));
       return;
     }
     final result = await Navigator.push<String?>(
       context,
       MaterialPageRoute(
-        builder: (_) =>
-            CallScreen.outgoing(calleeId: userId, callType: _callType),
+        builder: (_) => CallScreen.outgoing(
+          calleeId: user.id.toString(),
+          calleeName: user.fullName,
+          callType: _callType,
+        ),
       ),
     );
     if (result != null && result.isNotEmpty && mounted) {
@@ -525,6 +530,7 @@ class _StartCallScreenState extends State<StartCallScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final selected = _selectedUser;
     return Scaffold(
       appBar: AppBar(title: const Text('New Call')),
       body: Padding(
@@ -533,18 +539,60 @@ class _StartCallScreenState extends State<StartCallScreen> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             const Text(
-              'Call another Appointly user by their user ID. '
+              'Call another Appointly user. '
               'They need to be online in the app to receive the call.',
             ),
             const SizedBox(height: 20),
-            TextField(
-              controller: _userIdController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'User ID',
-                hintText: 'e.g. 2',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.person),
+            // Person picker (replaces the old numeric user-ID field).
+            GestureDetector(
+              onTap: _pickUser,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 12,
+                ),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: Theme.of(context).colorScheme.outline
+                        .withOpacity(0.5),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    CircleAvatar(
+                      child: selected == null
+                          ? const Icon(Icons.person_add_alt_rounded, size: 20)
+                          : Text(selected.initials),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: selected == null
+                          ? const Text('Choose a person…')
+                          : Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  selected.fullName,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                if (selected.email.isNotEmpty)
+                                  Text(
+                                    selected.email,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodySmall,
+                                  ),
+                              ],
+                            ),
+                    ),
+                    const Icon(Icons.chevron_right_rounded),
+                  ],
+                ),
               ),
             ),
             const SizedBox(height: 20),
