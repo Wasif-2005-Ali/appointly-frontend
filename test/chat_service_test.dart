@@ -77,8 +77,66 @@ void main() {
       });
       expect(page.count, 2);
       expect(page.nextBefore, '2026-11-16T20:01:00Z');
-      expect(page.messages.map((m) => m.content),
-          ['Hello from A', 'Hi A, B here']);
+      expect(page.messages.map((m) => m.content), [
+        'Hello from A',
+        'Hi A, B here',
+      ]);
+    });
+  });
+
+  group('ChatService.countUnread', () {
+    ChatApiMessage msg(
+      String id,
+      String senderId,
+      List<String> readBy,
+      String createdAt,
+    ) => ChatApiMessage.fromJson({
+      'id': id,
+      'room_id': '5cc143928a5a',
+      'sender_id': senderId,
+      'content': 'msg $id',
+      'message_type': 'text',
+      'read_by': readBy,
+      'created_at': createdAt,
+    });
+
+    test('counts only other people\'s unread messages', () {
+      final messages = [
+        msg('1', '2', ['2'], '2026-11-16T20:01:00Z'), // mine — skip
+        msg('2', '3', ['3'], '2026-11-16T20:02:00Z'), // theirs, unread
+        msg('3', '3', ['3'], '2026-11-16T20:03:00Z'), // theirs, unread
+      ];
+      expect(ChatService.countUnread(messages, myId: '2'), 2);
+    });
+
+    test('ignores messages already read via read_by', () {
+      final messages = [
+        msg('1', '3', ['3', '2'], '2026-11-16T20:01:00Z'), // read
+        msg('2', '3', ['3'], '2026-11-16T20:02:00Z'), // unread
+      ];
+      expect(ChatService.countUnread(messages, myId: '2'), 1);
+    });
+
+    test('ignores messages older than the local last-read stamp', () {
+      final messages = [
+        msg('1', '3', ['3'], '2026-11-16T20:01:00Z'), // before stamp
+        msg('2', '3', ['3'], '2026-11-16T20:03:00Z'), // after stamp
+      ];
+      expect(
+        ChatService.countUnread(
+          messages,
+          myId: '2',
+          lastReadAt: DateTime.parse('2026-11-16T20:02:00Z'),
+        ),
+        1,
+      );
+    });
+
+    test('returns 0 when not logged in', () {
+      final messages = [
+        msg('1', '3', ['3'], '2026-11-16T20:01:00Z'),
+      ];
+      expect(ChatService.countUnread(messages, myId: null), 0);
     });
   });
 }
