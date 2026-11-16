@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:convert';
 
 import '../user_session.dart';
 import 'api_client.dart';
+import 'call_service.dart';
 import 'token_storage.dart';
 
 /// High-level auth operations against `/api/v1/auth/`.
@@ -37,6 +39,8 @@ class AuthService {
       access: data['access'] as String,
       refresh: data['refresh'] as String,
     );
+    // Start listening for incoming calls now that we are logged in.
+    unawaited(CallService.instance.connectNotify());
     return Map<String, dynamic>.from(data['user'] as Map);
   }
 
@@ -85,6 +89,9 @@ class AuthService {
   /// POST /logout/ — blacklists the refresh token, then clears local state.
   /// Best-effort: local state is cleared even if the request fails.
   Future<void> logout() async {
+    // End any active call and stop listening for incoming calls.
+    await CallService.instance.activeCall?.dispose();
+    await CallService.instance.disconnectNotify();
     final refresh = await TokenStorage.instance.refreshToken;
     try {
       if (refresh != null && refresh.isNotEmpty) {
@@ -123,7 +130,9 @@ class AuthService {
   Future<Map<String, dynamic>?> restoreSession() async {
     if (!await TokenStorage.instance.hasRefreshToken) return null;
     try {
-      return await fetchMe();
+      final user = await fetchMe();
+      unawaited(CallService.instance.connectNotify());
+      return user;
     } on ApiException {
       return null;
     }

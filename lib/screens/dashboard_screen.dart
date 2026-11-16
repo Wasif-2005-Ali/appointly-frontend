@@ -2276,7 +2276,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       {'label': 'New Appointment', 'desc': 'Book a new slot',     'icon': Icons.add_circle_rounded,     's': const NewAppointmentScreen()},
 
       // YAHAN YEH NAYI LINE ADD KI HAI (Video Call ke liye)
-      {'label': 'Test Video Call', 'desc': 'Start WebRTC call',   'icon': Icons.video_camera_front_rounded, 's': const CallScreen(callerId: 'test_user_1')},
+      {'label': 'Video Call', 'desc': 'Call another user',   'icon': Icons.video_camera_front_rounded, 's': const StartCallScreen()},
 
       {'label': 'Add Client',      'desc': 'Register new client', 'icon': Icons.person_add_rounded,     's': const AddClientScreen()},
       {'label': 'Send Reminder',   'desc': 'Notify your clients', 'icon': Icons.send_rounded,            's': const SendReminderScreen()},
