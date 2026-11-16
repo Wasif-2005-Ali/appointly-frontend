@@ -1,4 +1,3 @@
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../theme/app_theme.dart';
@@ -11,6 +10,7 @@ import '../screens/my_availability_screen.dart';
 import '../screens/action_screens.dart';
 import '../screens/personal_tasks_screen.dart';
 import '../user_session.dart';
+import '../services/auth_service.dart';
 import '../screens/login_signup_screen.dart';
 
 class DrawerWidget extends StatelessWidget {
@@ -166,8 +166,9 @@ class DrawerWidget extends StatelessWidget {
     padding: EdgeInsets.fromLTRB(12, 8, 12, MediaQuery.of(ctx).padding.bottom + 12),
     decoration: BoxDecoration(border: Border(top: BorderSide(color: appState.drawerDividerColor))),
     child: ListTile(
-      onTap: () {
-        UserSession.instance.clear();
+      onTap: () async {
+        await AuthService.instance.logout();
+        if (!ctx.mounted) return;
         Navigator.pushAndRemoveUntil(
           ctx,
           MaterialPageRoute(builder: (_) => const WelcomeScreen()),

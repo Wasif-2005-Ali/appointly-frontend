@@ -5,6 +5,7 @@ import 'package:google_fonts/google_fonts.dart';
 import '../app_state.dart';
 import '../models/appointment.dart' as appt_model;
 import '../models/personal_task.dart';
+import '../services/api_client.dart';
 import '../theme/app_theme.dart';
 import '../theme/dark_theme.dart';
 
@@ -925,6 +926,18 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
     Navigator.pop(context);
   }
 
+  /// Shows a backend error (e.g. a cancel/reschedule the server rejected)
+  /// as a red snackbar.
+  void _showApiError(ApiException e) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(e.message,
+          style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+      backgroundColor: const Color(0xFFE05C5C),
+      behavior: SnackBarBehavior.floating,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+    ));
+  }
+
   /// Shows the conflict confirmation dialog for an appointment overlap.
   void _showConflictConfirmDialog(appt_model.Appointment appt) {
     showModalBottomSheet(
@@ -944,7 +957,13 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
         onCancelAppt: () async {
           final appState = AppStateProvider.of(context);
           if (appt.id != null) {
-            await appState.updateAppointmentStatus(appt.id!, appt_model.ApptStatus.cancelled);
+            try {
+              await appState.updateAppointmentStatus(appt.id!, appt_model.ApptStatus.cancelled);
+            } on ApiException catch (e) {
+              if (!mounted) return;
+              _showApiError(e);
+              return;
+            }
           }
           if (!mounted) return;
           Navigator.pop(context); // close conflict sheet
@@ -954,7 +973,13 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
         onReschedule: (newDateTime) async {
           final appState = AppStateProvider.of(context);
           final updated  = appt.copyWith(dateTime: newDateTime);
-          await appState.updateAppointment(updated);
+          try {
+            await appState.updateAppointment(updated);
+          } on ApiException catch (e) {
+            if (!mounted) return;
+            _showApiError(e);
+            return;
+          }
           if (!mounted) return;
           Navigator.pop(context); // close conflict sheet
           setState(() => _checkConflict());
@@ -1561,7 +1586,13 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
                 final appState = AppStateProvider.of(context);
                 final appt = _conflict!.appointment!;
                 if (appt.id != null) {
-                  await appState.updateAppointmentStatus(appt.id!, appt_model.ApptStatus.cancelled);
+                  try {
+                    await appState.updateAppointmentStatus(appt.id!, appt_model.ApptStatus.cancelled);
+                  } on ApiException catch (e) {
+                    if (!mounted) return;
+                    _showApiError(e);
+                    return;
+                  }
                 }
                 if (!mounted) return;
                 setState(() => _checkConflict());
@@ -1572,7 +1603,13 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
                 final newDT = await _pickRescheduleDateTime(appt.dateTime);
                 if (!mounted || newDT == null) return;
                 final appState = AppStateProvider.of(context);
-                await appState.updateAppointment(appt.copyWith(dateTime: newDT));
+                try {
+                  await appState.updateAppointment(appt.copyWith(dateTime: newDT));
+                } on ApiException catch (e) {
+                  if (!mounted) return;
+                  _showApiError(e);
+                  return;
+                }
                 if (!mounted) return;
                 setState(() => _checkConflict());
               }),
@@ -2292,6 +2329,7 @@ class _AppointmentQuickView extends StatelessWidget {
       case appt_model.ApptStatus.pending:    return const Color(0xFFF4A24A);
       case appt_model.ApptStatus.cancelled:  return const Color(0xFFE05C5C);
       case appt_model.ApptStatus.completed:  return const Color(0xFF4A90D9);
+      case appt_model.ApptStatus.rejected:   return const Color(0xFFC62828);
     }
   }
 
@@ -2301,6 +2339,7 @@ class _AppointmentQuickView extends StatelessWidget {
       case appt_model.ApptStatus.pending:    return 'Pending';
       case appt_model.ApptStatus.cancelled:  return 'Cancelled';
       case appt_model.ApptStatus.completed:  return 'Completed';
+      case appt_model.ApptStatus.rejected:   return 'Rejected';
     }
   }
 }

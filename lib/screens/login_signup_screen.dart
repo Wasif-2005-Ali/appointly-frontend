@@ -3,7 +3,8 @@ import 'package:flutter/material.dart';
 import '../app_state.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_svg/flutter_svg.dart';
-import '../database/bd_helper.dart';
+import '../services/api_client.dart';
+import '../services/auth_service.dart';
 import '../user_session.dart';
 import '../widgets/appointly_logo.dart';
 import 'dashboard_screen.dart';
@@ -295,27 +296,21 @@ class _LoginScreenState extends State<LoginScreen> {
   Future<void> _login() async {
     if (!_formKey.currentState!.validate()) return;
     setState(() { _loading = true; _error = ''; });
-    final result = await DBHelper.instance.loginUser(
-      email: _emailCtrl.text.trim(), password: _passCtrl.text,
-    );
-    if (!mounted) return;
-    switch (result.result) {
-      case LoginResult.success:
-        UserSession.instance.setFromMap(result.userRow!);
-        await DBHelper.instance.saveSession(result.userRow!['id'] as int);
-        if (!mounted) return;
-        await AppStateProvider.of(context).loadUserData();
-        if (!mounted) return;
-        Navigator.pushAndRemoveUntil(context, _slide(const DashboardScreen()), (r) => false);
-        break;
-      case LoginResult.emailNotFound:
-        setState(() { _loading = false; _error = 'No account found with this email address.'; });
-        break;
-      case LoginResult.wrongPassword:
-        setState(() { _loading = false; _error = 'Incorrect password. Please try again.'; });
-        break;
-      default:
-        setState(() { _loading = false; _error = 'Something went wrong. Please try again.'; });
+    try {
+      final user = await AuthService.instance.login(
+        email: _emailCtrl.text.trim(), password: _passCtrl.text,
+      );
+      if (!mounted) return;
+      UserSession.instance.setFromMap(user);
+      await AppStateProvider.of(context).loadUserData();
+      if (!mounted) return;
+      Navigator.pushAndRemoveUntil(context, _slide(const DashboardScreen()), (r) => false);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() { _loading = false; _error = e.message; });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() { _loading = false; _error = 'Something went wrong. Please try again.'; });
     }
   }
 
@@ -489,14 +484,28 @@ class _LoginScreenState extends State<LoginScreen> {
             child: Text('Cancel', style: GoogleFonts.dmSans(
                 color: appState.txtSub, fontWeight: FontWeight.w600))),
         ElevatedButton(
-          onPressed: () {
+          onPressed: () async {
+            final email = ctrl.text.trim();
             Navigator.pop(ctx);
-            ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
-              content: Text('Reset link sent! Check your email.',
-                  style: GoogleFonts.dmSans(fontWeight: FontWeight.w600, color: Colors.white)),
-              backgroundColor: const Color(0xFF2ECC96), behavior: SnackBarBehavior.floating,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-            ));
+            if (email.isEmpty) return;
+            try {
+              await AuthService.instance.requestPasswordReset(email);
+              if (!ctx.mounted) return;
+              ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
+                content: Text('Reset link sent! Check your email.',
+                    style: GoogleFonts.dmSans(fontWeight: FontWeight.w600, color: Colors.white)),
+                backgroundColor: const Color(0xFF2ECC96), behavior: SnackBarBehavior.floating,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ));
+            } on ApiException catch (e) {
+              if (!ctx.mounted) return;
+              ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
+                content: Text(e.message,
+                    style: GoogleFonts.dmSans(fontWeight: FontWeight.w600, color: Colors.white)),
+                backgroundColor: const Color(0xFFE05C5C), behavior: SnackBarBehavior.floating,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ));
+            }
           },
           style: ElevatedButton.styleFrom(
             backgroundColor: appState.accent,
@@ -549,33 +558,27 @@ class _SignupScreenState extends State<SignupScreen> {
     if (!_formKey.currentState!.validate()) return;
     if (!_pwStrong) { setState(() => _error = 'Password does not meet all requirements.'); return; }
     setState(() { _loading = true; _error = ''; });
-    final result = await DBHelper.instance.registerUser(
-      fullName: _nameCtrl.text.trim(), email: _emailCtrl.text.trim(),
-      password: _passCtrl.text, profession: _profCtrl.text.trim(),
-    );
-    if (!mounted) return;
-    switch (result) {
-      case RegisterResult.success:
-        final login = await DBHelper.instance.loginUser(
-          email: _emailCtrl.text.trim(), password: _passCtrl.text,
-        );
-        if (!mounted) return;
-        if (login.result == LoginResult.success) {
-          UserSession.instance.setFromMap(login.userRow!);
-          await DBHelper.instance.saveSession(login.userRow!['id'] as int);
-          if (!mounted) return;
-          await AppStateProvider.of(context).loadUserData();
-          if (!mounted) return;
-          Navigator.pushAndRemoveUntil(context, _slide(const DashboardScreen()), (r) => false);
-        } else {
-          setState(() { _loading = false; _error = 'Account created! Please log in.'; });
-        }
-        break;
-      case RegisterResult.emailAlreadyExists:
-        setState(() { _loading = false; _error = 'An account with this email already exists.'; });
-        break;
-      default:
-        setState(() { _loading = false; _error = 'Registration failed. Please try again.'; });
+    try {
+      await AuthService.instance.register(
+        fullName: _nameCtrl.text.trim(), email: _emailCtrl.text.trim(),
+        password: _passCtrl.text, confirmPassword: _confCtrl.text,
+        profession: _profCtrl.text.trim(),
+      );
+      // Register returns no tokens, so log in right away.
+      final user = await AuthService.instance.login(
+        email: _emailCtrl.text.trim(), password: _passCtrl.text,
+      );
+      if (!mounted) return;
+      UserSession.instance.setFromMap(user);
+      await AppStateProvider.of(context).loadUserData();
+      if (!mounted) return;
+      Navigator.pushAndRemoveUntil(context, _slide(const DashboardScreen()), (r) => false);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() { _loading = false; _error = e.message; });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() { _loading = false; _error = 'Registration failed. Please try again.'; });
     }
   }
 

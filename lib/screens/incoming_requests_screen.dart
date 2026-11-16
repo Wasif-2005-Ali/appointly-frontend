@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../app_state.dart';
+import '../models/appointment.dart';
+import '../services/api_client.dart';
 import '../theme/app_theme.dart';
 import '../theme/dark_theme.dart';
+import '../user_session.dart';
 import 'appointment_detail_screen.dart';
 
 enum RequestStatus { pending, accepted, declined }
@@ -11,11 +14,14 @@ class IncomingRequest {
   final String id, clientName, service, requestedDate, requestedTime, message, timeAgo;
   final Color avatarColor;
   final bool isNew;
+  /// The backend appointment id (null only for requests with no API record).
+  final int? appointmentId;
   RequestStatus status;
   IncomingRequest({required this.id, required this.clientName, required this.service,
     required this.requestedDate, required this.requestedTime, required this.message,
     required this.avatarColor, required this.timeAgo,
-    required this.isNew, this.status = RequestStatus.pending});
+    required this.isNew, this.appointmentId,
+    this.status = RequestStatus.pending});
   String get initials => clientName.trim().split(' ').map((w) => w.isNotEmpty ? w[0] : '').join();
 }
 
@@ -32,13 +38,50 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
   late Animation<Offset> _slide;
   int _selectedFilter = 0;
 
-  final List<IncomingRequest> _requests = [
-    IncomingRequest(id:'001', clientName:'Mahnoor Siddiqui', service:'Deep Tissue Massage', requestedDate:'Tue, Mar 18', requestedTime:'10:00 AM', message:"Hi! I'd like to book a session for my back pain. Please let me know if this slot works!", avatarColor:const Color(0xFF7C3AED), timeAgo:'5 min ago', isNew:true),
-    IncomingRequest(id:'002', clientName:'Rahim Shah', service:'Consultation', requestedDate:'Wed, Mar 19', requestedTime:'2:00 PM', message:'Looking for an initial consultation. First time booking with you. Excited!', avatarColor:const Color(0xFF2ECC96), timeAgo:'22 min ago', isNew:true),
-    IncomingRequest(id:'003', clientName:'Nida Hussain', service:'Hair Coloring', requestedDate:'Thu, Mar 20', requestedTime:'11:00 AM', message:'I want highlights done. I saw your work on Instagram and loved it!', avatarColor:const Color(0xFFE05C5C), timeAgo:'1 hr ago', isNew:true),
-    IncomingRequest(id:'004', clientName:'Jawad Malik', service:'Physiotherapy', requestedDate:'Fri, Mar 21', requestedTime:'9:30 AM', message:'Referred by Dr. Ahmed. Need post-surgery rehab sessions.', avatarColor:const Color(0xFF4A90D9), timeAgo:'3 hrs ago', isNew:false),
-    IncomingRequest(id:'005', clientName:'Sobia Raza', service:'Skin Care Session', requestedDate:'Mon, Mar 24', requestedTime:'3:00 PM', message:'Would love a facial + skin consultation. Flexible with timing!', avatarColor:const Color(0xFFF4A24A), timeAgo:'Yesterday', isNew:false),
-  ];
+  /// Requests made TO me, derived from my appointments (I am the provider).
+  /// Pending → pending, confirmed (accepted) → accepted, rejected → declined.
+  /// Cancelled/completed appointments are not requests, so they are left out.
+  /// (This replaces the old hardcoded demo list.)
+  List<IncomingRequest> get _requests {
+    final myId = UserSession.instance.userId?.toString();
+    return AppStateProvider.of(context).appointments
+        .where((a) => a.providerId != null && a.providerId == myId)
+        .where((a) => a.status == ApptStatus.pending ||
+            a.status == ApptStatus.confirmed ||
+            a.status == ApptStatus.rejected)
+        .map((a) {
+          final created = a.createdAt ?? a.dateTime;
+          return IncomingRequest(
+            id: '${a.id}',
+            appointmentId: a.id,
+            clientName: a.name,
+            service: a.service,
+            requestedDate: a.displayDate,
+            requestedTime: a.displayTime,
+            message: a.note.isEmpty ? 'No message.' : a.note,
+            avatarColor: a.avatarColor,
+            timeAgo: _timeAgo(created),
+            isNew: a.status == ApptStatus.pending &&
+                created.isAfter(
+                    DateTime.now().subtract(const Duration(hours: 24))),
+            status: a.status == ApptStatus.confirmed
+                ? RequestStatus.accepted
+                : (a.status == ApptStatus.rejected
+                    ? RequestStatus.declined
+                    : RequestStatus.pending),
+          );
+        })
+        .toList();
+  }
+
+  static String _timeAgo(DateTime t) {
+    final diff = DateTime.now().difference(t);
+    if (diff.inMinutes < 1) return 'Just now';
+    if (diff.inMinutes < 60) return '${diff.inMinutes} min ago';
+    if (diff.inHours < 24) return '${diff.inHours} hr${diff.inHours == 1 ? '' : 's'} ago';
+    if (diff.inDays == 1) return 'Yesterday';
+    return '${diff.inDays} days ago';
+  }
 
   List<IncomingRequest> get _filtered {
     if (_selectedFilter == 0) return _requests;
@@ -231,7 +274,22 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
           if (isPending)
             Padding(padding: const EdgeInsets.fromLTRB(16, 12, 16, 16), child: Row(children: [
               Expanded(child: GestureDetector(
-                onTap: () => setState(() => r.status = RequestStatus.declined),
+                onTap: () async {
+                  final id = r.appointmentId;
+                  if (id == null) return;
+                  try {
+                    await AppStateProvider.of(context).rejectAppointment(id);
+                  } on ApiException catch (e) {
+                    if (!context.mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                      content: Text(e.message,
+                          style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                      backgroundColor: AppColors.danger,
+                      behavior: SnackBarBehavior.floating,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14))));
+                  }
+                },
                 child: Container(padding: const EdgeInsets.symmetric(vertical: 11),
                   decoration: BoxDecoration(color: AppColors.danger.withOpacity(0.08),
                       borderRadius: BorderRadius.circular(12),
@@ -244,8 +302,23 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
               )),
               const SizedBox(width: 10),
               Expanded(child: GestureDetector(
-                onTap: () {
-                  setState(() => r.status = RequestStatus.accepted);
+                onTap: () async {
+                  final id = r.appointmentId;
+                  if (id == null) return;
+                  try {
+                    await AppStateProvider.of(context).acceptAppointment(id);
+                  } on ApiException catch (e) {
+                    if (!context.mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                      content: Text(e.message,
+                          style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                      backgroundColor: AppColors.danger,
+                      behavior: SnackBarBehavior.floating,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14))));
+                    return;
+                  }
+                  if (!context.mounted) return;
                   ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                     content: Text('${r.clientName}\'s request accepted!', style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
                     backgroundColor: AppColors.green, behavior: SnackBarBehavior.floating,

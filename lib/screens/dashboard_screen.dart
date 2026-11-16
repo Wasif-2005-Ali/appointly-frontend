@@ -1,11 +1,10 @@
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'call_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../app_state.dart';
-import '../theme/app_theme.dart';
+import '../services/api_client.dart';
 import '../widgets/drawer_widget.dart';
 import '../widgets/appointly_hand_icon.dart';
 import '../models/appointment.dart';
@@ -15,7 +14,6 @@ import 'incoming_requests_screen.dart';
 import 'profile_screen.dart';
 import 'action_screens.dart';
 import '../screens/personal_tasks_screen.dart';
-import 'personal_tasks_screen.dart';
 import 'appointment_detail_screen.dart';
 import '../chat/chat.dart';
 import 'my_availability_screen.dart';
@@ -166,8 +164,23 @@ class _DashboardScreenState extends State<DashboardScreen>
                 onTap: () async {
                   Navigator.pop(context);
                   if (a.id == null) return;
-                  await AppStateProvider.of(context)
-                      .updateAppointmentStatus(a.id!, ApptStatus.confirmed);
+                  try {
+                    await AppStateProvider.of(context)
+                        .updateAppointmentStatus(a.id!, ApptStatus.confirmed);
+                  } on ApiException catch (e) {
+                    // Accept is provider-only and pending-only — a
+                    // cancelled appointment cannot be re-confirmed.
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                      content: Text(e.message,
+                          style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                      backgroundColor: const Color(0xFFE05C5C),
+                      behavior: SnackBarBehavior.floating,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14)),
+                    ));
+                    return;
+                  }
                   if (mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                       content: Text('Appointment re-confirmed!',
@@ -2401,6 +2414,8 @@ class _DashboardScreenState extends State<DashboardScreen>
         sBg = const Color(0xFFFFECEC); sFg = const Color(0xFFB83232); sLbl = 'Cancelled'; break;
       case ApptStatus.completed:
         sBg = const Color(0xFFE8F5E9); sFg = const Color(0xFF2E7D32); sLbl = 'Completed'; break;
+      case ApptStatus.rejected:
+        sBg = const Color(0xFFFCE4EC); sFg = const Color(0xFFC62828); sLbl = 'Rejected';  break;
     }
     final compact = AppStateProvider.of(context).compactView;
     final vPad    = compact ? 5.0  : 10.0;

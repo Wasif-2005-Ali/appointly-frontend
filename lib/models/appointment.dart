@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-enum ApptStatus { confirmed, pending, cancelled, completed }
+enum ApptStatus { confirmed, pending, cancelled, completed, rejected }
 
 class Appointment {
   int?       id;
@@ -15,6 +15,11 @@ class Appointment {
   String     cancellationNote;
   ApptStatus status;
   int        colorValue;
+  /// Backend participant ids (API appointments only; not stored in SQLite).
+  String?    requesterId;
+  String?    providerId;
+  /// When the backend created the appointment (API appointments only).
+  DateTime?  createdAt;
 
   Appointment({
     this.id,
@@ -28,7 +33,76 @@ class Appointment {
     this.cancellationNote  = '',
     this.status            = ApptStatus.pending,
     this.colorValue        = 0xFF4A90D9,
+    this.requesterId,
+    this.providerId,
+    this.createdAt,
   });
+
+  // ── Backend API ───────────────────────────────────────────────────────────
+  /// Avatar colours cycled through for API appointments (stable per id).
+  static const _apiColors = [
+    0xFF4A90D9, 0xFF2ECC96, 0xFF7C3AED, 0xFFF4A24A,
+    0xFFE05C5C, 0xFF0D9E6A, 0xFF1A5EA8,
+  ];
+
+  static ApptStatus _statusFromApi(String s) {
+    switch (s) {
+      case 'accepted':  return ApptStatus.confirmed;
+      case 'rejected':  return ApptStatus.rejected;
+      case 'cancelled': return ApptStatus.cancelled;
+      case 'completed': return ApptStatus.completed;
+      case 'pending':
+      default:          return ApptStatus.pending;
+    }
+  }
+
+  /// Duration label for [minutes], using the labels the UI already knows
+  /// (`15 min`, `1 hr`, …) and falling back to `N min`.
+  static String durationLabel(int minutes) {
+    switch (minutes) {
+      case 15:  return '15 min';
+      case 30:  return '30 min';
+      case 45:  return '45 min';
+      case 60:  return '1 hr';
+      case 90:  return '1.5 hr';
+      case 120: return '2 hr';
+      default:  return '$minutes min';
+    }
+  }
+
+  /// Maps a backend appointment object to the local model.
+  ///
+  /// The API has no names, services or locations, so the display name is
+  /// the other party (`Provider #<id>` / `Requester #<id>`, picked with
+  /// [currentUserId]) and the service is a generic `Appointment`.
+  factory Appointment.fromApi(
+    Map<String, dynamic> json, {
+    String? currentUserId,
+  }) {
+    final id          = json['id'] as int;
+    final requesterId = json['requester_id']?.toString() ?? '';
+    final providerId  = json['provider_id']?.toString() ?? '';
+    final startsAt    = DateTime.parse(json['starts_at'] as String).toLocal();
+    final endsAt      = DateTime.parse(json['ends_at'] as String).toLocal();
+    final createdRaw  = json['created_at'] as String?;
+    final isRequester =
+        currentUserId != null && requesterId == currentUserId;
+    return Appointment(
+      id: id,
+      apptNumber: id,
+      name: isRequester ? 'Provider #$providerId' : 'Requester #$requesterId',
+      service: 'Appointment',
+      dateTime: startsAt,
+      duration: durationLabel(endsAt.difference(startsAt).inMinutes),
+      location: '',
+      note: (json['notes'] as String?) ?? '',
+      status: _statusFromApi((json['status'] as String?) ?? 'pending'),
+      colorValue: _apiColors[id % _apiColors.length],
+      requesterId: requesterId,
+      providerId: providerId,
+      createdAt: createdRaw == null ? null : DateTime.tryParse(createdRaw),
+    );
+  }
 
   // ── Convenience getters ───────────────────────────────────────────────────
   Color get avatarColor => Color(colorValue);
@@ -91,6 +165,8 @@ class Appointment {
     if (d == '1 hr')   return 60;
     if (d == '1.5 hr') return 90;
     if (d == '2 hr')   return 120;
+    final m = RegExp(r'^(\d+)\s*min$').firstMatch(d.trim());
+    if (m != null) return int.parse(m.group(1)!);
     return 30;
   }
 
@@ -129,6 +205,7 @@ class Appointment {
     int? id, int? apptNumber, String? name, String? service, DateTime? dateTime,
     String? duration, String? location, String? note, String? cancellationNote,
     ApptStatus? status, int? colorValue,
+    String? requesterId, String? providerId, DateTime? createdAt,
   }) => Appointment(
     id: id ?? this.id, apptNumber: apptNumber ?? this.apptNumber,
     name: name ?? this.name,
@@ -138,5 +215,8 @@ class Appointment {
     cancellationNote: cancellationNote ?? this.cancellationNote,
     status: status ?? this.status,
     colorValue: colorValue ?? this.colorValue,
+    requesterId: requesterId ?? this.requesterId,
+    providerId: providerId ?? this.providerId,
+    createdAt: createdAt ?? this.createdAt,
   );
 }

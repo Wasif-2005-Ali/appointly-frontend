@@ -10,13 +10,13 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import '../app_state.dart';
 import '../database/bd_helper.dart';
+import '../services/auth_service.dart';
 import '../user_session.dart';
 import 'login_signup_screen.dart';
 import '../theme/app_theme.dart';
 import '../theme/custom_color_picker.dart';
 import '../theme/theme_selector_screen.dart';
 import '../widgets/save_icon_button.dart';
-import '../widgets/save_success_overlay.dart';
 
 
 class SettingsScreen extends StatefulWidget {
@@ -877,6 +877,7 @@ class _SettingsScreenState extends State<SettingsScreen>
       ElevatedButton(
         onPressed: () async {
           Navigator.pop(ctx);
+          await AuthService.instance.logout();
           await DBHelper.instance.clearSession();
           UserSession.instance.clear();
           if (!mounted) return;

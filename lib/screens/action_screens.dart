@@ -1,13 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../app_state.dart';
-import '../database/bd_helper.dart';
 import '../models/appointment.dart' as appt_model;
+import '../services/api_client.dart';
+import '../services/appointment_service.dart';
 import '../theme/app_theme.dart';
 import '../theme/dark_theme.dart';
 import '../widgets/save_icon_button.dart';
-import '../widgets/save_success_overlay.dart';
-import 'my_availability_screen.dart';
 import '../models/personal_task.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +114,9 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
 
   final _nameCtrl  = TextEditingController();
   final _notesCtrl = TextEditingController();
+  /// The provider being booked with. The backend has no provider
+  /// directory, so the user must know (and enter) their user ID.
+  final _providerIdCtrl = TextEditingController();
   String? _service;
   String _selectedDuration = '30 min';
   DateTime _selectedDate = DateTime.now();
@@ -228,6 +230,9 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
         accent: dmAccent,
         selectedDuration: _selectedDuration,
         existingAppointments: AppStateProvider.of(context).appointments,
+        providerId: _providerIdCtrl.text.trim().isEmpty
+            ? null
+            : _providerIdCtrl.text.trim(),
       ),
     );
     if (result != null && mounted) {
@@ -273,6 +278,20 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
                 items: _services.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
                 onChanged: (v) => setState(() => _service = v),
               ))),
+            ])),
+            const SizedBox(height: 14),
+            // ── PROVIDER (who this appointment is booked with) ────────────
+            _dmCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _dmCardTitle('Provider', Icons.badge_rounded, const Color(0xFF1A5EA8)),
+              const SizedBox(height: 16),
+              _dmLabel('Provider User ID'),
+              _dmField(_providerIdCtrl, 'e.g. 12', Icons.badge_outlined),
+              const SizedBox(height: 8),
+              Text('Ask your provider for their user ID — the booking is '
+                  'sent to them for approval. Entering it also shows their '
+                  'real available slots in the calendar below.',
+                  style: GoogleFonts.dmSans(fontSize: 11.5, color: dmTxtSub,
+                      fontWeight: FontWeight.w500, height: 1.4)),
             ])),
             const SizedBox(height: 14),
             // ── 2. DATE & TIME (single button → calendar dialog) ──────────
@@ -420,9 +439,36 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
             const SizedBox(height: 24),
             _actionBtn('Book Appointment', Icons.check_circle_outline_rounded,
                 dmBtnGradient[0], dmBtnGradient[1], () async {
-                  final cancelled = await _saveToDb();
+                  try {
+                    await _saveToDb();
+                  } on ApiException catch (e) {
+                    // Booking failed (e.g. the time conflicts, or the
+                    // provider has no availability then). Show the reason
+                    // and keep the form open.
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                      content: Text(e.message,
+                          style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                      backgroundColor: const Color(0xFFE05C5C),
+                      behavior: SnackBarBehavior.floating,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14)),
+                    ));
+                    return;
+                  }
                   if (!mounted) return;
-                  _showBookingResult(cancelled);
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                    content: Row(children: [
+                      const Icon(Icons.check_circle_rounded, color: Colors.white, size: 18),
+                      const SizedBox(width: 10),
+                      Expanded(child: Text(
+                        'Appointment requested! Waiting for the provider to accept.',
+                        style: GoogleFonts.dmSans(fontWeight: FontWeight.w600))),
+                    ]),
+                    backgroundColor: const Color(0xFF2ECC96),
+                    behavior: SnackBarBehavior.floating,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  ));
                   Navigator.pop(context);
                 }),
           ]),
@@ -431,8 +477,8 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
     );
   }
 
-  // ── Save new appointment to SQLite via AppState ───────────────────────────
-  Future<List<String>> _saveToDb() async {
+  // ── Book the appointment through the backend via AppState ─────────────────
+  Future<void> _saveToDb() async {
     final dateTime = DateTime(
       _selectedDate.year, _selectedDate.month, _selectedDate.day,
       _selectedTime.hour, _selectedTime.minute,
@@ -445,51 +491,26 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
       default:          location = _locationCtrl.text.trim().isNotEmpty
           ? _locationCtrl.text.trim() : 'Location TBD';
     }
+    // The booking API has no service or location fields, so they are
+    // folded into the notes the provider sees.
+    final service = _service ?? 'Consultation';
+    final extra = _notesCtrl.text.trim();
+    final note = 'Service: $service\nLocation: $location'
+        '${extra.isEmpty ? '' : '\n$extra'}';
     final appointment = appt_model.Appointment(
       name       : _nameCtrl.text.trim().isNotEmpty ? _nameCtrl.text.trim() : 'Unknown Client',
-      service    : _service ?? 'Consultation',
+      service    : service,
       dateTime   : dateTime,
       duration   : _selectedDuration,
       location   : location,
-      note       : _notesCtrl.text.trim(),
-      status     : appt_model.ApptStatus.confirmed,
+      note       : note,
+      status     : appt_model.ApptStatus.pending,
       colorValue : 0xFF4A90D9,
+      providerId : _providerIdCtrl.text.trim(),
     );
-    return AppStateProvider.of(context).addAppointment(appointment);
-  }
-
-
-  void _showBookingResult(List<String> cancelled) {
-    if (cancelled.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Row(children: [
-          const Icon(Icons.check_circle_rounded, color: Colors.white, size: 18),
-          const SizedBox(width: 10),
-          Text('Appointment booked!',
-              style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
-        ]),
-        backgroundColor: const Color(0xFF2ECC96),
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-      ));
-    } else {
-      // Conflict found — new appointment was downgraded to Pending
-      final names = cancelled.join(', ');
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        duration: const Duration(seconds: 5),
-        content: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 18),
-          const SizedBox(width: 10),
-          Expanded(child: Text(
-            'Time slot taken by: $names. New appointment added as Pending — please reschedule.',
-            style: GoogleFonts.dmSans(fontWeight: FontWeight.w600),
-          )),
-        ]),
-        backgroundColor: const Color(0xFFF4A24A),
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-      ));
-    }
+    // Throws ApiException when the provider ID is missing or the
+    // backend rejects the booking.
+    await AppStateProvider.of(context).addAppointment(appointment);
   }
 
   Widget _buildClientAutocomplete(BuildContext context) {
@@ -623,10 +644,15 @@ class _CalendarPickerDialog extends StatefulWidget {
   final Color accent;
   final String selectedDuration;
   final List<appt_model.Appointment> existingAppointments;
+  /// When set, the selected day's slots come from this provider's real
+  /// published availability (GET /availability/slots/). When null, slots
+  /// are computed locally from my own availability, as before.
+  final String? providerId;
   const _CalendarPickerDialog({
     required this.accent,
     required this.selectedDuration,
     required this.existingAppointments,
+    this.providerId,
   });
   @override
   State<_CalendarPickerDialog> createState() => _CalendarPickerDialogState();
@@ -635,6 +661,48 @@ class _CalendarPickerDialog extends StatefulWidget {
 class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkMode {
   late DateTime _focusedMonth;
   DateTime? _selectedDate;
+  /// Slots fetched from the provider's API for the selected day (null
+  /// means "not loaded" — use the local computation instead).
+  List<TimeOfDay>? _apiSlots;
+  bool _loadingApiSlots = false;
+
+  /// Selects a day and, in provider mode, fetches that provider's real
+  /// slots for it. On failure the local slot computation is used.
+  void _selectDate(DateTime date) {
+    final providerMode =
+        widget.providerId != null && widget.providerId!.isNotEmpty;
+    setState(() {
+      _selectedDate = date;
+      _apiSlots = null;
+      _loadingApiSlots = providerMode;
+    });
+    if (providerMode) _loadApiSlots(date);
+  }
+
+  Future<void> _loadApiSlots(DateTime date) async {
+    final providerId = widget.providerId;
+    if (providerId == null || providerId.isEmpty) return;
+    List<TimeSlot> fetched;
+    try {
+      fetched = await AppointmentService.instance.fetchSlots(
+        providerId: providerId,
+        date: date,
+        durationMinutes: _durationToMins(widget.selectedDuration),
+      );
+    } on ApiException {
+      // Offline or the provider has no published schedule — fall back
+      // to the local slot computation.
+      if (mounted) setState(() => _loadingApiSlots = false);
+      return;
+    }
+    if (!mounted || _selectedDate != date) return;
+    setState(() {
+      _apiSlots = fetched
+          .map((s) => TimeOfDay(hour: s.startsAt.hour, minute: s.startsAt.minute))
+          .toList();
+      _loadingApiSlots = false;
+    });
+  }
 
   static const List<String> _dayNames = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
   String _weekdayKey(int weekday) => _dayNames[weekday - 1];
@@ -753,7 +821,7 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
       'July','August','September','October','November','December'];
 
     final slots = _selectedDate != null
-        ? _getAvailableSlots(_selectedDate!, appState)
+        ? (_apiSlots ?? _getAvailableSlots(_selectedDate!, appState))
         : <TimeOfDay>[];
 
     return Dialog(
@@ -842,13 +910,21 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
                               final isToday   = date == today;
                               final hasAvail  = _hasAvailability(date, appState) && !isPast;
                               final isFull    = hasAvail && _isFullDay(date, appState);
-                              final hasSlots  = hasAvail && !isFull &&
-                                  _getAvailableSlots(date, appState).isNotEmpty;
+                              // In provider mode every future day is tappable
+                              // — the provider's API decides which slots exist
+                              // on it. Otherwise days are gated on my own
+                              // availability, as before.
+                              final providerMode = widget.providerId != null &&
+                                  widget.providerId!.isNotEmpty;
+                              final hasSlots  = providerMode
+                                  ? !isPast
+                                  : hasAvail && !isFull &&
+                                      _getAvailableSlots(date, appState).isNotEmpty;
                               final isSel     = _selectedDate == date;
                               final bookedN   = hasAvail ? _bookedCount(date) : 0;
 
                               return GestureDetector(
-                                onTap: hasSlots ? () => setState(() => _selectedDate = date) : null,
+                                onTap: hasSlots ? () => _selectDate(date) : null,
                                 child: AnimatedContainer(
                                   duration: const Duration(milliseconds: 160),
                                   margin: const EdgeInsets.all(1),
@@ -932,7 +1008,24 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
                               ])),
                             ]),
                             const SizedBox(height: 12),
-                            if (slots.isEmpty)
+                            if (_loadingApiSlots)
+                              Container(
+                                padding: const EdgeInsets.symmetric(vertical: 18),
+                                decoration: BoxDecoration(
+                                  color: dmCard,
+                                  borderRadius: BorderRadius.circular(14),
+                                  border: Border.all(color: dmBorder),
+                                ),
+                                child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                                  SizedBox(width: 18, height: 18,
+                                      child: CircularProgressIndicator(
+                                          strokeWidth: 2.5, color: accent)),
+                                  const SizedBox(width: 10),
+                                  Text('Loading provider slots…',
+                                      style: GoogleFonts.dmSans(fontSize: 12.5, color: dmTxtSub)),
+                                ]),
+                              )
+                            else if (slots.isEmpty)
                               Container(
                                 padding: const EdgeInsets.symmetric(vertical: 18),
                                 decoration: BoxDecoration(
