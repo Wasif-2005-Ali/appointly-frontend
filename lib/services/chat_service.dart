@@ -27,9 +27,8 @@ class ChatRoomInfo {
   factory ChatRoomInfo.fromJson(Map<String, dynamic> json) => ChatRoomInfo(
     roomId: json['room_id'] as String,
     name: json['name'] as String? ?? '',
-    participants: (json['participants'] as List?)
-            ?.map((e) => e.toString())
-            .toList() ??
+    participants:
+        (json['participants'] as List?)?.map((e) => e.toString()).toList() ??
         const [],
     isGroup: json['is_group'] as bool? ?? false,
     createdAt: json['created_at'] == null
@@ -69,9 +68,8 @@ class ChatApiMessage {
       senderUsername: json['sender_username'] as String? ?? '',
       content: json['content'] as String? ?? '',
       messageType: json['message_type'] as String? ?? 'text',
-      readBy: (json['read_by'] as List?)
-              ?.map((e) => e.toString())
-              .toList() ??
+      readBy:
+          (json['read_by'] as List?)?.map((e) => e.toString()).toList() ??
           const [],
       createdAt:
           DateTime.tryParse(json['created_at'] as String? ?? '') ??
@@ -99,21 +97,30 @@ class MessagePage {
     roomId: json['room_id'] as String? ?? '',
     count: json['count'] as int? ?? 0,
     nextBefore: json['next_before'] as String?,
-    messages: (json['messages'] as List?)
+    messages:
+        (json['messages'] as List?)
             ?.map((e) => ChatApiMessage.fromJson(e as Map<String, dynamic>))
             .toList() ??
         const [],
   );
 }
 
-/// Connection state of a [ChatRoomConnection].
-enum ChatConnectionState {
-  connecting,
-  connected,
-  reconnecting,
-  closed,
-  failed,
+/// Preview data for one room in the inbox: the latest message and the
+/// number of unread messages.
+class RoomPreview {
+  final String roomId;
+  final ChatApiMessage? lastMessage;
+  final int unreadCount;
+
+  const RoomPreview({
+    required this.roomId,
+    required this.lastMessage,
+    required this.unreadCount,
+  });
 }
+
+/// Connection state of a [ChatRoomConnection].
+enum ChatConnectionState { connecting, connected, reconnecting, closed, failed }
 
 /// Chat rooms + messages against `/api/chat/` (REST) and
 /// `/ws/chat/<room_id>/` (WebSocket).
@@ -236,6 +243,19 @@ class ChatService {
     }
   }
 
+  /// POST /api/chat/rooms/<room_id>/read/ — mark the room's messages
+  /// as read by me, server-side, so unread badges stay cleared across
+  /// devices and app restarts. Best-effort: failures are ignored —
+  /// the local stamp ([markRoomReadLocally]) still clears the badge
+  /// for this session.
+  Future<void> markRoomRead(String roomId) async {
+    try {
+      await ApiClient.instance.post('$_chat/rooms/$roomId/read/');
+    } catch (_) {
+      // Best-effort: unread badges still clear locally.
+    }
+  }
+
   /// GET /api/chat/rooms/<room_id>/messages/ — the 50 most recent
   /// messages, oldest first. Pass [before] (ISO 8601) to page back.
   Future<MessagePage> listMessages(String roomId, {String? before}) async {
@@ -250,6 +270,89 @@ class ChatService {
       );
     }
     return MessagePage.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
+  }
+
+  /// Locally remembered "read up to" timestamps, one per room. The
+  /// backend has `Message.mark_read()` but never calls it, so `read_by`
+  /// only ever contains the sender — without this, every message from
+  /// someone else would look unread forever. Opening a thread stamps
+  /// the room here ([markRoomReadLocally]); the unread count then only
+  /// counts messages newer than the stamp. If the backend starts
+  /// marking messages read, this stays harmless: `read_by` is checked
+  /// first.
+  final Map<String, DateTime> _lastReadAt = {};
+
+  /// Remember that the user has seen this room's messages up to now.
+  void markRoomReadLocally(String roomId) {
+    _lastReadAt[roomId] = DateTime.now().toUtc();
+  }
+
+  /// Count unread messages in [messages] for [myId]: messages from
+  /// someone else that I have not read. A message counts as read when
+  /// my ID is in its `read_by` list, or when it arrived at or before
+  /// the room's local last-read stamp (see [markRoomReadLocally]).
+  /// Pure — unit-tested.
+  static int countUnread(
+    List<ChatApiMessage> messages, {
+    required String? myId,
+    DateTime? lastReadAt,
+  }) {
+    if (myId == null) return 0;
+    var count = 0;
+    for (final m in messages) {
+      if (m.senderId == myId) continue;
+      if (m.readBy.contains(myId)) continue;
+      if (lastReadAt != null && !m.createdAt.isAfter(lastReadAt)) continue;
+      count++;
+    }
+    return count;
+  }
+
+  /// Fetch a preview for each room: the latest message + unread count.
+  /// Rooms are fetched in parallel; a room that fails to load gets an
+  /// empty preview instead of failing the whole inbox. The messages
+  /// endpoint returns the 50 most recent messages, so the unread count
+  /// is capped at 50 per room — fine for a small number of rooms.
+  Future<Map<String, RoomPreview>> fetchRoomPreviews(
+    List<ChatRoomInfo> rooms,
+  ) async {
+    final myId = _myId;
+    final entries = await Future.wait(
+      rooms.map((room) async {
+        try {
+          final page = await listMessages(room.roomId);
+          final msgs = page.messages;
+          return MapEntry(
+            room.roomId,
+            RoomPreview(
+              roomId: room.roomId,
+              lastMessage: msgs.isEmpty ? null : msgs.last,
+              unreadCount: countUnread(
+                msgs,
+                myId: myId,
+                lastReadAt: _lastReadAt[room.roomId],
+              ),
+            ),
+          );
+        } catch (_) {
+          return MapEntry(
+            room.roomId,
+            RoomPreview(roomId: room.roomId, lastMessage: null, unreadCount: 0),
+          );
+        }
+      }),
+    );
+    return Map.fromEntries(entries);
+  }
+
+  /// Total unread messages across all my rooms (for the dashboard
+  /// badge). Throws [ApiException] like [listRooms] — callers that
+  /// only show a badge should catch and hide it.
+  Future<int> fetchTotalUnread() async {
+    final rooms = await listRooms();
+    if (rooms.isEmpty) return 0;
+    final previews = await fetchRoomPreviews(rooms);
+    return previews.values.fold<int>(0, (sum, p) => sum + p.unreadCount);
   }
 
   /// Open a live WebSocket connection to a room. The caller should
@@ -304,8 +407,7 @@ class ChatRoomConnection {
 
   final _messagesController = StreamController<ChatApiMessage>.broadcast();
   final _errorsController = StreamController<String>.broadcast();
-  final _statesController =
-      StreamController<ChatConnectionState>.broadcast();
+  final _statesController = StreamController<ChatConnectionState>.broadcast();
 
   Completer<List<ChatApiMessage>>? _historyCompleter;
 
@@ -322,15 +424,15 @@ class ChatRoomConnection {
 
   bool _connected = false;
 
-  Uri get _wsUri => Uri.parse(ChatService.wsBase).replace(
-    path: '/ws/chat/$roomId/',
-    queryParameters: {'token': _token},
-  );
+  Uri get _wsUri => Uri.parse(ChatService.wsBase)
+      .replace(path: '/ws/chat/$roomId/', queryParameters: {'token': _token});
 
   Future<void> _connect() async {
-    _emit(_attempts == 0
-        ? ChatConnectionState.connecting
-        : ChatConnectionState.reconnecting);
+    _emit(
+      _attempts == 0
+          ? ChatConnectionState.connecting
+          : ChatConnectionState.reconnecting,
+    );
     try {
       _channel = WebSocketChannel.connect(_wsUri);
     } catch (_) {
@@ -368,7 +470,8 @@ class ChatRoomConnection {
         final completer = _historyCompleter;
         _historyCompleter = null;
         if (completer != null && !completer.isCompleted) {
-          final list = (frame['messages'] as List?)
+          final list =
+              (frame['messages'] as List?)
                   ?.map(
                     (e) => ChatApiMessage.fromJson(e as Map<String, dynamic>),
                   )
@@ -463,15 +566,15 @@ class ChatRoomConnection {
       );
     }
     try {
-      channel.sink.add(jsonEncode({
-        'type': 'chat.message',
-        'content': text,
-        'message_type': messageType,
-      }));
-    } catch (_) {
-      throw const ApiException(
-        'Could not send the message. Please try again.',
+      channel.sink.add(
+        jsonEncode({
+          'type': 'chat.message',
+          'content': text,
+          'message_type': messageType,
+        }),
       );
+    } catch (_) {
+      throw const ApiException('Could not send the message. Please try again.');
     }
   }
 
@@ -490,10 +593,7 @@ class ChatRoomConnection {
     final completer = Completer<List<ChatApiMessage>>();
     _historyCompleter = completer;
     try {
-      channel.sink.add(jsonEncode({
-        'type': 'chat.history',
-        'before': before,
-      }));
+      channel.sink.add(jsonEncode({'type': 'chat.history', 'before': before}));
     } catch (_) {
       _historyCompleter = null;
       return Future.error(
@@ -504,7 +604,9 @@ class ChatRoomConnection {
       const Duration(seconds: 15),
       onTimeout: () {
         _historyCompleter = null;
-        throw const ApiException('Loading history timed out. Please try again.');
+        throw const ApiException(
+          'Loading history timed out. Please try again.',
+        );
       },
     );
   }

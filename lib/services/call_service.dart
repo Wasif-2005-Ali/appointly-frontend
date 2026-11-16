@@ -60,15 +60,16 @@ class IncomingCall {
   });
 
   factory IncomingCall.fromFrame(Map<String, dynamic> frame) => IncomingCall(
-        callId: frame['call_id'] as String,
-        callerId: frame['caller_id']?.toString() ?? '',
-        callerUsername: frame['caller_username'] as String? ?? '',
-        callType: frame['call_type'] as String? ?? 'video',
-        receivedAt: DateTime.now(),
-      );
+    callId: frame['call_id'] as String,
+    callerId: frame['caller_id']?.toString() ?? '',
+    callerUsername: frame['caller_username'] as String? ?? '',
+    callType: frame['call_type'] as String? ?? 'video',
+    receivedAt: DateTime.now(),
+  );
 
-  /// Display name for the caller — the username when the server sent
-  /// one, otherwise `User #id` (there is no user directory API).
+  /// Display name for the caller — the email when the server sent
+  /// one, otherwise `User #id` (the incoming frame carries no name,
+  /// and there is no get-user-by-ID endpoint to resolve one).
   String get displayName =>
       callerUsername.isNotEmpty ? callerUsername : 'User #$callerId';
 }
@@ -146,9 +147,10 @@ class CallSessionInfo {
 /// ends the call locally after [_ringTimeout] ([CallConnection]
 /// sends `call.end`, which moves the session to ENDED).
 ///
-/// ICE uses Google's free public STUN server only. There is no TURN
-/// server configured, so calls across symmetric NATs / mobile data
-/// may fail to connect (ICE failed) — see [CallConnection._iceServers].
+/// ICE uses Google's free public STUN server plus the Open Relay
+/// Project's free public TURN servers as a fallback, so calls can
+/// connect across symmetric NATs and mobile data (STUN alone cannot
+/// relay media) — see [CallConnection._iceServers].
 class CallService {
   CallService._();
   static final CallService instance = CallService._();
@@ -245,9 +247,9 @@ class CallService {
   }
 
   Uri get _notifyUri => Uri.parse(ChatService.wsBase).replace(
-        path: '/ws/notify/',
-        queryParameters: {'token': _notifyToken ?? ''},
-      );
+    path: '/ws/notify/',
+    queryParameters: {'token': _notifyToken ?? ''},
+  );
 
   Future<void> _connectNotifySocket() async {
     if (!_notifyWanted) return;
@@ -315,10 +317,11 @@ class CallService {
       }
       return;
     }
-    final delay = _notifyRetryDelays[_notifyAttempts.clamp(
-      0,
-      _notifyRetryDelays.length - 1,
-    )];
+    final delay =
+        _notifyRetryDelays[_notifyAttempts.clamp(
+          0,
+          _notifyRetryDelays.length - 1,
+        )];
     _notifyAttempts++;
     _notifyReconnectTimer?.cancel();
     _notifyReconnectTimer = Timer(delay, () async {
@@ -361,10 +364,11 @@ class CallService {
   Future<CallConnection> startCall({
     required String calleeId,
     String callType = 'video',
+    String calleeName = '',
   }) async {
     final peerId = calleeId.trim();
     if (peerId.isEmpty) {
-      throw const ApiException('Enter the user ID of the person to call.');
+      throw const ApiException('Choose a person to call.');
     }
     if (peerId == _myId) {
       throw const ApiException('You cannot call yourself.');
@@ -379,6 +383,7 @@ class CallService {
     final connection = CallConnection._outgoing(
       callId: newCallId(),
       peerId: peerId,
+      peerName: calleeName,
       callType: callType == 'audio' ? 'audio' : 'video',
       token: token,
       service: this,
@@ -500,33 +505,34 @@ class CallConnection {
   CallConnection._outgoing({
     required this.callId,
     required this.peerId,
+    this.peerName = '',
     required this.callType,
     required String token,
     required CallService service,
-  })  : _token = token,
-        _service = service,
-        isOutgoing = true,
-        peerName = '';
+  }) : _token = token,
+       _service = service,
+       isOutgoing = true;
 
   CallConnection._incoming({
     required IncomingCall incoming,
     required String token,
     required CallService service,
-  })  : callId = incoming.callId,
-        peerId = incoming.callerId,
-        peerName = incoming.callerUsername,
-        callType = incoming.callType,
-        _token = token,
-        _service = service,
-        isOutgoing = false;
+  }) : callId = incoming.callId,
+       peerId = incoming.callerId,
+       peerName = incoming.callerUsername,
+       callType = incoming.callType,
+       _token = token,
+       _service = service,
+       isOutgoing = false;
 
   final String callId;
 
   /// The other party's numeric user ID.
   final String peerId;
 
-  /// The other party's username when known (incoming calls only;
-  /// outgoing calls only know the ID — there is no user directory).
+  /// The other party's username when known (incoming calls: the
+  /// email from the `call.incoming` frame; outgoing calls: the name
+  /// of the person picked in the user picker, or '' when unknown).
   final String peerName;
 
   /// 'video' or 'audio'.
@@ -538,11 +544,25 @@ class CallConnection {
   final String _token;
   final CallService _service;
 
-  /// STUN only — no TURN server is configured. Calls between two
-  /// phones on mobile data or behind symmetric NATs may fail at the
-  /// ICE stage (see the `failed` ICE state handling below).
+  /// Google STUN plus the Open Relay Project's free public TURN
+  /// servers as a fallback, so calls can connect across symmetric
+  /// NATs and mobile data (STUN alone cannot relay media). The Open
+  /// Relay Project (openrelayproject.org) is a free public service;
+  /// its demo credentials below are published for anyone to use. If
+  /// call reliability matters long-term, the team should run its own
+  /// TURN server (e.g. coturn) or use a paid provider.
   static const _iceServers = [
     {'urls': 'stun:stun.l.google.com:19302'},
+    {
+      'urls': 'turn:openrelay.metered.ca:80',
+      'username': 'openrelayproject',
+      'credential': 'openrelayproject',
+    },
+    {
+      'urls': 'turn:openrelay.metered.ca:443',
+      'username': 'openrelayproject',
+      'credential': 'openrelayproject',
+    },
   ];
 
   WebSocketChannel? _channel;

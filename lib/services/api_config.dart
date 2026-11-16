@@ -16,4 +16,14 @@ class ApiConfig {
 
   /// Base path for the auth endpoints (register, login, me, ...).
   static const String authBase = '$baseUrl/api/v1/auth';
+
+  /// Web OAuth client ID for Google Sign-In (Google Cloud Console →
+  /// APIs & Services → Credentials → OAuth 2.0 Client IDs, type "Web
+  /// application"). The backend verifies ID tokens against the same
+  /// client ID (GOOGLE_CLIENT_ID on Render). GCP project "Appointly"
+  /// (appointly-514920); the consent screen is in Testing mode, so
+  /// only the listed test users can sign in with Google until the app
+  /// is published.
+  static const String googleServerClientId =
+      '1079927760935-c1qptn5omdikssrl58cu7ehkdkki4643.apps.googleusercontent.com';
 }
