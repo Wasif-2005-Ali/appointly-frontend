@@ -17,7 +17,6 @@ import '../theme/app_theme.dart';
 import '../theme/custom_color_picker.dart';
 import '../theme/theme_selector_screen.dart';
 import '../widgets/save_icon_button.dart';
-import '../widgets/save_success_overlay.dart';
 
 
 class SettingsScreen extends StatefulWidget {

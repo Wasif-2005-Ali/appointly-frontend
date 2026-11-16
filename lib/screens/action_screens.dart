@@ -1,15 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../app_state.dart';
-import '../database/bd_helper.dart';
 import '../models/appointment.dart' as appt_model;
 import '../services/api_client.dart';
 import '../services/appointment_service.dart';
 import '../theme/app_theme.dart';
 import '../theme/dark_theme.dart';
 import '../widgets/save_icon_button.dart';
-import '../widgets/save_success_overlay.dart';
-import 'my_availability_screen.dart';
 import '../models/personal_task.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────

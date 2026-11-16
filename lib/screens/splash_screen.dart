@@ -16,7 +16,6 @@ import '../app_state.dart';
 import '../user_session.dart';
 import 'dashboard_screen.dart';
 import 'login_signup_screen.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});

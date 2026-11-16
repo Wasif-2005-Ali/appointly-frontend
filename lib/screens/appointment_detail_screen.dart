@@ -5,7 +5,6 @@ import '../theme/app_theme.dart';
 import '../theme/dark_theme.dart';
 import '../models/appointment.dart';
 import '../services/api_client.dart';
-import '../models/personal_task.dart' show PersonalTaskStore;
 import 'incoming_requests_screen.dart';
 import 'my_appointments_screen.dart' show RescheduleScreen;
 
