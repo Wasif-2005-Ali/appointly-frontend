@@ -1,30 +1,91 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
+// Unit tests for the backend integration: the API -> model mapping and the
+// error-message parsing the UI shows in snackbars. Pure Dart, no plugins,
+// no network — run with `flutter test`.
 
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 
-import 'package:appointly/main.dart';
+import 'package:appointly/models/appointment.dart';
+import 'package:appointly/services/api_client.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  group('Appointment.fromApi', () {
+    Map<String, dynamic> json({String status = 'pending'}) => {
+      'id': 7,
+      'requester_id': 2,
+      'provider_id': 3,
+      'starts_at': '2026-11-17T10:00:00+05:00',
+      'ends_at': '2026-11-17T10:30:00+05:00',
+      'status': status,
+      'notes': 'Bring reports',
+      'created_at': '2026-11-16T20:00:00Z',
+    };
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    test('maps a pending appointment for the requester', () {
+      final a = Appointment.fromApi(json(), currentUserId: '2');
+      expect(a.id, 7);
+      expect(a.name, 'Provider #3');
+      expect(a.status, ApptStatus.pending);
+      expect(a.duration, '30 min');
+      expect(a.note, 'Bring reports');
+      expect(a.providerId, '3');
+      expect(a.requesterId, '2');
+    });
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
+    test('maps an accepted appointment to confirmed for the provider', () {
+      final a = Appointment.fromApi(
+        json(status: 'accepted'),
+        currentUserId: '3',
+      );
+      expect(a.name, 'Requester #2');
+      expect(a.status, ApptStatus.confirmed);
+    });
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    test('maps rejected and cancelled statuses', () {
+      expect(
+        Appointment.fromApi(json(status: 'rejected')).status,
+        ApptStatus.rejected,
+      );
+      expect(
+        Appointment.fromApi(json(status: 'cancelled')).status,
+        ApptStatus.cancelled,
+      );
+    });
+  });
+
+  group('ApiClient.errorMessage', () {
+    test('prefers detail, then message', () {
+      expect(
+        ApiClient.errorMessage(
+          http.Response('{"detail": "Nope."}', 400),
+          'fallback',
+        ),
+        'Nope.',
+      );
+      expect(
+        ApiClient.errorMessage(
+          http.Response('{"message": "Hello."}', 400),
+          'fallback',
+        ),
+        'Hello.',
+      );
+    });
+
+    test('reads DRF field errors and falls back on bad bodies', () {
+      expect(
+        ApiClient.errorMessage(
+          http.Response(
+            '{"email": ["A user with this email already exists."]}',
+            400,
+          ),
+          'fallback',
+        ),
+        'A user with this email already exists.',
+      );
+      expect(
+        ApiClient.errorMessage(http.Response('not json', 500), 'fallback'),
+        'fallback',
+      );
+    });
   });
 }
