@@ -1,7 +1,17 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'app_state.dart';
+import 'screens/call_screen.dart';
 import 'screens/splash_screen.dart';
+import 'services/call_service.dart';
+
+/// Global navigator key, so the incoming-call handler in
+/// [_AppointlyRootState] can show the incoming-call dialog from
+/// anywhere in the app.
+final GlobalKey<NavigatorState> appNavigatorKey =
+    GlobalKey<NavigatorState>();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -36,6 +46,8 @@ class AppointlyRoot extends StatefulWidget {
 
 class _AppointlyRootState extends State<AppointlyRoot> {
   final AppState _appState = AppState();
+  StreamSubscription<IncomingCall>? _incomingSub;
+  bool _incomingDialogOpen = false;
 
   @override
   void initState() {
@@ -43,10 +55,49 @@ class _AppointlyRootState extends State<AppointlyRoot> {
     _appState.addListener(() => setState(() {}));
     // Load appointments from the backend (falls back to SQLite when offline)
     _appState.loadAppointments();
+    // Show the incoming-call dialog whenever the server pushes one.
+    _incomingSub = CallService.instance.incomingCalls.listen(
+      _onIncomingCall,
+    );
+  }
+
+  /// An incoming call arrived on the notify socket. Shows the
+  /// accept/decline dialog (unless one is already open or a call is
+  /// already in progress), then acts on the answer.
+  Future<void> _onIncomingCall(IncomingCall incoming) async {
+    if (_incomingDialogOpen) return;
+    if (CallService.instance.hasActiveCall) return;
+    final navigator = appNavigatorKey.currentState;
+    if (navigator == null) return;
+    _incomingDialogOpen = true;
+    final accepted = await showDialog<bool>(
+      context: navigator.context,
+      barrierDismissible: false,
+      builder: (_) => IncomingCallDialog(incoming: incoming),
+    );
+    _incomingDialogOpen = false;
+    if (accepted == true) {
+      final result = await navigator.push<String?>(
+        MaterialPageRoute(
+          builder: (_) => CallScreen.incoming(incoming: incoming),
+        ),
+      );
+      if (result != null && result.isNotEmpty && mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(result)));
+      }
+    } else if (accepted == false) {
+      await CallService.instance.declineCall(incoming);
+    }
+    // null = the dialog timed out (30s) or was dismissed: the
+    // caller's ring timeout ends the session server-side, so there
+    // is nothing to do here.
   }
 
   @override
   void dispose() {
+    _incomingSub?.cancel();
     _appState.dispose();
     super.dispose();
   }
@@ -89,6 +140,7 @@ class _AppointlyRootState extends State<AppointlyRoot> {
       child: MaterialApp(
         title: 'Appointly',
         debugShowCheckedModeBanner: false,
+        navigatorKey: appNavigatorKey,
         scrollBehavior: const _SmoothScrollBehavior(),
         theme: ThemeData(
           scaffoldBackgroundColor: scaffoldBg,
