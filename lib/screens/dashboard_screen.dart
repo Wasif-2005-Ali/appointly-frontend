@@ -1436,8 +1436,6 @@ class _DashboardScreenState extends State<DashboardScreen>
                 RepaintBoundary(child: _buildWeeklyChart()),
                 const SizedBox(height: 18),
                 RepaintBoundary(child: _buildAnalyticsDonut()),
-                const SizedBox(height: 18),
-                RepaintBoundary(child: _buildClientSatisfactionCard()),
               ]),
             ),
           ),
@@ -1550,6 +1548,10 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Widget _buildIncomingBanner() {
+    final pendingCount = AppStateProvider.of(context)
+        .appointments
+        .where((a) => a.status == ApptStatus.pending)
+        .length;
     return GestureDetector(
       onTap: () => Navigator.push(context, _route(const IncomingRequestsScreen())),
       child: Container(
@@ -1580,13 +1582,17 @@ class _DashboardScreenState extends State<DashboardScreen>
             Text('Incoming Requests', style: GoogleFonts.dmSans(
                 fontSize: 15, fontWeight: FontWeight.w800, color: Colors.white)),
             const SizedBox(height: 3),
-            Text('3 new appointment requests waiting', style: GoogleFonts.dmSans(
-                fontSize: 12, color: Colors.white.withOpacity(0.6))),
+            Text(
+                pendingCount == 0
+                    ? 'No new appointment requests'
+                    : '$pendingCount new appointment ${pendingCount == 1 ? 'request' : 'requests'} waiting',
+                style: GoogleFonts.dmSans(
+                    fontSize: 12, color: Colors.white.withOpacity(0.6))),
           ])),
           Container(width: 36, height: 36,
               decoration: BoxDecoration(color: const Color(0xFFF4A24A), shape: BoxShape.circle,
                   boxShadow: [BoxShadow(color: const Color(0xFFF4A24A).withOpacity(0.5), blurRadius: 8)]),
-              child: Center(child: Text('3', style: GoogleFonts.dmSans(
+              child: Center(child: Text('$pendingCount', style: GoogleFonts.dmSans(
                   fontSize: 14, fontWeight: FontWeight.w900, color: Colors.white)))),
           const SizedBox(width: 8),
           Icon(Icons.arrow_forward_ios_rounded,
@@ -1920,65 +1926,8 @@ class _DashboardScreenState extends State<DashboardScreen>
     ),
   ]);
 
-  // ── CLIENT SATISFACTION CARD ──────────────────────────────────────────────
-  Widget _buildClientSatisfactionCard() {
-    final appState = AppStateProvider.of(context);
-    final g = (int i) => appState.cardGradient(i);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
-      decoration: _card(),
-      child: Row(children: [
-        Container(
-          width: 64, height: 64,
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topLeft, end: Alignment.bottomRight,
-              colors: g(0),
-            ),
-            shape: BoxShape.circle,
-            border: Border.all(color: _accent.withOpacity(0.3), width: 2),
-          ),
-          child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-            Text('4.9', style: GoogleFonts.dmSans(
-                fontSize: 18, fontWeight: FontWeight.w900,
-                color: Colors.white, letterSpacing: -0.5, height: 1)),
-            Icon(Icons.star_rounded, color: const Color(0xFFF4A24A), size: 13),
-          ]),
-        ),
-        const SizedBox(width: 16),
-        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Client Satisfaction', style: GoogleFonts.dmSans(
-              fontSize: 14.5, fontWeight: FontWeight.w800, color: _txtMain)),
-          const SizedBox(height: 3),
-          Text('Based on 87 reviews this month',
-              style: GoogleFonts.dmSans(fontSize: 11.5, color: _txtSub, fontWeight: FontWeight.w500)),
-          const SizedBox(height: 8),
-          Row(children: List.generate(5, (i) => Icon(
-            Icons.star_rounded, color: const Color(0xFFF4A24A), size: 15,
-          ))),
-        ])),
-        const SizedBox(width: 10),
-        Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: const Color(0xFF2ECC96).withOpacity(0.12),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: const Color(0xFF2ECC96).withOpacity(0.3)),
-            ),
-            child: Text('+6%', style: GoogleFonts.dmSans(
-                fontSize: 11, fontWeight: FontWeight.w800,
-                color: const Color(0xFF2ECC96))),
-          ),
-          const SizedBox(height: 4),
-          Text('vs last\nmonth', textAlign: TextAlign.right,
-              style: GoogleFonts.dmSans(fontSize: 9.5, color: _txtSub)),
-        ]),
-      ]),
-    );
-  }
-
   Widget _buildUpcomingSection() {
+    final today = AppStateProvider.of(context).appointmentsForDate(DateTime.now());
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
         _sectionLabel("Today's Upcoming"),
@@ -1997,11 +1946,20 @@ class _DashboardScreenState extends State<DashboardScreen>
         ),
       ]),
       const SizedBox(height: 12),
-      Container(decoration: _card(), padding: const EdgeInsets.all(8),
-        child: Column(children: AppStateProvider.of(context)
-            .appointmentsForDate(DateTime.now())
-            .take(3).map(_apptTile).toList()),
-      ),
+      if (today.isEmpty)
+        Container(
+          decoration: _card(),
+          padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
+          child: Center(
+            child: Text('No appointments today',
+                style: GoogleFonts.dmSans(
+                    fontSize: 13.5, color: _txtSub, fontWeight: FontWeight.w600)),
+          ),
+        )
+      else
+        Container(decoration: _card(), padding: const EdgeInsets.all(8),
+          child: Column(children: today.take(3).map(_apptTile).toList()),
+        ),
     ]);
   }
 
@@ -2305,7 +2263,6 @@ class _DashboardScreenState extends State<DashboardScreen>
       {'label': 'Video Call', 'desc': 'Call another user',   'icon': Icons.video_camera_front_rounded, 's': const StartCallScreen()},
 
       {'label': 'Add Client',      'desc': 'Register new client', 'icon': Icons.person_add_rounded,     's': const AddClientScreen()},
-      {'label': 'Send Reminder',   'desc': 'Notify your clients', 'icon': Icons.send_rounded,            's': const SendReminderScreen()},
       {'label': 'My Availability', 'desc': 'Set your open slots', 'icon': Icons.event_available_rounded, 's': const MyAvailabilityScreen()},
       {'label': 'My Reviews',      'desc': 'See client feedback', 'icon': Icons.star_rounded,            's': const MyReviewsScreen()},
       {'label': 'Personal Tasks',  'desc': 'Manage your to-dos',  'icon': Icons.check_circle_rounded,    's': const PersonalTasksScreen()},
@@ -2371,22 +2328,28 @@ class _DashboardScreenState extends State<DashboardScreen>
             // even when there is limited content on this tab.
             constraints: BoxConstraints(minHeight: constraints.maxHeight + _collapseRange),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                _sectionLabel('Recent Clients'),
-                Container(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: _accent.withOpacity(0.08),
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(color: _border),
-                    ),
-                    child: Text('All →', style: GoogleFonts.dmSans(
-                        fontSize: 12, fontWeight: FontWeight.w700, color: _accent))),
-              ]),
-              const SizedBox(height: 6),
-              Text('248 total clients', style: GoogleFonts.dmSans(
-                  fontSize: 13.5, color: _txtSub, fontWeight: FontWeight.w500)),
+              _sectionLabel('Recent Clients'),
               const SizedBox(height: 16),
-              _buildRecentClients(),
+              // No client list exists yet — honest empty state instead
+              // of hardcoded fake clients and a fake total.
+              Container(
+                decoration: _card(),
+                padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 20),
+                child: Center(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.people_alt_outlined, size: 40,
+                        color: _txtSub.withOpacity(0.5)),
+                    const SizedBox(height: 12),
+                    Text('No client list yet', style: GoogleFonts.dmSans(
+                        fontSize: 15, fontWeight: FontWeight.w800, color: _txtMain)),
+                    const SizedBox(height: 4),
+                    Text('Clients appear here after appointments.',
+                        textAlign: TextAlign.center,
+                        style: GoogleFonts.dmSans(
+                            fontSize: 12.5, color: _txtSub, fontWeight: FontWeight.w500)),
+                  ]),
+                ),
+              ),
             ]),
           ),
         );
@@ -2518,47 +2481,6 @@ class _DashboardScreenState extends State<DashboardScreen>
       ),
     );
   }
-
-  Widget _buildRecentClients() {
-    final clients = [
-      {'name': 'Aisha Khan',     'last': 'Today 9:00 AM',  'ac': _accent,                         'bg': _accent.withOpacity(0.12)},
-      {'name': 'Omar Farooq',    'last': 'Today 10:00 AM', 'ac': const Color(0xFF2ECC96),          'bg': const Color(0xFF2ECC96).withOpacity(0.12)},
-      {'name': 'Zara Malik',     'last': 'Yesterday',      'ac': const Color(0xFFF4A24A),          'bg': const Color(0xFFF4A24A).withOpacity(0.12)},
-      {'name': 'Bilal Chaudhry', 'last': '2 days ago',     'ac': const Color(0xFF7C3AED),          'bg': const Color(0xFF7C3AED).withOpacity(0.12)},
-    ];
-    return Container(decoration: _card(), child: Column(
-      children: List.generate(clients.length, (i) {
-        final c = clients[i];
-        final initials = (c['name'] as String).split(' ').map((w) => w[0]).join();
-        return Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
-          decoration: BoxDecoration(
-            color: i.isEven ? Colors.transparent : const Color(0xFF4A90D9).withOpacity(0.04),
-            borderRadius: BorderRadius.circular(14),
-          ),
-          child: Row(children: [
-            CircleAvatar(radius: 22, backgroundColor: c['bg'] as Color,
-                child: Text(initials, style: GoogleFonts.dmSans(
-                    fontSize: 13, fontWeight: FontWeight.w900, color: c['ac'] as Color))),
-            const SizedBox(width: 14),
-            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(c['name'] as String, style: GoogleFonts.dmSans(
-                  fontSize: 14, fontWeight: FontWeight.w700, color: _txtMain)),
-              const SizedBox(height: 2),
-              Text('Last visit: ${c['last']}', style: GoogleFonts.dmSans(
-                  fontSize: 12, color: _txtSub, fontWeight: FontWeight.w500)),
-            ])),
-            Container(width: 34, height: 34,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(colors: _btnGradient),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: const Icon(Icons.chevron_right_rounded, color: Colors.white, size: 20)),
-          ]),
-        );
-      }),
-    ));
-  }
 }
 
 // ── EXTENSION ──────────────────────────────────────────────────────────────────
@@ -2652,7 +2574,17 @@ class _LineChartPainter extends CustomPainter {
     }
   }
 
-  @override bool shouldRepaint(_) => false;
+  @override
+  bool shouldRepaint(_LineChartPainter old) =>
+      old.data != data ||
+      old.labels != labels ||
+      old.todayIdx != todayIdx ||
+      old.lineColor != lineColor ||
+      old.todayDotColor != todayDotColor ||
+      old.gridColor != gridColor ||
+      old.labelColor != labelColor ||
+      old.todayLabelColor != todayLabelColor ||
+      old.bgDark != bgDark;
 }
 
 // ── DONUT PAINTER ─────────────────────────────────────────────────────────────

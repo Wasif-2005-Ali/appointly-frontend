@@ -503,11 +503,94 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
                   filled: _appt.status != ApptStatus.confirmed,
                 )),
               ]),
+              // Mark a confirmed appointment done (provider only on the
+              // server; a requester tapping it gets the 403 surfaced
+              // below, same as Confirm).
+              if (_appt.status == ApptStatus.confirmed) ...[
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: _actionBtn(
+                    'Mark as done', Icons.task_alt_rounded, AppColors.green,
+                    () async {
+                      try {
+                        await appState.updateAppointmentStatus(
+                            _appt.id!, ApptStatus.completed);
+                      } on ApiException catch (e) {
+                        if (!context.mounted) return;
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                          content: Text(e.message,
+                              style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                          backgroundColor: AppColors.danger,
+                          behavior: SnackBarBehavior.floating,
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14))));
+                        return;
+                      }
+                      setState(() => _appt = _appt.copyWith(status: ApptStatus.completed));
+                    },
+                    filled: true,
+                  ),
+                ),
+              ],
+            ],
+            // Delete (either participant, not completed) — real server
+            // delete now; a confirm dialog guards against accidents.
+            if (_appt.status != ApptStatus.completed) ...[
+              const SizedBox(height: 14),
+              Center(
+                child: TextButton.icon(
+                  onPressed: () => _confirmDelete(appState),
+                  icon: const Icon(Icons.delete_outline_rounded, size: 18),
+                  label: Text('Delete appointment',
+                      style: GoogleFonts.dmSans(fontWeight: FontWeight.w700)),
+                  style: TextButton.styleFrom(foregroundColor: AppColors.danger),
+                ),
+              ),
             ],
           ]),
         )),
       ]),
     );
+  }
+
+  /// Confirm dialog + real delete. Pops back to the list on success.
+  Future<void> _confirmDelete(AppState appState) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete appointment?',
+            style: GoogleFonts.dmSans(fontWeight: FontWeight.w800)),
+        content: Text(
+            'This removes the appointment for both you and the other person. This cannot be undone.',
+            style: GoogleFonts.dmSans()),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('Keep it', style: GoogleFonts.dmSans(fontWeight: FontWeight.w700)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('Delete', style: GoogleFonts.dmSans(
+                fontWeight: FontWeight.w800, color: AppColors.danger)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || _appt.id == null) return;
+    try {
+      await appState.deleteAppointment(_appt.id!);
+    } on ApiException catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(e.message,
+            style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+        backgroundColor: AppColors.danger,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))));
+      return;
+    }
+    if (context.mounted) Navigator.pop(context);
   }
 
   Widget _buildHero(AppState appState) {

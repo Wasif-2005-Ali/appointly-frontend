@@ -258,9 +258,9 @@ class _CallScreenState extends State<CallScreen> {
                 ),
               ),
               const SizedBox(height: 4),
-              Text(
-                _statusText,
-                style: const TextStyle(color: Colors.white70, fontSize: 14),
+              const Text(
+                'Video call',
+                style: TextStyle(color: Colors.white38, fontSize: 13),
               ),
             ],
           ),

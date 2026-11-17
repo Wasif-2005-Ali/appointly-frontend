@@ -412,17 +412,33 @@ class _PersonalTasksState extends State<PersonalTasksScreen>
 
     final orderedKeys = _groupOrder.where((k) => grouped.containsKey(k)).toList();
 
-    return ListView(
+    // Flattened rows so ListView.builder only builds the visible rows
+    // instead of rebuilding the whole eager list on every keystroke.
+    // (isHeader, isSpacer, group, task) — task is null for headers/spacers.
+    final rows = <({bool isHeader, bool isSpacer, String group, PersonalTask? task})>[];
+    for (final key in orderedKeys) {
+      rows.add((isHeader: true, isSpacer: false, group: key, task: null));
+      for (final t in grouped[key]!) {
+        rows.add((isHeader: false, isSpacer: false, group: key, task: t));
+      }
+      rows.add((isHeader: false, isSpacer: true, group: key, task: null));
+    }
+
+    return ListView.builder(
       physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
-      children: [
-        for (final key in orderedKeys) ...[
-          _buildGroupHeader(key, grouped[key]!),
-          const SizedBox(height: 8),
-          ...grouped[key]!.map((t) => _buildTaskCard(t)),
-          const SizedBox(height: 16),
-        ],
-      ],
+      itemCount: rows.length,
+      itemBuilder: (context, i) {
+        final row = rows[i];
+        if (row.isSpacer) return const SizedBox(height: 16);
+        if (row.isHeader) {
+          return Column(children: [
+            _buildGroupHeader(row.group, grouped[row.group]!),
+            const SizedBox(height: 8),
+          ]);
+        }
+        return _buildTaskCard(row.task!);
+      },
     );
   }
 
