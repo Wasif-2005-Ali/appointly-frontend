@@ -597,24 +597,29 @@ class AppState extends ChangeNotifier {
   List<Appointment> _appointments = [];
   List<Appointment> get appointments => List.unmodifiable(_appointments);
 
+  /// Fetches the weekly schedule from the server. Returns true when
+  /// the server answered; false (caller falls back to SQLite) on failure.
+  Future<bool> _fetchAvailabilityFromServer() async {
+    try {
+      _applyApiSchedule(await AppointmentService.instance.fetchMyAvailability());
+      return true;
+    } on ApiException {
+      return false;
+    }
+  }
+
   Future<void> loadUserData() async {
     final userId = UserSession.instance.userId;
     if (userId == null) return;
     final savedTheme = UserSession.instance.themeMode;
     _applyEncodedTheme(savedTheme);
-    // Appointments come from the backend now (falls back to the local
-    // SQLite cache when offline — see loadAppointments).
-    await loadAppointments();
-    // Availability comes from the backend too; fall back to the local
-    // SQLite cache when the request fails.
-    bool availLoaded = false;
-    try {
-      _applyApiSchedule(await AppointmentService.instance.fetchMyAvailability());
-      availLoaded = true;
-    } on ApiException {
-      // Fall through to the SQLite cache below.
-    }
-    if (!availLoaded) {
+    // Appointments + availability come from the backend now (falling
+    // back to the local SQLite cache when offline — see loadAppointments).
+    // They are independent, so fetch them in parallel instead of one
+    // after the other.
+    final availFuture = _fetchAvailabilityFromServer();
+    await Future.wait([loadAppointments(), availFuture]);
+    if (!await availFuture) {
       final avail = await DBHelper.instance.loadAvailability(userId);
       if (avail != null) {
         try {
@@ -632,16 +637,26 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Marks all expired confirmed/pending appointments as [ApptStatus.completed].
+  /// Marks expired ACCEPTED appointments as [ApptStatus.completed].
+  /// Only `confirmed` (backend: accepted) appointments are completed:
+  /// a never-accepted PENDING appointment must stay pending, and
+  /// rejected/cancelled ones are never completed. The completion is
+  /// synced to the server when the backend accepts it (provider-only
+  /// endpoint, so a requester's device keeps it as a local display
+  /// state when the server refuses).
   Future<void> autoCompleteExpired() async {
     bool changed = false;
     for (final a in _appointments) {
-      if (a.status == ApptStatus.completed) continue;
-      if (a.status == ApptStatus.cancelled) continue;
+      if (a.status != ApptStatus.confirmed) continue;
       if (!a.isExpired) continue;
       await DBHelper.instance.updateAppointmentStatus(a.id!, ApptStatus.completed);
       a.status = ApptStatus.completed;
       changed = true;
+      try {
+        await AppointmentService.instance.completeAppointment(a.id!);
+      } on ApiException {
+        // Provider-only endpoint: requesters keep the local state.
+      }
     }
     if (changed) notifyListeners();
   }
@@ -774,11 +789,10 @@ class AppState extends ChangeNotifier {
 
   /// Changes an appointment's status through the backend:
   /// - `cancelled` → POST cancel (either participant, pending/accepted);
-  /// - `confirmed` → POST accept (provider only, pending only).
-  /// `pending`, `completed` and `rejected` have no API transition and
-  /// stay local-only (the backend has no "complete" endpoint, so
-  /// [autoCompleteExpired] remains a local display state).
-  /// Throws [ApiException] when the backend rejects the change.
+  /// - `confirmed` → POST accept (provider only, pending only);
+  /// - `completed` → POST complete (provider only, accepted only).
+  /// `pending` and `rejected` have no API transition and stay
+  /// local-only. Throws [ApiException] when the backend rejects the change.
   Future<void> updateAppointmentStatus(int id, ApptStatus status) async {
     if (status == ApptStatus.cancelled) {
       _replaceInMemory(await AppointmentService.instance.cancelAppointment(id));
@@ -788,10 +802,20 @@ class AppState extends ChangeNotifier {
       _replaceInMemory(await AppointmentService.instance.acceptAppointment(id));
       return;
     }
+    if (status == ApptStatus.completed) {
+      _replaceInMemory(await AppointmentService.instance.completeAppointment(id));
+      return;
+    }
     await DBHelper.instance.updateAppointmentStatus(id, status);
     final idx = _appointments.indexWhere((a) => a.id == id);
     if (idx != -1) _appointments[idx].status = status;
     notifyListeners();
+  }
+
+  /// Marks an accepted appointment complete (provider only).
+  /// Throws [ApiException] when the backend rejects it.
+  Future<void> completeAppointment(int id) async {
+    _replaceInMemory(await AppointmentService.instance.completeAppointment(id));
   }
 
   /// Accepts an incoming request (provider only, pending only).
@@ -806,10 +830,11 @@ class AppState extends ChangeNotifier {
     _replaceInMemory(await AppointmentService.instance.rejectAppointment(id));
   }
 
-  /// Removes an appointment from the local list only. The backend has
-  /// no delete endpoint, so a removed appointment comes back on the
-  /// next reload from the server.
+  /// Deletes an appointment on the server (either participant, not
+  /// completed) and removes it locally. Throws [ApiException] when the
+  /// backend rejects the delete, in which case nothing is removed.
   Future<void> deleteAppointment(int id) async {
+    await AppointmentService.instance.deleteAppointment(id);
     await DBHelper.instance.deleteAppointment(id);
     _appointments.removeWhere((a) => a.id == id);
     notifyListeners();
