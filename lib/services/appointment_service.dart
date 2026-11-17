@@ -200,6 +200,29 @@ class AppointmentService {
     return _map(jsonDecode(res.body) as Map<String, dynamic>);
   }
 
+  /// POST /appointments/{id}/complete/ — provider only, accepted only.
+  Future<Appointment> completeAppointment(int id) async {
+    final res = await ApiClient.instance.post('$_appointments/$id/complete/');
+    if (res.statusCode != 200) {
+      throw ApiException(
+        ApiClient.errorMessage(res, 'Could not mark the appointment complete.'),
+        statusCode: res.statusCode,
+      );
+    }
+    return _map(jsonDecode(res.body) as Map<String, dynamic>);
+  }
+
+  /// DELETE /appointments/{id}/ — either participant, not completed.
+  Future<void> deleteAppointment(int id) async {
+    final res = await ApiClient.instance.delete('$_appointments/$id/');
+    if (res.statusCode != 204 && res.statusCode != 200) {
+      throw ApiException(
+        ApiClient.errorMessage(res, 'Could not delete the appointment.'),
+        statusCode: res.statusCode,
+      );
+    }
+  }
+
   /// PATCH /appointments/{id}/reschedule/ — requester only,
   /// pending or accepted only. The status does not change.
   Future<Appointment> rescheduleAppointment({

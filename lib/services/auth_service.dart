@@ -81,7 +81,7 @@ class AuthService {
   /// SDK and exchanges it for the JWT pair. Returns the user map, like
   /// [login]. Throws [ApiException] when the user cancels or when the
   /// backend rejects the token.
-  Future<Map<String, dynamic>> signInWithGoogle() async {
+  Future<Map<String, dynamic>> signInWithGoogle({String? profession}) async {
     if (ApiConfig.googleServerClientId.isEmpty) {
       throw const ApiException(
         'Google Sign-In is not set up yet. Please sign in with email for now.',
@@ -101,15 +101,31 @@ class AuthService {
     if (account == null) {
       throw const ApiException('Google Sign-In was cancelled.');
     }
-    final idToken = (await account.authentication).idToken;
+    // Fetching the token can fail (e.g. no network) — keep it inside
+    // the try/catch so the friendly Google error is shown, not the
+    // generic "Something went wrong".
+    String? idToken;
+    try {
+      idToken = (await account.authentication).idToken;
+    } catch (_) {
+      throw const ApiException(
+        'Google Sign-In failed. Check your connection and try again.',
+      );
+    }
     if (idToken == null || idToken.isEmpty) {
       throw const ApiException(
         'Could not get a Google ID token. Please try again.',
       );
     }
+    // The backend requires `profession` for brand-new Google users
+    // (400 otherwise); it is ignored for existing accounts.
     final res = await ApiClient.instance.post(
       '$_auth/google/',
-      body: {'id_token': idToken},
+      body: {
+        'id_token': idToken,
+        if (profession != null && profession.isNotEmpty)
+          'profession': profession,
+      },
       auth: false,
     );
     if (res.statusCode != 200) {
