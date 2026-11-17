@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 
 import 'api_config.dart';
 import 'token_storage.dart';
@@ -36,6 +37,9 @@ class ApiClient {
   static final ApiClient instance = ApiClient._();
 
   static const _timeout = Duration(seconds: 15);
+
+  /// Uploads (photos, documents) take longer than JSON calls.
+  static const _uploadTimeout = Duration(seconds: 60);
 
   final http.Client _http = http.Client();
 
@@ -111,17 +115,56 @@ class ApiClient {
     );
   }
 
+  /// Authenticated multipart file upload. The request is rebuilt on
+  /// every attempt, so the 401 → refresh → retry flow works the same
+  /// as for JSON calls. Uses the longer upload timeout.
+  Future<http.Response> uploadMultipart(
+    String path, {
+    required String field,
+    required List<int> bytes,
+    required String filename,
+    String? mimeType,
+  }) {
+    return _send(
+      () async {
+        final request = http.MultipartRequest(
+          'POST',
+          Uri.parse('${ApiConfig.baseUrl}$path'),
+        );
+        final token = await TokenStorage.instance.accessToken;
+        if (token != null && token.isNotEmpty) {
+          request.headers['Authorization'] = 'Bearer $token';
+        }
+        request.headers['Accept'] = 'application/json';
+        request.files.add(
+          http.MultipartFile.fromBytes(
+            field,
+            bytes,
+            filename: filename,
+            contentType: mimeType == null ? null : MediaType.parse(mimeType),
+          ),
+        );
+        final streamed = await request.send();
+        return http.Response.fromStream(streamed);
+      },
+      retryOnAuth: true,
+      timeout: _uploadTimeout,
+    );
+  }
+
   /// Runs [request] once; on a 401 (and only for authenticated calls)
   /// refreshes the token and retries once.
   Future<http.Response> _send(
     Future<http.Response> Function() request, {
     required bool retryOnAuth,
+    Duration? timeout,
   }) async {
-    var res = await _guarded(request);
+    final t = timeout ?? _timeout;
+    var res = await _guarded(request, timeout: t);
     if (res.statusCode == 401 && retryOnAuth) {
       final refreshed = await _refreshAccessToken();
       if (!refreshed) throw const SessionExpiredException();
-      res = await _guarded(request);
+      res = await _guarded(request, timeout: t);
       if (res.statusCode == 401) throw const SessionExpiredException();
     }
     return res;
@@ -129,10 +172,11 @@ class ApiClient {
 
   /// Runs [request] and converts transport failures into [ApiException].
   Future<http.Response> _guarded(
-    Future<http.Response> Function() request,
-  ) async {
+    Future<http.Response> Function() request, {
+    Duration? timeout,
+  }) async {
     try {
-      return await request().timeout(_timeout);
+      return await request().timeout(timeout ?? _timeout);
     } on TimeoutException {
       throw const ApiException(
         'The server is taking too long to respond. Please try again.',
