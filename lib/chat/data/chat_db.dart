@@ -12,7 +12,7 @@ class ChatDB {
     if (_instance != null) return _instance!;
     _instance = await openDatabase(
       p.join(await getDatabasesPath(), 'appointly_chat_v3.db'),
-      version: 1,
+      version: 2,
       onCreate: (db, _) => db.execute('''
         CREATE TABLE messages (
           id TEXT PRIMARY KEY,
@@ -32,9 +32,19 @@ class ChatDB {
           replyToFromMe INTEGER,
           appointmentTitle TEXT,
           appointmentDate TEXT,
-          appointmentTime TEXT
+          appointmentTime TEXT,
+          fileName TEXT,
+          fileSize INTEGER
         )
       '''),
+      onUpgrade: (db, oldVersion, _) async {
+        // v2: keep the original file name + size for image/file messages
+        // so cached media still renders offline.
+        if (oldVersion < 2) {
+          await db.execute('ALTER TABLE messages ADD COLUMN fileName TEXT');
+          await db.execute('ALTER TABLE messages ADD COLUMN fileSize INTEGER');
+        }
+      },
     );
     return _instance!;
   }
@@ -60,6 +70,8 @@ class ChatDB {
       'appointmentTitle': m.appointmentTitle,
       'appointmentDate': m.appointmentDate,
       'appointmentTime': m.appointmentTime,
+      'fileName': m.fileName,
+      'fileSize': m.fileSize,
     }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
@@ -103,6 +115,8 @@ class ChatDB {
       appointmentTitle: r['appointmentTitle'] as String?,
       appointmentDate: r['appointmentDate'] as String?,
       appointmentTime: r['appointmentTime'] as String?,
+      fileName: r['fileName'] as String?,
+      fileSize: r['fileSize'] as int?,
       replyTo: r['replyToId'] != null
           ? ChatMessage(
               id: r['replyToId'] as String,
