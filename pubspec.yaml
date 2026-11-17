@@ -26,8 +26,10 @@ dependencies:
   file_saver: ^0.2.14
   share_plus: ^10.0.0
   http: ^1.2.0
+  http_parser: ^4.0.2
   flutter_secure_storage: ^9.0.0
   google_sign_in: ^6.2.1
+  url_launcher: ^6.3.1
 
 dev_dependencies:
   flutter_test:

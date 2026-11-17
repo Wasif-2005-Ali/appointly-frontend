@@ -1,8 +1,12 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../../app_state.dart';
 import '../../services/api_client.dart';
 import '../../services/chat_service.dart';
@@ -51,6 +55,10 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   final Set<String> _seenIds = {};
   // Optimistic copies of my sends, replaced when the echo arrives.
   final List<ChatMessage> _pending = [];
+  // Media upload in progress (photo/file). While true, a sending
+  // indicator shows above the input bar.
+  bool _uploadingMedia = false;
+  String _uploadingLabel = '';
 
   late AnimationController _typCtrl, _sendCtrl, _recCtrl;
   int _emojiTab    = 0;
@@ -103,7 +111,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       });
       // Fill in the inbox tile preview from the latest message.
       if (apiMsgs.isNotEmpty) {
-        widget.conversation.lastMsg = apiMsgs.last.text;
+        widget.conversation.lastMsg = apiMsgs.last.previewText;
         widget.conversation.time = apiMsgs.last.time;
       }
       // Cache for offline use.
@@ -187,7 +195,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         }
       }
       _msgs.add(msg);
-      widget.conversation.lastMsg = msg.text;
+      widget.conversation.lastMsg = msg.previewText;
       widget.conversation.time = msg.time;
       toSave = msg;
     });
@@ -283,6 +291,95 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     _scrollDown();
   }
 
+  // ── Media sending ────────────────────────────────────────────────────────
+  // Photos and files upload over REST (POST …/media/); the created
+  // message comes back in the response and is rendered from it. The
+  // server may also broadcast it over the WebSocket — the id is
+  // recorded in _seenIds so the echo is dropped. On failure nothing
+  // is added to the list, only a snackbar.
+  Future<void> _pickImage(ImageSource source) async {
+    try {
+      final picked = await ImagePicker().pickImage(
+        source: source,
+        maxWidth: 1920,
+        maxHeight: 1920,
+        imageQuality: 85,
+      );
+      if (picked == null) return;
+      final bytes = await picked.readAsBytes();
+      if (!mounted) return;
+      await _sendMedia(bytes: bytes, fileName: picked.name);
+    } catch (_) {
+      if (mounted) _toast('Could not pick the photo. Please try again.');
+    }
+  }
+
+  Future<void> _pickFile() async {
+    try {
+      final result = await FilePicker.platform.pickFiles();
+      if (result == null || result.files.isEmpty) return;
+      final picked = result.files.first;
+      final List<int> bytes;
+      if (picked.bytes != null) {
+        // Web (or withData): bytes come with the result.
+        bytes = picked.bytes!;
+      } else if (picked.path != null) {
+        bytes = await File(picked.path!).readAsBytes();
+      } else {
+        return;
+      }
+      if (!mounted) return;
+      await _sendMedia(bytes: bytes, fileName: picked.name);
+    } catch (_) {
+      if (mounted) _toast('Could not read the file. Please try again.');
+    }
+  }
+
+  Future<void> _sendMedia({
+    required List<int> bytes,
+    required String fileName,
+  }) async {
+    if (_uploadingMedia) return;
+    final isImage = ChatService.isImageFile(fileName);
+    setState(() {
+      _uploadingMedia = true;
+      _uploadingLabel = isImage ? 'Sending photo…' : 'Sending file…';
+    });
+    try {
+      final apiMsg = await ChatService.instance.uploadMedia(
+        _convId,
+        bytes: bytes,
+        fileName: fileName,
+      );
+      if (!mounted) return;
+      final myId = UserSession.instance.userId?.toString();
+      final msg = ChatMessage.fromApi(apiMsg, currentUserId: myId);
+      setState(() {
+        _seenIds.add(apiMsg.id);
+        _msgs.add(msg);
+        widget.conversation.lastMsg = msg.previewText;
+        widget.conversation.time = msg.time;
+      });
+      ChatDB.save(_convId, msg).catchError((_) {});
+      _scrollDown();
+    } on ApiException catch (e) {
+      if (mounted) _toast(e.message);
+    } finally {
+      if (mounted) setState(() => _uploadingMedia = false);
+    }
+  }
+
+  /// Open a file message's URL in the browser / external app.
+  Future<void> _openFileUrl(String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null) {
+      _toast('Could not open the file.');
+      return;
+    }
+    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!ok && mounted) _toast('Could not open the file.');
+  }
+
   void _scrollDown() => Future.delayed(const Duration(milliseconds: 80), () {
     if (_scrollCtrl.hasClients) {
       _scrollCtrl.animateTo(
@@ -369,6 +466,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         if (_replyTo != null) _replyBar(),
         if (_recording) _recordingOverlay(),
         if (_showEmoji) _emojiKeyboard(),
+        if (_uploadingMedia) _uploadingBar(),
         if (!_recording) _inputBar(c),
       ]),
     );
@@ -463,6 +561,8 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     final isEmoji = msg.type == MessageType.emoji;
     final isVoice = msg.type == MessageType.voice;
     final isAppt  = msg.type == MessageType.appointment;
+    final isImage = msg.type == MessageType.image;
+    final isFile  = msg.type == MessageType.file;
     final showAv  = !isMe && (idx == 0 || _msgs[idx - 1].fromMe);
 
     if (msg.isDeleted) {
@@ -511,11 +611,15 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
                       Icon(Icons.shortcut_rounded, size: 12, color: _txtSub.withOpacity(0.6)), const SizedBox(width: 4),
                       Text('Forwarded', style: GoogleFonts.dmSans(fontSize: 11, color: _txtSub.withOpacity(0.6), fontStyle: FontStyle.italic)),
                     ])),
-                // Appointment card or emoji or normal bubble
+                // Appointment card or emoji or media or normal bubble
                 if (isAppt)
                   _appointmentBubble(msg, isMe)
                 else if (isEmoji)
                   Text(msg.text, style: const TextStyle(fontSize: 40))
+                else if (isImage)
+                  _imageBubble(msg, isMe)
+                else if (isFile)
+                  _fileBubble(msg, isMe)
                 else
                   _textBubble(msg, c, isMe, isVoice),
                 // Reactions
@@ -653,6 +757,98 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     ),
   );
 
+  /// Photo message: the image with rounded corners; tap opens it
+  /// full-screen. `msg.text` holds the media URL.
+  Widget _imageBubble(ChatMessage msg, bool isMe) => GestureDetector(
+    onTap: () => Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => _FullScreenImageView(url: msg.text)),
+    ),
+    child: Container(
+      constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.68),
+      decoration: BoxDecoration(
+        color: _cardBg,
+        borderRadius: BorderRadius.only(
+          topLeft: const Radius.circular(20), topRight: const Radius.circular(20),
+          bottomLeft: Radius.circular(isMe ? 20 : 4), bottomRight: Radius.circular(isMe ? 4 : 20),
+        ),
+        border: Border.all(color: _border, width: 1.2),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.09), blurRadius: 8, offset: const Offset(0, 3))],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.only(
+          topLeft: const Radius.circular(18), topRight: const Radius.circular(18),
+          bottomLeft: Radius.circular(isMe ? 18 : 3), bottomRight: Radius.circular(isMe ? 3 : 18),
+        ),
+        child: Image.network(
+          msg.text,
+          fit: BoxFit.cover,
+          loadingBuilder: (context, child, progress) {
+            if (progress == null) return child;
+            return Container(
+              height: 180,
+              color: _bg,
+              child: Center(child: CircularProgressIndicator(color: _accent, strokeWidth: 2.5)),
+            );
+          },
+          errorBuilder: (_, __, ___) => Container(
+            height: 140,
+            color: _bg,
+            child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+              Icon(Icons.broken_image_rounded, size: 36, color: _txtSub.withOpacity(0.5)),
+              const SizedBox(height: 8),
+              Text("Couldn't load image", style: GoogleFonts.dmSans(fontSize: 12, color: _txtSub)),
+            ]),
+          ),
+        ),
+      ),
+    ),
+  );
+
+  /// File message: icon + name + size; tap opens the URL externally.
+  Widget _fileBubble(ChatMessage msg, bool isMe) => GestureDetector(
+    onTap: () => _openFileUrl(msg.text),
+    child: Container(
+      constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.68),
+      decoration: BoxDecoration(
+        gradient: isMe ? LinearGradient(colors: _btnGrad, begin: Alignment.topLeft, end: Alignment.bottomRight) : null,
+        color: isMe ? null : _cardBg,
+        borderRadius: BorderRadius.only(
+          topLeft: const Radius.circular(20), topRight: const Radius.circular(20),
+          bottomLeft: Radius.circular(isMe ? 20 : 4), bottomRight: Radius.circular(isMe ? 4 : 20),
+        ),
+        border: isMe ? null : Border.all(color: _border, width: 1.2),
+        boxShadow: [BoxShadow(color: (isMe ? _btnShadow : Colors.black).withOpacity(0.09), blurRadius: 8, offset: const Offset(0, 3))],
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Container(width: 40, height: 40,
+              decoration: BoxDecoration(
+                color: isMe ? Colors.white.withOpacity(0.2) : _accent.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(11),
+              ),
+              child: Icon(Icons.insert_drive_file_rounded, color: isMe ? Colors.white : _accent, size: 20)),
+          const SizedBox(width: 10),
+          Flexible(child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text(msg.fileName ?? 'File', maxLines: 2, overflow: TextOverflow.ellipsis,
+                style: GoogleFonts.dmSans(fontSize: 13.5, fontWeight: FontWeight.w700,
+                    color: isMe ? Colors.white : _txtMain)),
+            if (msg.fileSize != null) ...[
+              const SizedBox(height: 2),
+              Text(ChatService.formatFileSize(msg.fileSize!),
+                  style: GoogleFonts.dmSans(fontSize: 11.5,
+                      color: isMe ? Colors.white.withOpacity(0.75) : _txtSub)),
+            ],
+          ])),
+          const SizedBox(width: 8),
+          Icon(Icons.open_in_new_rounded, size: 16,
+              color: isMe ? Colors.white.withOpacity(0.75) : _txtSub),
+        ]),
+      ),
+    ),
+  );
+
   Widget _tick(MessageStatus s) {
     switch (s) {
       case MessageStatus.sent:      return Icon(Icons.check_rounded, size: 13, color: _txtSub.withOpacity(0.6));
@@ -686,6 +882,17 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     ]),
   );
 
+  // ── Media upload indicator ───────────────────────────────────────────────
+  Widget _uploadingBar() => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+    decoration: BoxDecoration(color: _cardBg, border: Border(top: BorderSide(color: _border, width: 1))),
+    child: Row(children: [
+      SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2.5, color: _accent)),
+      const SizedBox(width: 10),
+      Text(_uploadingLabel, style: GoogleFonts.dmSans(fontSize: 13, fontWeight: FontWeight.w600, color: _txtSub)),
+    ]),
+  );
+
   // ── Reply bar ──────────────────────────────────────────────────────────────
   Widget _replyBar() {
     final msg = _replyTo!;
@@ -698,7 +905,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text(msg.fromMe ? 'You' : widget.conversation.name.split(' ').first,
               style: GoogleFonts.dmSans(fontSize: 12, fontWeight: FontWeight.w700, color: _accent)),
-          Text(msg.type == MessageType.voice ? '🎤 Voice message' : msg.text, maxLines: 1, overflow: TextOverflow.ellipsis,
+          Text(msg.type == MessageType.voice ? '🎤 Voice message' : msg.previewText, maxLines: 1, overflow: TextOverflow.ellipsis,
               style: GoogleFonts.dmSans(fontSize: 12, color: _txtSub)),
         ])),
         GestureDetector(onTap: () => setState(() => _replyTo = null),
@@ -819,22 +1026,29 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
           Text('Share', style: GoogleFonts.dmSans(fontSize: 16, fontWeight: FontWeight.w800, color: _txtMain)),
           const SizedBox(height: 16),
           Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: rows.sublist(0, 4).map((r) => _attIcon(r[0] as IconData, r[1] as String, r[2] as Color, r[1] == 'Appointment')).toList()),
+              children: rows.sublist(0, 4).map((r) => _attIcon(r[0] as IconData, r[1] as String, r[2] as Color)).toList()),
           const SizedBox(height: 16),
           Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: rows.sublist(4).map((r) => _attIcon(r[0] as IconData, r[1] as String, r[2] as Color, r[1] == 'Appointment')).toList()),
+              children: rows.sublist(4).map((r) => _attIcon(r[0] as IconData, r[1] as String, r[2] as Color)).toList()),
         ]),
       ),
     ));
   }
 
-  Widget _attIcon(IconData icon, String label, Color color, bool isAppt) => GestureDetector(
+  Widget _attIcon(IconData icon, String label, Color color) => GestureDetector(
     onTap: () {
       Navigator.pop(context);
-      if (isAppt) {
-        _showAppointmentPicker();
-      } else {
-        _toast('$label coming soon');
+      switch (label) {
+        case 'Camera':
+          _pickImage(ImageSource.camera);
+        case 'Gallery':
+          _pickImage(ImageSource.gallery);
+        case 'Document':
+          _pickFile();
+        case 'Appointment':
+          _showAppointmentPicker();
+        default:
+          _toast('$label coming soon');
       }
     },
     child: SizedBox(width: 68, child: Column(children: [
@@ -1013,7 +1227,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
                 decoration: BoxDecoration(color: _txtSub.withOpacity(0.3), borderRadius: BorderRadius.circular(4))),
             Container(margin: const EdgeInsets.fromLTRB(20, 0, 20, 12), padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(color: _bg, borderRadius: BorderRadius.circular(14), border: Border.all(color: _border)),
-                child: Text(msg.type == MessageType.voice ? '🎤 Voice message (${msg.voiceDuration})' : msg.text,
+                child: Text(msg.type == MessageType.voice ? '🎤 Voice message (${msg.voiceDuration})' : msg.previewText,
                     maxLines: 2, overflow: TextOverflow.ellipsis,
                     style: GoogleFonts.dmSans(fontSize: 13, color: _txtSub))),
             // Quick reactions
@@ -1264,4 +1478,38 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
     duration: const Duration(seconds: 2),
   ));
+}
+
+/// Full-screen photo view: pinch to zoom, back arrow to return.
+class _FullScreenImageView extends StatelessWidget {
+  final String url;
+  const _FullScreenImageView({required this.url});
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: Colors.black,
+    appBar: AppBar(
+      backgroundColor: Colors.black,
+      iconTheme: const IconThemeData(color: Colors.white),
+    ),
+    body: Center(
+      child: InteractiveViewer(
+        child: Image.network(
+          url,
+          fit: BoxFit.contain,
+          errorBuilder: (_, __, ___) => const Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.broken_image_rounded, size: 48, color: Colors.white54),
+              SizedBox(height: 12),
+              Text(
+                "Couldn't load image",
+                style: TextStyle(color: Colors.white70),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
 }

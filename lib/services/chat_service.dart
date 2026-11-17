@@ -47,6 +47,9 @@ class ChatApiMessage {
   final String messageType;
   final List<String> readBy;
   final DateTime createdAt;
+  // Media-only fields (image/file messages). Old messages lack them.
+  final String? fileName;
+  final int? fileSize;
 
   const ChatApiMessage({
     required this.id,
@@ -57,10 +60,13 @@ class ChatApiMessage {
     required this.messageType,
     required this.readBy,
     required this.createdAt,
+    this.fileName,
+    this.fileSize,
   });
 
   factory ChatApiMessage.fromJson(Map<String, dynamic> json) {
     final rawId = json['id'];
+    final rawSize = json['file_size'];
     return ChatApiMessage(
       id: rawId?.toString() ?? '',
       roomId: json['room_id'] as String? ?? '',
@@ -74,7 +80,22 @@ class ChatApiMessage {
       createdAt:
           DateTime.tryParse(json['created_at'] as String? ?? '') ??
           DateTime.now(),
+      fileName: json['file_name'] as String?,
+      fileSize: rawSize is num ? rawSize.toInt() : null,
     );
+  }
+
+  /// One-line text for the inbox preview. Media messages carry a URL
+  /// in [content], which must never leak into the preview. Pure.
+  String get previewText {
+    switch (messageType) {
+      case 'image':
+        return 'Photo';
+      case 'file':
+        return fileName != null && fileName!.isNotEmpty ? fileName! : 'File';
+      default:
+        return content;
+    }
   }
 }
 
@@ -270,6 +291,115 @@ class ChatService {
       );
     }
     return MessagePage.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
+  }
+
+  /// POST /api/chat/rooms/<room_id>/media/ — upload a photo or file.
+  /// Returns the created message (content is the Cloudinary URL).
+  /// The size check runs first so oversized files fail fast, before
+  /// any upload starts; the backend enforces the same limits.
+  Future<ChatApiMessage> uploadMedia(
+    String roomId, {
+    required List<int> bytes,
+    required String fileName,
+    String? mimeType,
+  }) async {
+    validateMediaSize(bytes.length, fileName);
+    final res = await ApiClient.instance.uploadMultipart(
+      '$_chat/rooms/$roomId/media/',
+      field: 'file',
+      bytes: bytes,
+      filename: fileName,
+      mimeType: mimeType ?? mimeTypeFor(fileName),
+    );
+    if (res.statusCode != 201) {
+      throw ApiException(
+        ApiClient.errorMessage(res, 'Could not send the file.'),
+        statusCode: res.statusCode,
+      );
+    }
+    return ChatApiMessage.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
+  }
+
+  /// Server size limits (also enforced by the backend): images 10 MB,
+  /// other files 25 MB.
+  static const maxImageBytes = 10 * 1024 * 1024;
+  static const maxFileBytes = 25 * 1024 * 1024;
+
+  static const _imageExtensions = {
+    'jpg',
+    'jpeg',
+    'png',
+    'gif',
+    'webp',
+    'bmp',
+    'heic',
+    'heif',
+  };
+
+  /// True when [fileName] looks like an image (by extension). Pure.
+  static bool isImageFile(String fileName) {
+    final dot = fileName.lastIndexOf('.');
+    if (dot < 0 || dot == fileName.length - 1) return false;
+    return _imageExtensions.contains(
+      fileName.substring(dot + 1).toLowerCase(),
+    );
+  }
+
+  /// Throws [ApiException] when [byteCount] exceeds the limit for the
+  /// file kind. Pure — unit-tested.
+  static void validateMediaSize(int byteCount, String fileName) {
+    if (isImageFile(fileName)) {
+      if (byteCount > maxImageBytes) {
+        throw const ApiException(
+          'That photo is over 10 MB. Pick a smaller one.',
+        );
+      }
+    } else if (byteCount > maxFileBytes) {
+      throw const ApiException('That file is over 25 MB.');
+    }
+  }
+
+  /// Best-effort MIME type from the file extension, so the server can
+  /// tell images from documents. Unknown extensions fall back to a
+  /// generic binary type. Pure.
+  static String mimeTypeFor(String fileName) {
+    final dot = fileName.lastIndexOf('.');
+    final ext = dot < 0 ? '' : fileName.substring(dot + 1).toLowerCase();
+    return switch (ext) {
+      'jpg' || 'jpeg' => 'image/jpeg',
+      'png' => 'image/png',
+      'gif' => 'image/gif',
+      'webp' => 'image/webp',
+      'bmp' => 'image/bmp',
+      'heic' => 'image/heic',
+      'heif' => 'image/heif',
+      'pdf' => 'application/pdf',
+      'txt' => 'text/plain',
+      'doc' => 'application/msword',
+      'docx' =>
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'xls' => 'application/vnd.ms-excel',
+      'xlsx' =>
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'ppt' => 'application/vnd.ms-powerpoint',
+      'pptx' =>
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'zip' => 'application/zip',
+      'mp3' => 'audio/mpeg',
+      'mp4' => 'video/mp4',
+      _ => 'application/octet-stream',
+    };
+  }
+
+  /// Human-readable size, e.g. `512 B`, `1.5 KB`, `2.4 MB`. Pure.
+  static String formatFileSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) {
+      final kb = bytes / 1024;
+      return '${kb % 1 == 0 ? kb.toInt() : kb.toStringAsFixed(1)} KB';
+    }
+    final mb = bytes / (1024 * 1024);
+    return '${mb % 1 == 0 ? mb.toInt() : mb.toStringAsFixed(1)} MB';
   }
 
   /// Locally remembered "read up to" timestamps, one per room. The

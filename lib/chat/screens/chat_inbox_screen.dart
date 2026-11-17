@@ -86,7 +86,7 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
             preview.lastMessage!,
             currentUserId: myId,
           );
-          convo.lastMsg = last.text;
+          convo.lastMsg = last.previewText;
           convo.time = last.time;
         }
         convo.unread = preview.unreadCount;

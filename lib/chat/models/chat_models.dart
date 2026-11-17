@@ -5,7 +5,7 @@ import '../../services/chat_service.dart';
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENUMS
 // ─────────────────────────────────────────────────────────────────────────────
-enum MessageType   { text, emoji, voice, appointment, image }
+enum MessageType   { text, emoji, voice, appointment, image, file }
 enum MessageStatus { sent, delivered, read }
 
 // Deterministic avatar palette for API rooms (no avatar data on the
@@ -107,6 +107,26 @@ class ChatMessage {
   final String? appointmentTime;
   // For image messages
   final Color? imageColor;
+  // For image/file messages from the API: the original file name and
+  // size in bytes. Old messages lack them (null). `text` holds the
+  // media URL for these messages.
+  final String? fileName;
+  final int? fileSize;
+
+  /// One-line text for the inbox preview and reply quotes. Media
+  /// messages carry a URL in [text], which must never be shown raw.
+  String get previewText {
+    switch (type) {
+      case MessageType.image:
+        return 'Photo';
+      case MessageType.file:
+        return fileName != null && fileName!.isNotEmpty ? fileName! : 'File';
+      case MessageType.voice:
+        return 'Voice message';
+      default:
+        return text;
+    }
+  }
 
   ChatMessage({
     required this.id,
@@ -126,6 +146,8 @@ class ChatMessage {
     this.appointmentDate,
     this.appointmentTime,
     this.imageColor,
+    this.fileName,
+    this.fileSize,
   }) : reactions = reactions ?? {};
 
   /// Maps a backend message to the local model. [currentUserId] is
@@ -146,12 +168,16 @@ class ChatMessage {
       text: msg.content,
       fromMe: fromMe,
       time: _fmtTime(msg.createdAt.toLocal()),
-      type: msg.messageType == 'image'
-          ? MessageType.image
-          : MessageType.text,
+      type: switch (msg.messageType) {
+        'image' => MessageType.image,
+        'file' => MessageType.file,
+        _ => MessageType.text,
+      },
       status: fromMe
           ? (read ? MessageStatus.read : MessageStatus.delivered)
           : MessageStatus.delivered,
+      fileName: msg.fileName,
+      fileSize: msg.fileSize,
     );
   }
 }
