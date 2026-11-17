@@ -38,8 +38,6 @@ class InboxPopupMenu extends StatelessWidget {
           child: const Icon(Icons.more_vert_rounded, color: Colors.white, size: 19),
         ),
         itemBuilder: (_) => [
-          _item('new_group', 'New Group',        Icons.group_rounded),
-          _item('starred',   'Starred Messages', Icons.star_outline_rounded),
           _item('archived',  'Archived Chats',   Icons.archive_rounded),
           _item('settings',  'Settings',         Icons.settings_rounded),
         ],
@@ -95,14 +93,9 @@ class ThreadPopupMenu extends StatelessWidget {
         ),
         itemBuilder: (_) => [
           _item('search',    'Search in Chat',        Icons.search_rounded),
-          _item('contact',   'View Contact',          Icons.person_rounded),
           _item('mute',      'Mute Notifications',    Icons.volume_off_rounded),
-          _item('timer',     'Disappearing Messages', Icons.timer_outlined),
           _item('starred',   'Starred Messages',      Icons.star_outline_rounded),
-          _item('wallpaper', 'Chat Wallpaper',        Icons.wallpaper_rounded),
           _item('clear',     'Clear Chat',            Icons.cleaning_services_rounded),
-          _item('block',     'Block Contact',         Icons.block_rounded),
-          _item('report',    'Report',                Icons.flag_rounded),
         ],
       );
 

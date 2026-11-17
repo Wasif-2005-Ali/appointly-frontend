@@ -47,17 +47,64 @@ class AppointlyRoot extends StatefulWidget {
 class _AppointlyRootState extends State<AppointlyRoot> {
   final AppState _appState = AppState();
   StreamSubscription<IncomingCall>? _incomingSub;
+  StreamSubscription<String>? _notifyErrorSub;
   bool _incomingDialogOpen = false;
+  // Last theme-relevant values, so AppState notifications that only
+  // change data (appointments, chat badges, ...) do NOT rebuild the
+  // whole MaterialApp — only a real theme change does.
+  AppThemeMode? _lastThemeMode;
+  Color? _lastBg;
+  Color? _lastAccent;
 
   @override
   void initState() {
     super.initState();
-    _appState.addListener(() => setState(() {}));
-    // Load appointments from the backend (falls back to SQLite when offline)
-    _appState.loadAppointments();
+    _appState.addListener(_onAppStateChanged);
+    // NOTE: appointments are loaded by the splash screen's
+    // loadUserData() — do not fetch them here too (duplicate request
+    // on every launch).
     // Show the incoming-call dialog whenever the server pushes one.
     _incomingSub = CallService.instance.incomingCalls.listen(
       _onIncomingCall,
+    );
+    // Surface notify-socket failures (incoming calls paused) instead
+    // of letting them fail silently.
+    _notifyErrorSub = CallService.instance.notifyErrors.listen(
+      _onNotifyError,
+    );
+  }
+
+  /// Only rebuild the app shell when something theme-related changed.
+  /// Data-only notifications (appointments, unread badges, ...) are
+  /// consumed by the screens themselves via AppStateProvider.
+  void _onAppStateChanged() {
+    if (_lastThemeMode != _appState.themeMode ||
+        _lastBg != _appState.bg ||
+        _lastAccent != _appState.accent) {
+      _lastThemeMode = _appState.themeMode;
+      _lastBg = _appState.bg;
+      _lastAccent = _appState.accent;
+      setState(() {});
+    }
+  }
+
+  /// The notify socket (incoming calls) failed. Show it once with a
+  /// retry action instead of silently missing calls. Auth failures
+  /// need a fresh login, so they get no retry button.
+  void _onNotifyError(String message) {
+    final navigator = appNavigatorKey.currentState;
+    if (navigator == null || !mounted) return;
+    final authFailed = CallService.instance.notifyAuthFailed;
+    ScaffoldMessenger.of(navigator.context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        action: authFailed
+            ? null
+            : SnackBarAction(
+                label: 'Retry',
+                onPressed: () => CallService.instance.reconnectNotify(),
+              ),
+      ),
     );
   }
 
@@ -98,6 +145,7 @@ class _AppointlyRootState extends State<AppointlyRoot> {
   @override
   void dispose() {
     _incomingSub?.cancel();
+    _notifyErrorSub?.cancel();
     _appState.dispose();
     super.dispose();
   }

@@ -386,6 +386,10 @@ class ChatService {
         'application/vnd.openxmlformats-officedocument.presentationml.presentation',
       'zip' => 'application/zip',
       'mp3' => 'audio/mpeg',
+      'm4a' => 'audio/mp4',
+      'aac' => 'audio/aac',
+      'wav' => 'audio/wav',
+      'opus' => 'audio/ogg',
       'mp4' => 'video/mp4',
       _ => 'application/octet-stream',
     };
@@ -403,13 +407,12 @@ class ChatService {
   }
 
   /// Locally remembered "read up to" timestamps, one per room. The
-  /// backend has `Message.mark_read()` but never calls it, so `read_by`
-  /// only ever contains the sender — without this, every message from
-  /// someone else would look unread forever. Opening a thread stamps
-  /// the room here ([markRoomReadLocally]); the unread count then only
-  /// counts messages newer than the stamp. If the backend starts
-  /// marking messages read, this stays harmless: `read_by` is checked
-  /// first.
+  /// backend marks messages read server-side (POST …/read/, see
+  /// [markRoomRead]), so `read_by` is checked first; this local stamp
+  /// is only a fallback for messages read while offline or before
+  /// the server call landed. Opening a thread stamps the room here
+  /// ([markRoomReadLocally]); the unread count then only counts
+  /// messages newer than the stamp.
   final Map<String, DateTime> _lastReadAt = {};
 
   /// Remember that the user has seen this room's messages up to now.
@@ -513,20 +516,32 @@ class ChatService {
 ///   `{"type": "chat.history", "messages": […]}` (50 max).
 /// - Errors: `{"type": "error", "code": "…", "detail": "…"}`.
 ///
-/// The connection reconnects automatically (up to 3 attempts) when
-/// the socket drops unexpectedly; on a 4001 close it refreshes the
-/// access token through a REST call first.
+/// The connection reconnects automatically with escalating delays
+/// (2s, 5s, 10s, 20s, 30s, 30s, 30s — about 2–3 minutes of budget)
+/// when the socket drops unexpectedly; after the budget is spent it
+/// enters [ChatConnectionState.failed] and waits for a manual
+/// [ChatRoomConnection.reconnect]. On a 4001 close it refreshes the
+/// access token through a REST call first. The connection is only
+/// reported as connected once the WebSocket handshake is confirmed
+/// (via the channel's `ready` future or the first inbound frame) —
+/// never optimistically — so sends during the handshake window are
+/// refused (and trigger a reconnect) instead of being lost.
 class ChatRoomConnection {
   ChatRoomConnection._(this.roomId, String token) : _token = token;
 
   final String roomId;
   String _token;
 
-  static const _maxAttempts = 3;
+  // Escalating retry delays; the list length is the attempt budget
+  // (2+5+10+20+30+30+30 = 127s of waiting, ~2–3 min with handshakes).
   static const _retryDelays = [
     Duration(seconds: 2),
     Duration(seconds: 5),
     Duration(seconds: 10),
+    Duration(seconds: 20),
+    Duration(seconds: 30),
+    Duration(seconds: 30),
+    Duration(seconds: 30),
   ];
 
   WebSocketChannel? _channel;
@@ -563,27 +578,68 @@ class ChatRoomConnection {
           ? ChatConnectionState.connecting
           : ChatConnectionState.reconnecting,
     );
+    WebSocketChannel channel;
     try {
-      _channel = WebSocketChannel.connect(_wsUri);
+      channel = WebSocketChannel.connect(_wsUri);
     } catch (_) {
       _scheduleReconnect();
       return;
     }
-    _subscription = _channel!.stream.listen(
+    _channel = channel;
+    _subscription = channel.stream.listen(
       _onData,
       onError: (_) => _onSocketClosed(),
       onDone: _onSocketClosed,
       cancelOnError: false,
     );
-    // web_socket_channel has no connect callback; the socket is
-    // usable as soon as the channel exists. Treat it as connected
-    // and let onDone/onError report real failures.
+    // Do NOT mark the connection live yet: the handshake has not
+    // completed. Confirm it via `ready` (or the first inbound frame,
+    // see [_onData]) and only then reset the retry budget and report
+    // `connected` — sends before that point would be lost.
+    unawaited(
+      channel.ready
+          .then((_) {
+            if (!_closed && identical(_channel, channel)) _markConnected();
+          })
+          .catchError((_) {
+            // Handshake failed — onDone/onError reports it.
+          }),
+    );
+  }
+
+  /// The handshake completed (or the first frame arrived): the socket
+  /// is genuinely open. Resets the retry budget — only here, never
+  /// when the channel is merely created.
+  void _markConnected() {
+    if (_closed || _connected) return;
     _connected = true;
     _attempts = 0;
     _emit(ChatConnectionState.connected);
   }
 
+  /// Reconnect now, resetting the retry budget. Safe to call while
+  /// connecting/reconnecting or after [ChatConnectionState.failed];
+  /// a no-op when already connected or closed.
+  Future<void> reconnect() async {
+    if (_closed || isConnected) return;
+    _attempts = 0;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    await _subscription?.cancel();
+    _subscription = null;
+    try {
+      await _channel?.sink.close();
+    } catch (_) {
+      // Already closed.
+    }
+    _channel = null;
+    _connected = false;
+    await _connect();
+  }
+
   void _onData(dynamic data) {
+    // Any inbound frame proves the handshake completed.
+    _markConnected();
     Map<String, dynamic> frame;
     try {
       frame = jsonDecode(data as String) as Map<String, dynamic>;
@@ -651,14 +707,14 @@ class ChatRoomConnection {
 
   void _scheduleReconnect({bool refreshTokenFirst = false}) {
     if (_closed) return;
-    if (_attempts >= _maxAttempts) {
+    if (_attempts >= _retryDelays.length) {
       _emit(ChatConnectionState.failed);
       _errorsController.add(
-        'Live connection lost. Pull to refresh or reopen the chat.',
+        'Live connection lost. Tap Reconnect to try again.',
       );
       return;
     }
-    final delay = _retryDelays[_attempts.clamp(0, _retryDelays.length - 1)];
+    final delay = _retryDelays[_attempts];
     _attempts++;
     _emit(ChatConnectionState.reconnecting);
     _reconnectTimer?.cancel();
@@ -691,8 +747,12 @@ class ChatRoomConnection {
     }
     final channel = _channel;
     if (_closed || channel == null || !_connected) {
+      // Reconnect-on-send: kick off a fresh attempt instead of
+      // silently dropping the message, then refuse loudly so the
+      // caller can tell the user to retry.
+      unawaited(reconnect());
       throw const ApiException(
-        'Not connected. Please wait a moment and try again.',
+        'Connection lost. Reconnecting — please try again.',
       );
     }
     try {

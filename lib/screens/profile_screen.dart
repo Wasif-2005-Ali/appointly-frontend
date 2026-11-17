@@ -1,4 +1,3 @@
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -11,7 +10,6 @@ import '../user_session.dart';
 import '../database/bd_helper.dart';
 import '../widgets/image_crop_dialog.dart';
 import '../widgets/save_icon_button.dart';
-import '../widgets/save_success_overlay.dart';
 import '../widgets/appointly_hand_icon.dart';
 
 
@@ -33,12 +31,12 @@ class _ProfileScreenState extends State<ProfileScreen>
   late Animation<double> _fade;
   late Animation<Offset> _slide;
 
-  bool _isEditing = true;
+  bool _isEditing = false;
   late final TextEditingController _nameCtrl;
   late final TextEditingController _emailCtrl;
   late final TextEditingController _phoneCtrl;
-  final _bioCtrl = TextEditingController(
-      text: 'Professional service provider with 6+ years of experience. Passionate about delivering excellence.');
+  // No hardcoded default bio — an empty bio shows an honest empty state.
+  final _bioCtrl = TextEditingController();
 
   String _selectedStatus = 'Available';
   String _privacyMode    = 'Public';
@@ -52,14 +50,7 @@ class _ProfileScreenState extends State<ProfileScreen>
   static const double _kFabRight  = 16.0;
   static const double _kFabBottom = 80.0;
 
-  final List<Map<String,dynamic>> _allContacts = [
-    {'name':'Aisha Khan',     'sel':true},
-    {'name':'Omar Farooq',    'sel':true},
-    {'name':'Bilal Chaudhry', 'sel':false},
-    {'name':'Zara Malik',     'sel':false},
-    {'name':'Hina Raza',      'sel':true},
-    {'name':'Tariq Ahmed',    'sel':false},
-  ];
+
 
   String get _initials {
     final p = _nameCtrl.text.trim().split(' ');
@@ -102,6 +93,41 @@ class _ProfileScreenState extends State<ProfileScreen>
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
       ));
+    }
+  }
+
+  /// Persists the profile (local SQLite + best-effort server name
+  /// sync). Shared by the header save button and the FAB "Save Profile"
+  /// action so both actually save.
+  Future<void> _saveProfile() async {
+    final uid = UserSession.instance.userId;
+    if (uid == null) return;
+    // Persist all profile fields to SQLite
+    await DBHelper.instance.updateUserProfile(
+      uid,
+      name:          _nameCtrl.text.trim(),
+      phone:         _phoneCtrl.text.trim(),
+      bio:           _bioCtrl.text.trim(),
+      profileStatus: _selectedStatus,
+      privacyMode:   _privacyMode,
+      profileImage:  UserSession.instance.profileImageBytes,
+    );
+    // Update in-memory session
+    UserSession.instance.fullName      = _nameCtrl.text.trim();
+    UserSession.instance.phone         = _phoneCtrl.text.trim();
+    UserSession.instance.bio           = _bioCtrl.text.trim();
+    UserSession.instance.profileStatus = _selectedStatus;
+    UserSession.instance.privacyMode   = _privacyMode;
+    // Sync the name to the server so other users see it in
+    // search and chat. Best-effort: the local save above
+    // already ran, so a failure here only leaves the server
+    // copy as it was.
+    try {
+      await UserService.instance.updateProfile(
+        fullName: _nameCtrl.text.trim(),
+      );
+    } catch (_) {
+      // Offline or server error — local profile is saved.
     }
   }
 
@@ -225,37 +251,7 @@ class _ProfileScreenState extends State<ProfileScreen>
         SaveIconButton(
           changeSignal: _cs,
           foregroundColor: Colors.white,
-          onSave: () async {
-            final uid = UserSession.instance.userId;
-            if (uid == null) return;
-            // Persist all profile fields to SQLite
-            await DBHelper.instance.updateUserProfile(
-              uid,
-              name:          _nameCtrl.text.trim(),
-              phone:         _phoneCtrl.text.trim(),
-              bio:           _bioCtrl.text.trim(),
-              profileStatus: _selectedStatus,
-              privacyMode:   _privacyMode,
-              profileImage:  UserSession.instance.profileImageBytes,
-            );
-            // Update in-memory session
-            UserSession.instance.fullName      = _nameCtrl.text.trim();
-            UserSession.instance.phone         = _phoneCtrl.text.trim();
-            UserSession.instance.bio           = _bioCtrl.text.trim();
-            UserSession.instance.profileStatus = _selectedStatus;
-            UserSession.instance.privacyMode   = _privacyMode;
-            // Sync the name to the server so other users see it in
-            // search and chat. Best-effort: the local save above
-            // already ran, so a failure here only leaves the server
-            // copy as it was.
-            try {
-              await UserService.instance.updateProfile(
-                fullName: _nameCtrl.text.trim(),
-              );
-            } catch (_) {
-              // Offline or server error — local profile is saved.
-            }
-          },
+          onSave: _saveProfile,
         ),
       ]),
     )),
@@ -316,6 +312,7 @@ class _ProfileScreenState extends State<ProfileScreen>
                               imgBytes,
                               width: 94,
                               height: 94,
+                              cacheWidth: 188,
                               fit: BoxFit.cover,
                             ),
                           )
@@ -369,82 +366,9 @@ class _ProfileScreenState extends State<ProfileScreen>
         ),
 
         const SizedBox(height: 20),
-
-        // ── LinkedIn-style Message & Call buttons ─────────────────────────
-        Row(children: [
-          Expanded(child: _actionBtn(
-            icon: Icons.chat_bubble_outline_rounded,
-            label: 'Message',
-            gradient: [dmAccent, const Color(0xFF1565C0)],
-            textColor: Colors.white,
-            onTap: () => ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text('Chat coming soon!', style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
-              backgroundColor: dmAccent, behavior: SnackBarBehavior.floating,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)))),
-          )),
-          const SizedBox(width: 10),
-          Expanded(child: _outlineBtn(
-            icon: Icons.phone_outlined,
-            label: 'Call',
-            color: AppColors.green,
-            onTap: () => ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text('Call coming soon!', style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
-              backgroundColor: AppColors.green, behavior: SnackBarBehavior.floating,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)))),
-          )),
-        ]),
       ]),
     );
   }
-
-  Widget _actionBtn({
-    required IconData icon,
-    required String label,
-    required List<Color> gradient,
-    required Color textColor,
-    required VoidCallback onTap,
-  }) => GestureDetector(
-    onTap: onTap,
-    child: Container(
-      padding: const EdgeInsets.symmetric(vertical: 13),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(colors: gradient),
-        borderRadius: BorderRadius.circular(14),
-        boxShadow: [BoxShadow(
-          color: gradient.last.withOpacity(0.4),
-          blurRadius: 12, offset: const Offset(0, 4))],
-      ),
-      child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-        Icon(icon, color: textColor, size: 18),
-        const SizedBox(width: 7),
-        Text(label, style: GoogleFonts.dmSans(
-            fontSize: 14, fontWeight: FontWeight.w700, color: textColor)),
-      ]),
-    ),
-  );
-
-  Widget _outlineBtn({
-    required IconData icon,
-    required String label,
-    required Color color,
-    required VoidCallback onTap,
-  }) => GestureDetector(
-    onTap: onTap,
-    child: Container(
-      padding: const EdgeInsets.symmetric(vertical: 13),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: color.withOpacity(0.4), width: 1.5),
-      ),
-      child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-        Icon(icon, color: color, size: 18),
-        const SizedBox(width: 7),
-        Text(label, style: GoogleFonts.dmSans(
-            fontSize: 14, fontWeight: FontWeight.w700, color: color)),
-      ]),
-    ),
-  );
 
   // ── STATUS CARD ───────────────────────────────────────────────────────────
   Widget _buildStatusCard() => _card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -554,52 +478,13 @@ class _ProfileScreenState extends State<ProfileScreen>
           ),
         );
       }),
-      if (_privacyMode == 'Protected') ...[ 
+      if (_privacyMode == 'Protected') ...[
         const SizedBox(height: 4),
         Container(height: 1, color: dmBorder),
         const SizedBox(height: 12),
-        Row(children: [
-          Icon(Icons.manage_accounts_rounded, size: 15, color: AppColors.warning),
-          const SizedBox(width: 6),
-          Text('Allowed Contacts', style: GoogleFonts.dmSans(
-              fontSize: 13, fontWeight: FontWeight.w800, color: dmTxtMain)),
-          const Spacer(),
-          Text('${_allContacts.where((c) => c['sel'] == true).length} selected',
-              style: GoogleFonts.dmSans(fontSize: 11, color: dmTxtSub, fontWeight: FontWeight.w600)),
-        ]),
-        const SizedBox(height: 10),
-        ..._allContacts.asMap().entries.map((e) {
-          final c = e.value; final i = e.key;
-          final sel = c['sel'] as bool;
-          return GestureDetector(
-            onTap: () => setState(() => _allContacts[i]['sel'] = !sel),
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 150),
-              margin: const EdgeInsets.only(bottom: 8),
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              decoration: BoxDecoration(
-                color: sel ? AppColors.warning.withOpacity(0.08) : dmCard2,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: sel ? AppColors.warning.withOpacity(0.4) : dmBorder),
-              ),
-              child: Row(children: [
-                CircleAvatar(radius: 15, backgroundColor: dmAccent.withOpacity(0.15),
-                  child: Text((c['name'] as String).split(' ').map((w) => w[0]).join(),
-                      style: GoogleFonts.dmSans(fontSize: 11, fontWeight: FontWeight.w800, color: dmAccent))),
-                const SizedBox(width: 10),
-                Expanded(child: Text(c['name'] as String, style: GoogleFonts.dmSans(
-                    fontSize: 13, fontWeight: FontWeight.w600, color: dmTxtMain))),
-                AnimatedContainer(duration: const Duration(milliseconds: 150),
-                  width: 22, height: 22,
-                  decoration: BoxDecoration(shape: BoxShape.circle,
-                    gradient: sel ? const LinearGradient(colors: [Color(0xFFE08020), Color(0xFFF4A24A)]) : null,
-                    color: sel ? null : Colors.transparent,
-                    border: Border.all(color: sel ? AppColors.warning : dmBorder, width: 2)),
-                  child: sel ? const Icon(Icons.check_rounded, color: Colors.white, size: 13) : null),
-              ]),
-            ),
-          );
-        }),
+        Text('No allowed contacts yet — contact selection isn\'t available yet.',
+            style: GoogleFonts.dmSans(fontSize: 12, color: dmTxtSub, fontWeight: FontWeight.w500)),
+      
       ],
     ]));
   }
@@ -688,7 +573,8 @@ class _ProfileScreenState extends State<ProfileScreen>
     const SizedBox(height: 16),
     _editField('Full Name', _nameCtrl, Icons.badge_outlined),
     const SizedBox(height: 12),
-    _editField('Email Address', _emailCtrl, Icons.email_outlined),
+    _editField('Email Address', _emailCtrl, Icons.email_outlined,
+        readOnly: true, note: "Email can't be changed here"),
     const SizedBox(height: 12),
     _editField('Phone Number', _phoneCtrl, Icons.phone_outlined),
     const SizedBox(height: 12),
@@ -746,57 +632,33 @@ class _ProfileScreenState extends State<ProfileScreen>
               border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
               focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: dmAccent, width: 1.5)),
               contentPadding: const EdgeInsets.all(14)))
+    else if (_bioCtrl.text.trim().isEmpty)
+      Text('No bio yet.', style: GoogleFonts.dmSans(
+          fontSize: 13.5, color: dmTxtSub, fontWeight: FontWeight.w500, height: 1.6))
     else
       Text(_bioCtrl.text, style: GoogleFonts.dmSans(
           fontSize: 13.5, color: dmTxtBody, fontWeight: FontWeight.w500, height: 1.6)),
   ]));
 
   Widget _buildServicesCard() {
-    final services = ['Deep Tissue Massage','Consultation','Skin Care','Hair Coloring','Physiotherapy'];
+    // No services data exists — honest empty state instead of a
+    // hardcoded list.
     return _card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       _cardTitle('Services Offered', Icons.medical_services_outlined, dmAccent),
       const SizedBox(height: 14),
-      Wrap(spacing: 8, runSpacing: 8, children: services.map((s) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        decoration: BoxDecoration(color: dmAccent.withOpacity(0.1), borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: dmAccent.withOpacity(0.25))),
-        child: Text(s, style: GoogleFonts.dmSans(fontSize: 12, fontWeight: FontWeight.w600, color: dmAccent)),
-      )).toList()),
+      Text('No services added yet.', style: GoogleFonts.dmSans(
+          fontSize: 13, color: dmTxtSub, fontWeight: FontWeight.w500)),
     ]));
   }
 
   Widget _buildReviewsCard() {
-    final reviews = [
-      {'name':'Aisha Khan','text':'Amazing experience! Very professional.','rating':5,'ac':const Color(0xFF4A90D9),'bg':const Color(0xFF1A2A40)},
-      {'name':'Omar Farooq','text':'Highly recommend. Excellent service!','rating':5,'ac':const Color(0xFF2ECC96),'bg':const Color(0xFF0F2820)},
-      {'name':'Zara Malik','text':'Great attention to detail. Will come again.','rating':4,'ac':const Color(0xFFF4A24A),'bg':const Color(0xFF2A1E0A)},
-    ];
+    // No review data exists — honest empty state instead of
+    // hardcoded fake reviews.
     return _card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-        _cardTitle('Recent Reviews', Icons.star_outline_rounded, AppColors.warning),
-        Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          decoration: BoxDecoration(color: AppColors.warning.withOpacity(0.12), borderRadius: BorderRadius.circular(20)),
-          child: Row(children: [const Icon(Icons.star_rounded, color: AppColors.warning, size: 14), const SizedBox(width: 4),
-            Text('4.9', style: GoogleFonts.dmSans(fontSize: 12, fontWeight: FontWeight.w800, color: AppColors.warning))])),
-      ]),
-      const SizedBox(height: 16),
-      ...reviews.map((r) => Container(margin: const EdgeInsets.only(bottom: 12), padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(color: dmCard2, borderRadius: BorderRadius.circular(14), border: Border.all(color: dmBorder2)),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            CircleAvatar(radius: 16, backgroundColor: (r['bg'] as Color),
-                child: Text((r['name'] as String).split(' ').map((w) => w[0]).join(),
-                    style: GoogleFonts.dmSans(fontSize: 11, fontWeight: FontWeight.w800, color: r['ac'] as Color))),
-            const SizedBox(width: 10),
-            Expanded(child: Text(r['name'] as String, style: GoogleFonts.dmSans(
-                fontSize: 13, fontWeight: FontWeight.w700, color: dmTxtMain))),
-            Row(children: List.generate(5, (i) => Icon(Icons.star_rounded, size: 13,
-                color: i < (r['rating'] as int) ? AppColors.warning : dmBorder))),
-          ]),
-          const SizedBox(height: 8),
-          Text(r['text'] as String, style: GoogleFonts.dmSans(
-              fontSize: 12.5, color: dmTxtBody, fontWeight: FontWeight.w500, height: 1.5)),
-        ]))),
+      _cardTitle('Recent Reviews', Icons.star_outline_rounded, AppColors.warning),
+      const SizedBox(height: 14),
+      Text('No reviews yet.', style: GoogleFonts.dmSans(
+          fontSize: 13, color: dmTxtSub, fontWeight: FontWeight.w500)),
     ]));
   }
 
@@ -897,8 +759,20 @@ class _ProfileScreenState extends State<ProfileScreen>
                         setState(() => _showAccessibility = false);
                       }),
                       const SizedBox(height: 6),
-                      _accessBtn(Icons.edit_rounded, _isEditing ? 'Save Profile' : 'Edit Profile', AppColors.green, () {
-                        setState(() { _isEditing = !_isEditing; _showAccessibility = false; });
+                      _accessBtn(Icons.edit_rounded, _isEditing ? 'Save Profile' : 'Edit Profile', AppColors.green, () async {
+                        if (_isEditing) {
+                          await _saveProfile();
+                          if (!mounted) return;
+                          setState(() { _isEditing = false; _showAccessibility = false; });
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                            content: Text('Profile saved', style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                            backgroundColor: const Color(0xFF2ECC96),
+                            behavior: SnackBarBehavior.floating,
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                          ));
+                        } else {
+                          setState(() { _isEditing = true; _showAccessibility = false; });
+                        }
                       }),
                     ]),
                   )
@@ -989,35 +863,34 @@ class _ProfileScreenState extends State<ProfileScreen>
 
   // ── Shared helpers ─────────────────────────────────────────────────────────
   Widget _buildStatsRow() {
-    final stats = [
-      {'label':'Appointments','value':'1,284','icon':Icons.calendar_today_rounded,'color':dmAccent},
-      {'label':'Clients',      'value':'248',  'icon':Icons.people_alt_rounded,   'color':AppColors.green},
-      {'label':'Reviews',      'value':'4.9★', 'icon':Icons.star_rounded,         'color':AppColors.warning},
-    ];
-    return Row(children: stats.asMap().entries.map((e) => Expanded(child: Container(
-      margin: EdgeInsets.only(left: e.key == 0 ? 0 : 8),
+    // Only real data: the appointment count from AppState. There is
+    // no client list or review data, so those tiles were removed
+    // rather than showing made-up numbers.
+    final count = AppStateProvider.of(context).appointments.length;
+    return Container(
       padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
       decoration: BoxDecoration(color: dmCard, borderRadius: BorderRadius.circular(16),
           border: Border.all(color: dmBorder, width: 1.5),
           boxShadow: [BoxShadow(color: dmAccent.withOpacity(0.05), blurRadius: 10)]),
       child: Column(children: [
-        Icon(e.value['icon'] as IconData, color: e.value['color'] as Color, size: 20),
+        Icon(Icons.calendar_today_rounded, color: dmAccent, size: 20),
         const SizedBox(height: 8),
-        Text(e.value['value'] as String, style: GoogleFonts.dmSans(
+        Text('$count', style: GoogleFonts.dmSans(
             fontSize: 16, fontWeight: FontWeight.w900, color: dmTxtMain, letterSpacing: -0.5)),
         const SizedBox(height: 2),
-        Text(e.value['label'] as String, textAlign: TextAlign.center, style: GoogleFonts.dmSans(
+        Text('Appointments', textAlign: TextAlign.center, style: GoogleFonts.dmSans(
             fontSize: 9.5, color: dmTxtSub, fontWeight: FontWeight.w600)),
       ]),
-    ))).toList());
+    );
   }
 
-  Widget _editField(String label, TextEditingController ctrl, IconData icon) =>
+  Widget _editField(String label, TextEditingController ctrl, IconData icon,
+      {bool readOnly = false, String? note}) =>
     Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Text(label, style: GoogleFonts.dmSans(fontSize: 11, fontWeight: FontWeight.w700,
           color: dmTxtSub, letterSpacing: 0.5)),
       const SizedBox(height: 6),
-      if (_isEditing)
+      if (_isEditing && !readOnly)
         TextField(controller: ctrl,
           style: GoogleFonts.dmSans(fontSize: 14, color: dmTxtMain, fontWeight: FontWeight.w600),
           decoration: InputDecoration(prefixIcon: Icon(icon, color: dmAccent, size: 18),
@@ -1032,6 +905,10 @@ class _ProfileScreenState extends State<ProfileScreen>
             Icon(icon, color: dmAccent, size: 18), const SizedBox(width: 10),
             Expanded(child: Text(ctrl.text, style: GoogleFonts.dmSans(fontSize: 14, color: dmTxtMain, fontWeight: FontWeight.w600))),
           ])),
+      if (note != null) ...[
+        const SizedBox(height: 4),
+        Text(note, style: GoogleFonts.dmSans(fontSize: 11, color: dmTxtSub, fontWeight: FontWeight.w500)),
+      ],
     ]);
 
   Widget _card({required Widget child}) => Container(

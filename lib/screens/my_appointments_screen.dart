@@ -103,7 +103,26 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
             ),
             SliverToBoxAdapter(child: _buildStatsRow()),
             SliverToBoxAdapter(child: _buildFilterRow()),
-            SliverPadding(
+            if (items.isEmpty)
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 24, 16, 100),
+                  child: Column(children: [
+                    Icon(Icons.event_busy_rounded, size: 56,
+                        color: dmTxtSub.withOpacity(0.4)),
+                    const SizedBox(height: 14),
+                    Text('No appointments yet', style: GoogleFonts.dmSans(
+                        fontSize: 18, fontWeight: FontWeight.w800, color: dmTxtMain)),
+                    const SizedBox(height: 6),
+                    Text('Book your first appointment with the + button below.',
+                        textAlign: TextAlign.center,
+                        style: GoogleFonts.dmSans(
+                            fontSize: 13, color: dmTxtSub, fontWeight: FontWeight.w500)),
+                  ]),
+                ),
+              )
+            else
+              SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 100),
               sliver: SliverList(
                 delegate: SliverChildBuilderDelegate(
@@ -132,9 +151,6 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
                                   borderRadius: BorderRadius.circular(14)),
                             ));
                           }
-                        },
-                        onDelete: (id) async {
-                          await AppStateProvider.of(context).deleteAppointment(id);
                         },
                         onReschedule: (appt) => _openReschedule(appt),
                       ),
@@ -430,7 +446,6 @@ class _ApptCard extends StatefulWidget {
   final int index;
   final int? dayNumber;
   final Future<void> Function(int id, ApptStatus) onStatusChanged;
-  final Future<void> Function(int id) onDelete;
   final void Function(Appointment) onReschedule;
 
   const _ApptCard({
@@ -438,7 +453,6 @@ class _ApptCard extends StatefulWidget {
     required this.index,
     required this.dayNumber,
     required this.onStatusChanged,
-    required this.onDelete,
     required this.onReschedule,
   });
 
@@ -767,31 +781,6 @@ class _ApptCardState extends State<_ApptCard>
                 },
               )),
             ]),
-            const SizedBox(height: 8),
-            SizedBox(
-              width: double.infinity,
-              child: _actionBtn(
-                'Remove',
-                Icons.delete_outline_rounded,
-                const Color(0xFFE05C5C).withOpacity(0.08),
-                const Color(0xFFE05C5C),
-                () async {
-                  if (a.id == null) return;
-                  setState(() => _expanded = false);
-                  await widget.onDelete(a.id!);
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                      content: Text('Appointment removed',
-                          style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
-                      backgroundColor: const Color(0xFFE05C5C),
-                      behavior: SnackBarBehavior.floating,
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14)),
-                    ));
-                  }
-                },
-              ),
-            ),
           ])
         else
           Row(children: [

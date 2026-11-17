@@ -174,20 +174,36 @@ class CallService {
   // Notify socket (persistent, app-level)
   // ------------------------------------------------------------------
 
-  static const _maxNotifyAttempts = 3;
+  // Escalating retry delays for the notify socket; after the budget
+  // (~2–3 min) is spent, a slow 60s retry keeps running until logout
+  // so incoming calls never silently die. The budget resets on the
+  // first confirmed connection.
   static const _notifyRetryDelays = [
     Duration(seconds: 2),
     Duration(seconds: 5),
     Duration(seconds: 10),
+    Duration(seconds: 20),
+    Duration(seconds: 30),
+    Duration(seconds: 30),
+    Duration(seconds: 30),
   ];
+  static const _notifySlowRetry = Duration(seconds: 60);
 
   WebSocketChannel? _notifyChannel;
   StreamSubscription? _notifySubscription;
   Timer? _notifyReconnectTimer;
   bool _notifyWanted = false;
   bool _notifyConnected = false;
+  bool _notifySlowMode = false;
   int _notifyAttempts = 0;
   String? _notifyToken;
+
+  /// True when the last notify handshake failed with an auth error
+  /// (the backend rejects bad tokens at HTTP level, e.g. 403, never
+  /// with close code 4001). Retries are paused until [reconnectNotify]
+  /// is called (e.g. after a fresh login).
+  bool _notifyAuthFailed = false;
+  bool get notifyAuthFailed => _notifyAuthFailed;
 
   final _incomingController = StreamController<IncomingCall>.broadcast();
   final _notifyErrorsController = StreamController<String>.broadcast();
@@ -196,8 +212,10 @@ class CallService {
   /// (see `main.dart`) and shows the incoming-call dialog.
   Stream<IncomingCall> get incomingCalls => _incomingController.stream;
 
-  /// Problems with the notify connection (shown nowhere by default;
-  /// the socket retries on its own).
+  /// Problems with the notify connection. Emitted on auth failures
+  /// and when the escalating retry budget is spent (a slow 60s retry
+  /// keeps running after that). Listen to this to surface the state
+  /// and offer a manual retry via [reconnectNotify].
   Stream<String> get notifyErrors => _notifyErrorsController.stream;
 
   bool get isNotifyConnected => _notifyWanted && _notifyConnected;
@@ -220,6 +238,7 @@ class CallService {
   Future<void> connectNotify() async {
     if (_notifyWanted && _notifyConnected && _notifyChannel != null) return;
     _notifyWanted = true;
+    _notifyAuthFailed = false;
     final token = await TokenStorage.instance.accessToken;
     if (token == null || token.isEmpty) {
       _notifyWanted = false;
@@ -227,6 +246,30 @@ class CallService {
     }
     _notifyToken = token;
     _notifyAttempts = 0;
+    _notifySlowMode = false;
+    await _connectNotifySocket();
+  }
+
+  /// Reconnect the notify socket now, resetting the retry budget and
+  /// clearing any auth-failure flag. Safe to call any time after
+  /// login; a no-op when already connected or when not wanted.
+  Future<void> reconnectNotify() async {
+    if (!_notifyWanted || _notifyConnected) return;
+    _notifyAuthFailed = false;
+    _notifyAttempts = 0;
+    _notifySlowMode = false;
+    _notifyReconnectTimer?.cancel();
+    _notifyReconnectTimer = null;
+    await _notifySubscription?.cancel();
+    _notifySubscription = null;
+    try {
+      await _notifyChannel?.sink.close();
+    } catch (_) {
+      // Already closed.
+    }
+    _notifyChannel = null;
+    final token = await TokenStorage.instance.accessToken;
+    if (token != null && token.isNotEmpty) _notifyToken = token;
     await _connectNotifySocket();
   }
 
@@ -253,20 +296,52 @@ class CallService {
 
   Future<void> _connectNotifySocket() async {
     if (!_notifyWanted) return;
+    WebSocketChannel channel;
     try {
-      _notifyChannel = WebSocketChannel.connect(_notifyUri);
+      channel = WebSocketChannel.connect(_notifyUri);
     } catch (_) {
       _scheduleNotifyReconnect();
       return;
     }
-    _notifySubscription = _notifyChannel!.stream.listen(
+    _notifyChannel = channel;
+    _notifySubscription = channel.stream.listen(
       _onNotifyData,
       onError: (_) => _onNotifyClosed(),
       onDone: _onNotifyClosed,
       cancelOnError: false,
     );
-    _notifyConnected = true;
-    _notifyAttempts = 0;
+    // Confirm the handshake before reporting connected: the backend
+    // rejects bad tokens at HTTP level (403), so a failed handshake
+    // surfaces here, not as a close code.
+    unawaited(
+      channel.ready
+          .then((_) {
+            if (!_notifyWanted || !identical(_notifyChannel, channel)) return;
+            _notifyConnected = true;
+            _notifyAttempts = 0;
+            _notifySlowMode = false;
+            _notifyAuthFailed = false;
+          })
+          .catchError((Object e) {
+            if (!_notifyWanted || !identical(_notifyChannel, channel)) return;
+            if ('$e'.contains('403')) {
+              // Auth error, not a network blip: stop retrying with a
+              // dead token and say so distinctly.
+              _notifyAuthFailed = true;
+              _emitNotifyError(
+                'Your session expired. Log in again to receive calls.',
+              );
+            }
+            // Other handshake failures fall through to the socket
+            // close path, which retries on its own.
+          }),
+    );
+  }
+
+  void _emitNotifyError(String message) {
+    if (!_notifyErrorsController.isClosed) {
+      _notifyErrorsController.add(message);
+    }
   }
 
   void _onNotifyData(dynamic data) {
@@ -308,20 +383,23 @@ class CallService {
   }
 
   void _scheduleNotifyReconnect({bool refreshTokenFirst = false}) {
-    if (!_notifyWanted) return;
-    if (_notifyAttempts >= _maxNotifyAttempts) {
-      if (!_notifyErrorsController.isClosed) {
-        _notifyErrorsController.add(
-          'Call notifications unavailable. Restart the app to reconnect.',
+    if (!_notifyWanted || _notifyAuthFailed) return;
+    if (_notifyAttempts >= _notifyRetryDelays.length) {
+      // Escalating budget spent: keep a slow 60s retry so incoming
+      // calls never silently die until logout. Say so once.
+      if (!_notifySlowMode) {
+        _notifySlowMode = true;
+        _emitNotifyError(
+          'Call notifications unavailable. Retrying in the background.',
         );
       }
+      _notifyReconnectTimer?.cancel();
+      _notifyReconnectTimer = Timer(_notifySlowRetry, () async {
+        if (_notifyWanted) await _connectNotifySocket();
+      });
       return;
     }
-    final delay =
-        _notifyRetryDelays[_notifyAttempts.clamp(
-          0,
-          _notifyRetryDelays.length - 1,
-        )];
+    final delay = _notifyRetryDelays[_notifyAttempts];
     _notifyAttempts++;
     _notifyReconnectTimer?.cancel();
     _notifyReconnectTimer = Timer(delay, () async {
@@ -335,8 +413,8 @@ class CallService {
           if (fresh != null && fresh.isNotEmpty) _notifyToken = fresh;
         } catch (_) {
           // Refresh failed — reconnect with the old token; the
-          // server will close with 4001 again and we give up after
-          // the remaining attempts.
+          // server will reject it again and the slow retry keeps
+          // trying until logout.
         }
       }
       if (_notifyWanted) await _connectNotifySocket();

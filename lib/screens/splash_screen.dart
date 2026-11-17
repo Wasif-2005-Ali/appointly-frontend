@@ -105,34 +105,47 @@ class _SplashScreenState extends State<SplashScreen>
       );
     }
 
-    _ctrl.forward().then((_) async {
+    // Animation is purely cosmetic: session restore starts immediately,
+    // in parallel, and we navigate as soon as it finishes (after a
+    // minimum ~1s so the splash is actually seen).
+    _ctrl.forward();
+    _restoreAndNavigate();
+  }
+
+  Future<void> _restoreAndNavigate() async {
+    final started = DateTime.now();
+    // Ensure DB is ready.
+    await DBHelper.instance.database;
+    // Try to restore the backend session (stored JWT tokens).
+    // ApiClient retries a timeout once, so a cold-starting backend
+    // (~30s wake-up) does not bounce a valid session to login.
+    Widget next = const WelcomeScreen();
+    final savedUser = await AuthService.instance.restoreSession();
+    if (savedUser != null && mounted) {
+      UserSession.instance.setFromMap(savedUser);
+      await AppStateProvider.of(context).loadUserData();
       if (!mounted) return;
-      // Ensure DB is ready (runs in background during the 4 s animation — fast)
-      await DBHelper.instance.database;
-      // Try to restore the backend session (stored JWT tokens).
-      // If valid, skip the login screen and go straight to the dashboard.
-      Widget next = const WelcomeScreen();
-      final savedUser = await AuthService.instance.restoreSession();
-      if (savedUser != null && mounted) {
-        UserSession.instance.setFromMap(savedUser);
-        await AppStateProvider.of(context).loadUserData();
-        if (!mounted) return;
-        next = const DashboardScreen();
-      }
+      next = const DashboardScreen();
+    }
+    if (!mounted) return;
+    final elapsed = DateTime.now().difference(started);
+    const minSplash = Duration(seconds: 1);
+    if (elapsed < minSplash) {
+      await Future.delayed(minSplash - elapsed);
       if (!mounted) return;
-      // Crossfade directly — no pre-fade so no black flash
-      Navigator.of(context).pushReplacement(PageRouteBuilder(
-        pageBuilder: (_, __, ___) => next,
-        transitionDuration: const Duration(milliseconds: 700),
-        reverseTransitionDuration: const Duration(milliseconds: 400),
-        transitionsBuilder: (_, anim, __, child) {
-          return FadeTransition(
-            opacity: CurvedAnimation(parent: anim, curve: Curves.easeInOut),
-            child: child,
-          );
-        },
-      ));
-    });
+    }
+    // Crossfade directly — no pre-fade so no black flash
+    Navigator.of(context).pushReplacement(PageRouteBuilder(
+      pageBuilder: (_, __, ___) => next,
+      transitionDuration: const Duration(milliseconds: 700),
+      reverseTransitionDuration: const Duration(milliseconds: 400),
+      transitionsBuilder: (_, anim, __, child) {
+        return FadeTransition(
+          opacity: CurvedAnimation(parent: anim, curve: Curves.easeInOut),
+          child: child,
+        );
+      },
+    ));
   }
 
   @override

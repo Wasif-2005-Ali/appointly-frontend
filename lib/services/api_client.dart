@@ -36,7 +36,7 @@ class ApiClient {
   ApiClient._();
   static final ApiClient instance = ApiClient._();
 
-  static const _timeout = Duration(seconds: 15);
+  static const _timeout = Duration(seconds: 45);
 
   /// Uploads (photos, documents) take longer than JSON calls.
   static const _uploadTimeout = Duration(seconds: 60);
@@ -115,6 +115,16 @@ class ApiClient {
     );
   }
 
+  Future<http.Response> delete(String path, {bool auth = true}) {
+    return _send(
+      () async => _http.delete(
+        Uri.parse('${ApiConfig.baseUrl}$path'),
+        headers: auth ? await _authHeaders() : _jsonHeaders,
+      ),
+      retryOnAuth: auth,
+    );
+  }
+
   /// Authenticated multipart file upload. The request is rebuilt on
   /// every attempt, so the 401 → refresh → retry flow works the same
   /// as for JSON calls. Uses the longer upload timeout.
@@ -171,25 +181,37 @@ class ApiClient {
   }
 
   /// Runs [request] and converts transport failures into [ApiException].
+  /// A timeout is retried ONCE before throwing: the free-tier backend
+  /// takes ~30s to wake from a cold start, so the first call after idle
+  /// would otherwise always fail. (No retry on the 401 path — that is
+  /// handled by the token refresh in [_send].)
   Future<http.Response> _guarded(
     Future<http.Response> Function() request, {
     Duration? timeout,
   }) async {
-    try {
-      return await request().timeout(timeout ?? _timeout);
-    } on TimeoutException {
-      throw const ApiException(
-        'The server is taking too long to respond. Please try again.',
-      );
-    } on SocketException {
-      throw const ApiException(
-        'Could not reach the server. Make sure the backend is running.',
-      );
-    } on http.ClientException {
-      throw const ApiException(
-        'Could not reach the server. Make sure the backend is running.',
-      );
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await request().timeout(timeout ?? _timeout);
+      } on TimeoutException {
+        if (attempt == 1) {
+          throw const ApiException(
+            'The server is taking too long to respond. Please try again.',
+          );
+        }
+        // First timeout — retry once (likely a cold start).
+      } on SocketException {
+        throw const ApiException(
+          'Could not reach the server. Make sure the backend is running.',
+        );
+      } on http.ClientException {
+        throw const ApiException(
+          'Could not reach the server. Make sure the backend is running.',
+        );
+      }
     }
+    throw const ApiException(
+      'The server is taking too long to respond. Please try again.',
+    );
   }
 
   Future<bool> _refreshAccessToken() {

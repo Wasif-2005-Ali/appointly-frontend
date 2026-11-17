@@ -31,15 +31,7 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
   late AnimationController _headerCtrl, _listCtrl;
   late Animation<double>   _headerFade;
 
-  final _filters = ['All', 'Unread', 'Online'];
-
-  final _stories = [
-    const StatusStory('My Status', Color(0xFF4A90D9), isMe: true),
-    const StatusStory('Aisha Khan',  Color(0xFF4A90D9)),
-    const StatusStory('Omar Farooq', Color(0xFF7C5CBF)),
-    const StatusStory('Tariq Ahmed', Color(0xFF3B73C0), viewed: true),
-    const StatusStory('Hina Raza',   Color(0xFFE8805A)),
-  ];
+  final _filters = ['All', 'Unread'];
 
   final List<ChatConversation> _convos = [];
   bool _loading = true;
@@ -141,7 +133,6 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
     }
     switch (_selectedFilter) {
       case 1: return list.where((c) => c.unread > 0).toList();
-      case 2: return list.where((c) => c.online).toList();
       default: return list;
     }
   }
@@ -172,7 +163,6 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
       backgroundColor: _bg,
       body: Column(children: [
         _buildHeader(),
-        _buildStatusStrip(),
         _buildFilterChips(),
         Expanded(child: _buildList()),
       ]),
@@ -207,8 +197,6 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
                   style: GoogleFonts.dmSans(fontSize: 12,
                       color: Colors.white.withOpacity(0.55), fontWeight: FontWeight.w500)),
             ])),
-            _hBtn(Icons.camera_alt_rounded, () => _toast('Camera')),
-            const SizedBox(width: 8),
             _hBtn(Icons.search_rounded, () => setState(() => _showSearch = !_showSearch)),
             const SizedBox(width: 8),
             InboxPopupMenu(
@@ -219,8 +207,6 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
                   Navigator.push(context, MaterialPageRoute(builder: (_) => const ChatSettingsScreen()));
                 } else if (v == 'archived') {
                   _openArchived();
-                } else {
-                  _toast(v);
                 }
               },
             ),
@@ -280,61 +266,6 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
 
   Widget _hBtn(IconData icon, VoidCallback onTap) => GestureDetector(
     onTap: onTap, child: _glassBtn(icon),
-  );
-
-  // ── Status strip ───────────────────────────────────────────────────────────
-  Widget _buildStatusStrip() => Container(
-    height: 100, color: _bg,
-    child: ListView.builder(
-      scrollDirection: Axis.horizontal,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-      itemCount: _stories.length,
-      itemBuilder: (_, i) {
-        final s = _stories[i];
-        return GestureDetector(
-          onTap: () => _toast(s.isMe ? 'Add Status' : 'View status'),
-          child: Padding(
-            padding: const EdgeInsets.only(right: 14),
-            child: Column(children: [
-              Container(
-                padding: const EdgeInsets.all(2.5),
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  gradient: (s.viewed || s.isMe)
-                      ? null
-                      : LinearGradient(colors: [_accent, _btnGrad.last], begin: Alignment.topLeft, end: Alignment.bottomRight),
-                  color: s.viewed ? _border : (s.isMe ? _cardBg : null),
-                  border: (s.viewed || s.isMe) ? Border.all(color: _border, width: 2) : null,
-                ),
-                child: Container(
-                  width: 52, height: 52,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: LinearGradient(colors: [s.color.withOpacity(0.7), s.color]),
-                    border: Border.all(color: _bg, width: 2),
-                  ),
-                  child: Center(child: s.isMe
-                      ? const Icon(Icons.add_rounded, color: Colors.white, size: 22)
-                      : Text(s.initials,
-                          style: GoogleFonts.dmSans(fontSize: 14, fontWeight: FontWeight.w900, color: Colors.white))),
-                ),
-              ),
-              const SizedBox(height: 5),
-              SizedBox(
-                width: 60,
-                child: Text(
-                  s.isMe ? 'My Status' : s.name.split(' ').first,
-                  textAlign: TextAlign.center, maxLines: 1, overflow: TextOverflow.ellipsis,
-                  style: GoogleFonts.dmSans(fontSize: 10.5, fontWeight: FontWeight.w600,
-                      color: s.viewed ? _txtSub.withOpacity(0.5) : _txtSub),
-                ),
-              ),
-            ]),
-          ),
-        );
-      },
-    ),
   );
 
   // ── Filter chips ───────────────────────────────────────────────────────────
@@ -579,8 +510,9 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
                 ]),
               ])),
           Divider(color: _border, height: 1),
-          _menuItem(Icons.mark_chat_read_rounded, c.unread > 0 ? 'Mark as Read' : 'Mark as Unread',
-              () => setState(() => c.unread = c.unread > 0 ? 0 : 1)),
+          if (c.unread > 0)
+            _menuItem(Icons.mark_chat_read_rounded, 'Mark as Read',
+                () => _markAsRead(c)),
           _menuItem(c.isPinned ? Icons.push_pin_outlined : Icons.push_pin_rounded,
               c.isPinned ? 'Unpin' : 'Pin Chat', () => setState(() => c.isPinned = !c.isPinned)),
           _menuItem(c.isMuted ? Icons.volume_up_rounded : Icons.volume_off_rounded,
@@ -602,10 +534,20 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
   );
 
   // ── Navigation ─────────────────────────────────────────────────────────────
+  /// Mark a room read on the server (POST …/read/) as well as locally,
+  /// so the unread badge stays cleared across devices and restarts.
+  /// There is no server endpoint for marking unread, so that option
+  /// does not exist.
+  Future<void> _markAsRead(ChatConversation c) async {
+    ChatService.instance.markRoomReadLocally(c.id);
+    setState(() => c.unread = 0);
+    await ChatService.instance.markRoomRead(c.id);
+  }
+
   void _openThread(ChatConversation c) {
-    // The backend never marks messages read, so stamp the room read
-    // locally — otherwise the unread badge would come back on the
-    // next reload (see ChatService.markRoomReadLocally).
+    // Stamp the room read locally; the thread screen marks it read
+    // server-side (POST …/read/) when it loads, so the unread badge
+    // stays cleared across devices and app restarts.
     ChatService.instance.markRoomReadLocally(c.id);
     setState(() => c.unread = 0);
     Navigator.push(context, PageRouteBuilder(

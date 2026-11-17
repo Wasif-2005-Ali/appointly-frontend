@@ -141,23 +141,6 @@ class WelcomeScreen extends StatelessWidget {
                       _socialBtn(context, 'Continue with email',
                           icon: Icons.email_outlined, accent: accent, border: border, txtMain: txtMain,
                           onTap: () => Navigator.push(context, _slide(const LoginScreen()))),
-                      const SizedBox(height: 24),
-                      Row(children: [
-                        Expanded(child: Divider(color: border)),
-                        Padding(padding: const EdgeInsets.symmetric(horizontal: 16),
-                            child: Text('OR', style: TextStyle(color: txtSub, fontSize: 12))),
-                        Expanded(child: Divider(color: border)),
-                      ]),
-                      const SizedBox(height: 24),
-                      Row(children: [
-                        Expanded(child: _socialBtn(context, 'Apple',
-                            icon: Icons.apple, isSmall: true, accent: accent, border: border, txtMain: txtMain)),
-                        const SizedBox(width: 16),
-                        Expanded(child: _socialBtn(context, 'Facebook',
-                            icon: Icons.facebook, isSmall: true,
-                            iconColor: const Color(0xFF1877F2),
-                            accent: accent, border: border, txtMain: txtMain)),
-                      ]),
                     ]),
                   ),
                 ]),
@@ -175,42 +158,140 @@ class WelcomeScreen extends StatelessWidget {
   /// is not configured yet (empty client ID), the service throws a
   /// friendly message shown in the snackbar below.
   Future<void> _signInWithGoogle(BuildContext context) async {
+    _showLoading(context);
+    Map<String, dynamic>? user;
+    try {
+      user = await AuthService.instance.signInWithGoogle();
+    } on ApiException catch (e) {
+      // Brand-new Google users need a profession (backend 400);
+      // ask for it and retry once with the chosen value.
+      if (_needsProfession(e.message)) {
+        if (context.mounted) Navigator.pop(context); // Dismiss loading.
+        final profession = await _askProfession(context);
+        if (profession == null || profession.isEmpty) return;
+        if (!context.mounted) return;
+        _showLoading(context);
+        try {
+          user = await AuthService.instance.signInWithGoogle(profession: profession);
+        } on ApiException catch (e2) {
+          if (context.mounted) Navigator.pop(context);
+          if (context.mounted) _showGoogleError(context, e2.message);
+          return;
+        } catch (_) {
+          if (context.mounted) Navigator.pop(context);
+          if (context.mounted) {
+            _showGoogleError(context, 'Something went wrong. Please try again.');
+          }
+          return;
+        }
+      } else {
+        if (context.mounted) Navigator.pop(context);
+        if (context.mounted) _showGoogleError(context, e.message);
+        return;
+      }
+    } catch (_) {
+      if (context.mounted) Navigator.pop(context);
+      if (context.mounted) {
+        _showGoogleError(context, 'Something went wrong. Please try again.');
+      }
+      return;
+    }
+    if (!context.mounted) return;
+    Navigator.pop(context); // Dismiss the loading indicator.
+    UserSession.instance.setFromMap(user);
+    await AppStateProvider.of(context).loadUserData();
+    if (!context.mounted) return;
+    Navigator.pushAndRemoveUntil(
+      context,
+      _slide(const DashboardScreen()),
+      (r) => false,
+    );
+  }
+
+  /// The backend rejects a brand-new Google account without a
+  /// profession; its error message names the missing field.
+  // The backend 400 for a brand-new Google user is
+  // {"profession": ["This field is required for new Google users."]} and
+  // ApiClient.errorMessage returns only the value text, so the field
+  // name never appears in the message — match the message wording too.
+  bool _needsProfession(String message) {
+    final m = message.toLowerCase();
+    return m.contains('profession') || m.contains('new google user');
+  }
+
+  void _showLoading(BuildContext context) {
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (_) => const Center(child: CircularProgressIndicator()),
     );
-    try {
-      final user = await AuthService.instance.signInWithGoogle();
-      if (!context.mounted) return;
-      Navigator.pop(context); // Dismiss the loading indicator.
-      UserSession.instance.setFromMap(user);
-      await AppStateProvider.of(context).loadUserData();
-      if (!context.mounted) return;
-      Navigator.pushAndRemoveUntil(
-        context,
-        _slide(const DashboardScreen()),
-        (r) => false,
-      );
-    } on ApiException catch (e) {
-      if (!context.mounted) return;
-      Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(e.message),
-          backgroundColor: const Color(0xFFE05C5C),
+  }
+
+  void _showGoogleError(BuildContext context, String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: const Color(0xFFE05C5C),
+      ),
+    );
+  }
+
+  /// Asks a first-time Google user for their profession (free text
+  /// plus suggested chips). Returns null when the user cancels.
+  Future<String?> _askProfession(BuildContext context) async {
+    final ctrl = TextEditingController();
+    const suggestions = ['Doctor', 'Therapist', 'Consultant', 'Other'];
+    String? error;
+    final result = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          title: Text('What is your profession?',
+              style: GoogleFonts.poppins(fontWeight: FontWeight.w700, fontSize: 18)),
+          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Google sign-in needs a profession for new accounts.',
+                style: GoogleFonts.poppins(fontSize: 13, color: Colors.grey[600])),
+            const SizedBox(height: 12),
+            Wrap(spacing: 8, runSpacing: 8, children: suggestions.map((s) => ChoiceChip(
+              label: Text(s, style: GoogleFonts.poppins(fontSize: 13)),
+              selected: ctrl.text == s,
+              onSelected: (_) => setDialogState(() => ctrl.text = s),
+            )).toList()),
+            const SizedBox(height: 12),
+            TextField(
+              controller: ctrl,
+              textCapitalization: TextCapitalization.words,
+              decoration: InputDecoration(
+                hintText: 'e.g. Doctor',
+                errorText: error,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
+          ]),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: Text('Cancel', style: GoogleFonts.poppins(fontWeight: FontWeight.w600)),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                final value = ctrl.text.trim();
+                if (value.isEmpty) {
+                  setDialogState(() => error = 'Please enter or pick a profession.');
+                  return;
+                }
+                Navigator.pop(ctx, value);
+              },
+              child: Text('Continue', style: GoogleFonts.poppins(fontWeight: FontWeight.w700)),
+            ),
+          ],
         ),
-      );
-    } catch (_) {
-      if (!context.mounted) return;
-      Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Something went wrong. Please try again.'),
-          backgroundColor: Color(0xFFE05C5C),
-        ),
-      );
-    }
+      ),
+    );
+    ctrl.dispose();
+    return result;
   }
 
   Widget _socialBtn(BuildContext ctx, String text, {
@@ -331,7 +412,7 @@ class _LoginScreenState extends State<LoginScreen> {
                         accent: accent, txtMain: txtMain, txtSub: txtSub, cardBg: cardBg, border: border,
                         validator: (v) {
                           if (v == null || v.trim().isEmpty) return 'Please enter your email';
-                          if (!RegExp(r'^[\w.-]+@[\w.-]+\.\w{2,}$').hasMatch(v.trim()))
+                          if (!RegExp(r'^[\w.+-]+@[\w.-]+\.\w{2,}$').hasMatch(v.trim()))
                             return 'Enter a valid email address';
                           return null;
                         }),
@@ -414,7 +495,9 @@ class _LoginScreenState extends State<LoginScreen> {
 
   void _showForgotPassword(BuildContext ctx, AppState appState) {
     final ctrl = TextEditingController();
-    showDialog(context: ctx, builder: (_) => AlertDialog(
+    String? error;
+    showDialog(context: ctx, builder: (_) => StatefulBuilder(
+      builder: (dialogCtx, setDialogState) => AlertDialog(
       backgroundColor: appState.cardBg,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(20),
@@ -432,6 +515,7 @@ class _LoginScreenState extends State<LoginScreen> {
           decoration: InputDecoration(
             hintText: 'Email address',
             hintStyle: GoogleFonts.dmSans(color: appState.txtSub),
+            errorText: error,
             filled: true, fillColor: appState.bg,
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(12),
                 borderSide: BorderSide(color: appState.border)),
@@ -444,14 +528,22 @@ class _LoginScreenState extends State<LoginScreen> {
         ),
       ]),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(ctx),
+        TextButton(onPressed: () => Navigator.pop(dialogCtx),
             child: Text('Cancel', style: GoogleFonts.dmSans(
                 color: appState.txtSub, fontWeight: FontWeight.w600))),
         ElevatedButton(
           onPressed: () async {
             final email = ctrl.text.trim();
-            Navigator.pop(ctx);
-            if (email.isEmpty) return;
+            // Inline error — never close the dialog silently.
+            if (email.isEmpty) {
+              setDialogState(() => error = 'Please enter your email address.');
+              return;
+            }
+            if (!RegExp(r'^[\w.+-]+@[\w.-]+\.\w{2,}$').hasMatch(email)) {
+              setDialogState(() => error = 'Enter a valid email address.');
+              return;
+            }
+            Navigator.pop(dialogCtx);
             try {
               await AuthService.instance.requestPasswordReset(email);
               if (!ctx.mounted) return;
@@ -479,8 +571,9 @@ class _LoginScreenState extends State<LoginScreen> {
               fontWeight: FontWeight.w700, color: Colors.white)),
         ),
       ],
-    ));
+    )));
   }
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -598,8 +691,7 @@ class _SignupScreenState extends State<SignupScreen> {
                         controller: _nameCtrl,
                         accent: accent, txtMain: txtMain, txtSub: txtSub, cardBg: cardBg, border: border,
                         validator: (v) {
-                          if (v == null || v.trim().isEmpty) return 'Please enter your full name';
-                          if (v.trim().split(' ').length < 2) return 'Enter first and last name';
+                          if (v == null || v.trim().isEmpty) return 'Please enter your name';
                           return null;
                         }),
                     const SizedBox(height: 16),
@@ -608,7 +700,7 @@ class _SignupScreenState extends State<SignupScreen> {
                         accent: accent, txtMain: txtMain, txtSub: txtSub, cardBg: cardBg, border: border,
                         validator: (v) {
                           if (v == null || v.trim().isEmpty) return 'Please enter your email';
-                          if (!RegExp(r'^[\w.-]+@[\w.-]+\.\w{2,}$').hasMatch(v.trim()))
+                          if (!RegExp(r'^[\w.+-]+@[\w.-]+\.\w{2,}$').hasMatch(v.trim()))
                             return 'Enter a valid email address';
                           return null;
                         }),
