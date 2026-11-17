@@ -88,6 +88,7 @@ class DrawerWidget extends StatelessWidget {
                         imgBytes,
                         width: 52,
                         height: 52,
+                        cacheWidth: 104,
                         fit: BoxFit.cover,
                       ),
                     )
