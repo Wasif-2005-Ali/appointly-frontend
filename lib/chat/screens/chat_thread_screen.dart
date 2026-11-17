@@ -1,13 +1,19 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:record/record.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../app_state.dart';
+import '../../models/appointment.dart';
+import '../../screens/call_screen.dart';
 import '../../services/api_client.dart';
 import '../../services/chat_service.dart';
 import '../../user_session.dart';
@@ -41,7 +47,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   final ScrollController      _scrollCtrl = ScrollController();
   final List<ChatMessage>     _msgs       = [];
 
-  bool _typing = false, _showEmoji = false, _clientTyping = false;
+  bool _typing = false, _showEmoji = false;
   bool _recording = false;
   ChatMessage? _replyTo;
 
@@ -59,8 +65,14 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   // indicator shows above the input bar.
   bool _uploadingMedia = false;
   String _uploadingLabel = '';
+  // True once the live connection has failed and is waiting for a
+  // manual reconnect (see the banner in [build]).
+  bool _connFailed = false;
+  // Real voice-note recorder (see [_startRecording]).
+  final AudioRecorder _recorder = AudioRecorder();
+  String? _recordingPath;
 
-  late AnimationController _typCtrl, _sendCtrl, _recCtrl;
+  late AnimationController _sendCtrl, _recCtrl;
   int _emojiTab    = 0;
   int _recSeconds  = 0;
   Timer? _recTimer;
@@ -88,7 +100,6 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   @override
   void initState() {
     super.initState();
-    _typCtrl  = AnimationController(vsync: this, duration: const Duration(milliseconds: 900))..repeat();
     _sendCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 200));
     _recCtrl  = AnimationController(vsync: this, duration: const Duration(milliseconds: 1200))..repeat(reverse: true);
     _initMessages();
@@ -157,11 +168,27 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     });
     _stateSub = _connection!.states.listen((s) {
       if (!mounted) return;
-      setState(() => _wsLive = s == ChatConnectionState.connected);
+      setState(() {
+        _wsLive = s == ChatConnectionState.connected;
+        if (s == ChatConnectionState.failed) _connFailed = true;
+        if (s == ChatConnectionState.connected) _connFailed = false;
+      });
       if (s == ChatConnectionState.failed) {
-        _toast('Live connection lost. Reopen the chat to reconnect.');
+        _toast('Live connection lost. Tap Reconnect to try again.');
       }
     });
+  }
+
+  /// Manual reconnect from the "Connection lost" banner. Reuses the
+  /// live connection when there is one; otherwise opens a fresh one.
+  Future<void> _reconnectLive() async {
+    final conn = _connection;
+    setState(() => _connFailed = false);
+    if (conn == null) {
+      await _connectLive();
+      return;
+    }
+    await conn.reconnect();
   }
 
   /// A message arrived over the WebSocket (from the other side, or the
@@ -210,8 +237,9 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     _stateSub?.cancel();
     _connection?.close();
     _msgCtrl.dispose(); _scrollCtrl.dispose();
-    _typCtrl.dispose(); _sendCtrl.dispose(); _recCtrl.dispose();
+    _sendCtrl.dispose(); _recCtrl.dispose();
     _recTimer?.cancel();
+    unawaited(_recorder.dispose());
     super.dispose();
   }
 
@@ -225,7 +253,9 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     final text = _msgCtrl.text.trim();
     if (text.isEmpty) return;
     if (_connection == null || !_wsLive) {
-      _toast('Not connected yet — please wait a moment and try again.');
+      // Kick off a reconnect instead of silently dropping the send.
+      unawaited(_connection?.reconnect());
+      _toast('Not connected — reconnecting. Please try again in a moment.');
       return;
     }
     _sendCtrl.forward().then((_) => _sendCtrl.reverse());
@@ -247,7 +277,8 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
 
   Future<void> _sendEmoji(String e) async {
     if (_connection == null || !_wsLive) {
-      _toast('Not connected yet — please wait a moment and try again.');
+      unawaited(_connection?.reconnect());
+      _toast('Not connected — reconnecting. Please try again in a moment.');
       return;
     }
     final msg = ChatMessage(id: _mkId(), text: e, fromMe: true, time: _fmt(DateTime.now()), type: MessageType.emoji);
@@ -263,32 +294,100 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     }
   }
 
-  /// Voice notes are device-only: the backend has no audio upload and
-  /// no voice message type, so the other side never sees these.
-  void _sendVoice(String dur) {
-    final msg = ChatMessage(id: _mkId(), text: dur, fromMe: true, time: _fmt(DateTime.now()), type: MessageType.voice, voiceDuration: dur, status: MessageStatus.sent);
-    setState(() => _msgs.add(msg));
-    ChatDB.save(_convId, msg).catchError((_) {});
-    _scrollDown();
-    Future.delayed(const Duration(milliseconds: 700), () {
-      if (!mounted) return;
-      setState(() => msg.status = MessageStatus.delivered);
-      ChatDB.update(_convId, msg).catchError((_) {});
-    });
+  // ── Voice notes (real recording) ─────────────────────────────────────────
+  // The mic records real audio (AAC .m4a) and uploads it via the same
+  // media endpoint as photos/files, so the other side receives it as
+  // a file message. Nothing is simulated.
+  Future<void> _startRecording() async {
+    try {
+      if (!await _recorder.hasPermission()) {
+        _toast('Microphone permission is needed to record a voice note.');
+        return;
+      }
+      final dir = await getTemporaryDirectory();
+      final path =
+          '${dir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.m4a';
+      await _recorder.start(
+        const RecordConfig(encoder: AudioEncoder.aacLc),
+        path: path,
+      );
+      _recordingPath = path;
+      _recSeconds = 0;
+      _recTimer?.cancel();
+      _recTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() => _recSeconds++);
+      });
+      setState(() => _recording = true);
+    } catch (_) {
+      _toast('Could not start recording. Please try again.');
+    }
   }
 
-  /// Send a shared appointment card. Device-only: the backend has no
-  /// appointment message type, so the other side never sees these.
-  void _sendAppointment(String title, String date, String time) {
-    final msg = ChatMessage(
-      id: _mkId(), text: 'Appointment shared', fromMe: true,
-      time: _fmt(DateTime.now()), type: MessageType.appointment,
-      appointmentTitle: title, appointmentDate: date, appointmentTime: time,
-      status: MessageStatus.sent,
-    );
-    setState(() => _msgs.add(msg));
-    ChatDB.save(_convId, msg).catchError((_) {});
-    _scrollDown();
+  /// Stop the recorder. When [send] is true, upload the recording as
+  /// a voice-note file message; otherwise discard it.
+  Future<void> _finishRecording({required bool send}) async {
+    _recTimer?.cancel();
+    String? path;
+    try {
+      path = await _recorder.stop();
+    } catch (_) {}
+    final duration = _recSeconds;
+    final filePath = path ?? _recordingPath;
+    _recordingPath = null;
+    setState(() {
+      _recording = false;
+      _recSeconds = 0;
+    });
+    if (filePath == null) return;
+    if (!send || duration < 1) {
+      if (!send) {
+        try {
+          await File(filePath).delete();
+        } catch (_) {}
+      } else {
+        _toast('Voice note too short.');
+        try {
+          await File(filePath).delete();
+        } catch (_) {}
+      }
+      return;
+    }
+    try {
+      final bytes = await File(filePath).readAsBytes();
+      if (!mounted) return;
+      await _sendMedia(
+        bytes: bytes,
+        fileName:
+            'voice_note_${DateTime.now().millisecondsSinceEpoch}.m4a',
+        label: 'Sending voice note…',
+      );
+    } catch (_) {
+      if (mounted) _toast('Could not send the voice note. Please try again.');
+    } finally {
+      try {
+        await File(filePath).delete();
+      } catch (_) {}
+    }
+  }
+
+  /// Share a real appointment: sends its details as a text message
+  /// over the WebSocket, so the other side actually receives it.
+  Future<void> _shareAppointment(Appointment appt) async {
+    if (_connection == null || !_wsLive) {
+      unawaited(_connection?.reconnect());
+      _toast('Not connected — reconnecting. Please try again in a moment.');
+      return;
+    }
+    final date = DateFormat('EEEE, MMM d').format(appt.dateTime);
+    final time = DateFormat('h:mm a').format(appt.dateTime);
+    final text =
+        '📅 Appointment: ${appt.name} — ${appt.service}\n'
+        '$date at $time • ${appt.status.name}';
+    try {
+      await _connection!.sendText(text);
+    } on ApiException catch (e) {
+      if (mounted) _toast(e.message);
+    }
   }
 
   // ── Media sending ────────────────────────────────────────────────────────
@@ -338,12 +437,14 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   Future<void> _sendMedia({
     required List<int> bytes,
     required String fileName,
+    String? label,
   }) async {
     if (_uploadingMedia) return;
     final isImage = ChatService.isImageFile(fileName);
     setState(() {
       _uploadingMedia = true;
-      _uploadingLabel = isImage ? 'Sending photo…' : 'Sending file…';
+      _uploadingLabel =
+          label ?? (isImage ? 'Sending photo…' : 'Sending file…');
     });
     try {
       final apiMsg = await ChatService.instance.uploadMedia(
@@ -421,6 +522,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       resizeToAvoidBottomInset: true,
       body: Column(children: [
         _buildHeader(c),
+        if (_connFailed) _reconnectBanner(),
         if (_loadError != null && _msgs.isEmpty)
           Expanded(child: Center(child: Padding(
             padding: const EdgeInsets.all(24),
@@ -452,9 +554,8 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
             controller: _scrollCtrl,
             physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
             padding: const EdgeInsets.fromLTRB(12, 16, 12, 16),
-            itemCount: _msgs.length + (_clientTyping ? 1 : 0),
+            itemCount: _msgs.length,
             itemBuilder: (_, i) {
-              if (_clientTyping && i == _msgs.length) return _typingBubble(c);
               final msg = _msgs[i];
               return Column(children: [
                 if (i == 0) _dateSep('Today'),
@@ -487,39 +588,28 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
                     border: Border.all(color: Colors.white.withOpacity(0.22))),
                 child: const Icon(Icons.arrow_back_ios_new_rounded, color: Colors.white, size: 16))),
         const SizedBox(width: 8),
-        GestureDetector(onTap: () => _toast('Contact info'),
-            child: Stack(children: [
-              Container(width: 44, height: 44,
-                  decoration: BoxDecoration(shape: BoxShape.circle,
-                      gradient: LinearGradient(colors: [c.avatarColor.withOpacity(0.7), c.avatarColor]),
-                      border: Border.all(color: Colors.white.withOpacity(0.35), width: 2),
-                      boxShadow: [BoxShadow(color: c.avatarColor.withOpacity(0.45), blurRadius: 12, offset: const Offset(0, 4))]),
-                  child: Center(child: Text(c.initials,
-                      style: GoogleFonts.dmSans(fontSize: 13, fontWeight: FontWeight.w900, color: Colors.white)))),
-              if (c.online) Positioned(bottom: 0, right: 0, child: Container(width: 13, height: 13,
-                  decoration: BoxDecoration(color: const Color(0xFF2ECC96), shape: BoxShape.circle,
-                      border: Border.all(color: _hero.last, width: 2)))),
-            ])),
+        Stack(children: [
+          Container(width: 44, height: 44,
+              decoration: BoxDecoration(shape: BoxShape.circle,
+                  gradient: LinearGradient(colors: [c.avatarColor.withOpacity(0.7), c.avatarColor]),
+                  border: Border.all(color: Colors.white.withOpacity(0.35), width: 2),
+                  boxShadow: [BoxShadow(color: c.avatarColor.withOpacity(0.45), blurRadius: 12, offset: const Offset(0, 4))]),
+              child: Center(child: Text(c.initials,
+                  style: GoogleFonts.dmSans(fontSize: 13, fontWeight: FontWeight.w900, color: Colors.white)))),
+        ]),
         const SizedBox(width: 8),
-        Expanded(child: GestureDetector(onTap: () => _toast('Contact info'),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(c.name, style: GoogleFonts.dmSans(fontSize: 16, fontWeight: FontWeight.w800, color: Colors.white)),
-              Row(children: [
-                if (c.online) ...[
-                  Container(width: 6, height: 6, margin: const EdgeInsets.only(right: 5),
-                      decoration: const BoxDecoration(color: Color(0xFF2ECC96), shape: BoxShape.circle)),
-                  Text('Active now', style: GoogleFonts.dmSans(fontSize: 11.5, color: Colors.white.withOpacity(0.65), fontWeight: FontWeight.w500)),
-                ] else Text(c.service, style: GoogleFonts.dmSans(fontSize: 11.5, color: Colors.white.withOpacity(0.55), fontWeight: FontWeight.w500)),
-              ]),
-            ]))),
-        // Video call
-        GestureDetector(onTap: () => _toast('Video call'),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(c.name, style: GoogleFonts.dmSans(fontSize: 16, fontWeight: FontWeight.w800, color: Colors.white)),
+          Text(c.service, style: GoogleFonts.dmSans(fontSize: 11.5, color: Colors.white.withOpacity(0.55), fontWeight: FontWeight.w500)),
+        ])),
+        // Video call — starts a real call with the other party.
+        GestureDetector(onTap: () => _startCall('video'),
             child: Container(width: 36, height: 36, margin: const EdgeInsets.only(right: 6),
                 decoration: BoxDecoration(color: Colors.white.withOpacity(0.12), borderRadius: BorderRadius.circular(11),
                     border: Border.all(color: Colors.white.withOpacity(0.2))),
                 child: const Icon(Icons.videocam_rounded, color: Colors.white, size: 17))),
-        // Voice call
-        GestureDetector(onTap: () => _toast('Voice call'),
+        // Voice call — starts a real call with the other party.
+        GestureDetector(onTap: () => _startCall('audio'),
             child: Container(width: 36, height: 36, margin: const EdgeInsets.only(right: 6),
                 decoration: BoxDecoration(color: Colors.white.withOpacity(0.12), borderRadius: BorderRadius.circular(11),
                     border: Border.all(color: Colors.white.withOpacity(0.2))),
@@ -527,19 +617,75 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         ThreadPopupMenu(accent: _accent, cardBg: _cardBg, border: _border, txtMain: _txtMain, onSelect: (v) {
           switch (v) {
             case 'search':    _openSearch(); break;
-            case 'contact':   _toast('View contact'); break;
             case 'mute':      setState(() => c.isMuted = !c.isMuted); _toast(c.isMuted ? 'Muted' : 'Unmuted'); break;
-            case 'timer':     _toast('Disappearing messages'); break;
             case 'starred':   _showStarred(); break;
-            case 'wallpaper': _toast('Chat wallpaper'); break;
             case 'clear':     _clearChat(); break;
-            case 'block':     _toast('Contact blocked'); break;
-            case 'report':    _toast('Reported'); break;
           }
         }),
       ]),
     )),
   );
+
+  // ── "Connection lost" banner ─────────────────────────────────────────────
+  Widget _reconnectBanner() => Container(
+    width: double.infinity,
+    color: const Color(0xFFE05C5C).withOpacity(0.12),
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+    child: Row(children: [
+      const Icon(Icons.wifi_off_rounded, color: Color(0xFFE05C5C), size: 18),
+      const SizedBox(width: 10),
+      Expanded(
+        child: Text(
+          'Connection lost',
+          style: GoogleFonts.dmSans(
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+            color: const Color(0xFFE05C5C),
+          ),
+        ),
+      ),
+      TextButton(
+        onPressed: _reconnectLive,
+        style: TextButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          minimumSize: Size.zero,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        child: Text(
+          'Tap to reconnect',
+          style: GoogleFonts.dmSans(
+            fontSize: 13,
+            fontWeight: FontWeight.w800,
+            color: const Color(0xFFE05C5C),
+          ),
+        ),
+      ),
+    ]),
+  );
+
+  /// Start a real call with the other party in this chat (same flow
+  /// as the New Call screen). Group chats and rooms with no known
+  /// peer have no single callee, so they toast honestly instead.
+  Future<void> _startCall(String callType) async {
+    final myId = UserSession.instance.userId?.toString();
+    final peerId = widget.conversation.participantIds
+        .firstWhere((id) => id != myId, orElse: () => '');
+    if (peerId.isEmpty) {
+      _toast('Calls are only available in direct chats.');
+      return;
+    }
+    final result = await Navigator.push<String?>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CallScreen.outgoing(
+          calleeId: peerId,
+          calleeName: widget.conversation.name,
+          callType: callType,
+        ),
+      ),
+    );
+    if (result != null && result.isNotEmpty && mounted) _toast(result);
+  }
 
   // ── Date separator ─────────────────────────────────────────────────────────
   Widget _dateSep(String label) => Padding(
@@ -780,18 +926,18 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
           topLeft: const Radius.circular(18), topRight: const Radius.circular(18),
           bottomLeft: Radius.circular(isMe ? 18 : 3), bottomRight: Radius.circular(isMe ? 3 : 18),
         ),
-        child: Image.network(
-          msg.text,
+        child: CachedNetworkImage(
+          imageUrl: msg.text,
           fit: BoxFit.cover,
-          loadingBuilder: (context, child, progress) {
-            if (progress == null) return child;
-            return Container(
-              height: 180,
-              color: _bg,
-              child: Center(child: CircularProgressIndicator(color: _accent, strokeWidth: 2.5)),
-            );
-          },
-          errorBuilder: (_, __, ___) => Container(
+          // Chat bubbles are ~68% of screen width; decoding the full
+          // upload resolution here is wasted work on every scroll.
+          memCacheWidth: 800,
+          placeholder: (_, __) => Container(
+            height: 180,
+            color: _bg,
+            child: Center(child: CircularProgressIndicator(color: _accent, strokeWidth: 2.5)),
+          ),
+          errorWidget: (_, __, ___) => Container(
             height: 140,
             color: _bg,
             child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
@@ -856,31 +1002,6 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       case MessageStatus.read:      return Icon(Icons.done_all_rounded, size: 13, color: _accent);
     }
   }
-
-  // ── Typing bubble ──────────────────────────────────────────────────────────
-  Widget _typingBubble(ChatConversation c) => Padding(
-    padding: const EdgeInsets.only(bottom: 8, top: 4),
-    child: Row(children: [
-      Container(width: 28, height: 28,
-          decoration: BoxDecoration(shape: BoxShape.circle, gradient: LinearGradient(colors: [c.avatarColor.withOpacity(0.6), c.avatarColor])),
-          child: Center(child: Text(c.initials[0], style: GoogleFonts.dmSans(fontSize: 10, fontWeight: FontWeight.w900, color: Colors.white)))),
-      const SizedBox(width: 6),
-      Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        decoration: BoxDecoration(color: _cardBg,
-            borderRadius: const BorderRadius.only(topLeft: Radius.circular(20), topRight: Radius.circular(20), bottomLeft: Radius.circular(4), bottomRight: Radius.circular(20)),
-            border: Border.all(color: _border, width: 1.2)),
-        child: AnimatedBuilder(animation: _typCtrl, builder: (_, __) => Row(mainAxisSize: MainAxisSize.min,
-            children: List.generate(3, (i) {
-              final phase  = ((_typCtrl.value * 3) - i).clamp(0.0, 1.0);
-              final bounce = math.sin(phase * math.pi);
-              return Container(margin: const EdgeInsets.symmetric(horizontal: 2.5), width: 7, height: 7,
-                  transform: Matrix4.translationValues(0, -bounce * 5, 0),
-                  decoration: BoxDecoration(color: _txtSub.withOpacity(0.4 + bounce * 0.6), shape: BoxShape.circle));
-            }))),
-      ),
-    ]),
-  );
 
   // ── Media upload indicator ───────────────────────────────────────────────
   Widget _uploadingBar() => Container(
@@ -947,19 +1068,13 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         Text('$mins:$secs', style: GoogleFonts.dmSans(fontSize: 16, fontWeight: FontWeight.w800, color: const Color(0xFFE05C5C))),
         const SizedBox(width: 12),
         GestureDetector(
-          onTap: () { _recTimer?.cancel(); setState(() { _recording = false; _recSeconds = 0; }); },
+          onTap: () => _finishRecording(send: false),
           child: Container(width: 40, height: 40, decoration: BoxDecoration(color: _txtSub.withOpacity(0.1), borderRadius: BorderRadius.circular(13), border: Border.all(color: _border)),
               child: Icon(Icons.close_rounded, color: _txtSub, size: 18)),
         ),
         const SizedBox(width: 8),
         GestureDetector(
-          onTap: () {
-            _recTimer?.cancel();
-            final m2 = _recSeconds ~/ 60;
-            final s2 = (_recSeconds % 60).toString().padLeft(2, '0');
-            setState(() { _recording = false; _recSeconds = 0; });
-            _sendVoice('$m2:$s2');
-          },
+          onTap: () => _finishRecording(send: true),
           child: Container(width: 46, height: 46,
               decoration: BoxDecoration(gradient: LinearGradient(colors: _btnGrad, begin: Alignment.topLeft, end: Alignment.bottomRight),
                   borderRadius: BorderRadius.circular(14),
@@ -1004,16 +1119,13 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   );
 
   // ── Attachment picker ──────────────────────────────────────────────────────
+  // Only options that actually work are shown.
   void _showAttach() {
     final rows = [
       [Icons.camera_alt_rounded,       'Camera',      const Color(0xFF4A90D9)],
       [Icons.image_rounded,             'Gallery',     const Color(0xFF7C3AED)],
-      [Icons.videocam_rounded,          'Video',       const Color(0xFF2ECC96)],
       [Icons.insert_drive_file_rounded, 'Document',    const Color(0xFFE8805A)],
       [Icons.calendar_month_rounded,    'Appointment', const Color(0xFF3B73C0)],
-      [Icons.location_on_rounded,       'Location',    const Color(0xFFE05C5C)],
-      [Icons.contact_page_rounded,      'Contact',     const Color(0xFF2A6AB5)],
-      [Icons.payments_rounded,          'Payment',     const Color(0xFF2ECC96)],
     ];
     showModalBottomSheet(context: context, backgroundColor: Colors.transparent, builder: (_) => SafeArea(
       child: Container(
@@ -1026,10 +1138,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
           Text('Share', style: GoogleFonts.dmSans(fontSize: 16, fontWeight: FontWeight.w800, color: _txtMain)),
           const SizedBox(height: 16),
           Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: rows.sublist(0, 4).map((r) => _attIcon(r[0] as IconData, r[1] as String, r[2] as Color)).toList()),
-          const SizedBox(height: 16),
-          Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: rows.sublist(4).map((r) => _attIcon(r[0] as IconData, r[1] as String, r[2] as Color)).toList()),
+              children: rows.map((r) => _attIcon(r[0] as IconData, r[1] as String, r[2] as Color)).toList()),
         ]),
       ),
     ));
@@ -1047,8 +1156,6 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
           _pickFile();
         case 'Appointment':
           _showAppointmentPicker();
-        default:
-          _toast('$label coming soon');
       }
     },
     child: SizedBox(width: 68, child: Column(children: [
@@ -1062,13 +1169,18 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     ])),
   );
 
-  // ── Appointment picker (NEW FEATURE) ───────────────────────────────────────
+  // ── Appointment picker ───────────────────────────────────────────────────
+  // Real upcoming appointments from AppState — never hardcoded.
   void _showAppointmentPicker() {
-    final appts = [
-      {'title': 'Consultation',    'date': 'Monday, May 12', 'time': '10:00 AM'},
-      {'title': 'Follow-up Visit', 'date': 'Tuesday, May 13','time': '2:30 PM'},
-      {'title': 'Physiotherapy',   'date': 'Wednesday, May 14','time': '9:00 AM'},
-    ];
+    final now = DateTime.now();
+    final appts = AppStateProvider.of(context).appointments
+        .where(
+          (a) =>
+              a.dateTime.isAfter(now.subtract(const Duration(minutes: 1))) &&
+              a.status != ApptStatus.cancelled &&
+              a.status != ApptStatus.completed,
+        )
+        .toList();
     showModalBottomSheet(
       context: context, isScrollControlled: true, backgroundColor: Colors.transparent,
       builder: (_) => Container(
@@ -1087,15 +1199,24 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
               ])),
           const SizedBox(height: 16),
           Divider(color: _border, height: 1),
+          if (appts.isEmpty)
+            Expanded(child: Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+              Icon(Icons.calendar_month_rounded, size: 52, color: _txtSub.withOpacity(0.3)),
+              const SizedBox(height: 12),
+              Text('No upcoming appointments', style: GoogleFonts.dmSans(fontSize: 15, color: _txtSub)),
+            ])))
+          else
           Expanded(child: ListView.builder(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
             itemCount: appts.length,
             itemBuilder: (_, i) {
               final a = appts[i];
+              final date = DateFormat('EEEE, MMM d').format(a.dateTime);
+              final time = DateFormat('h:mm a').format(a.dateTime);
               return GestureDetector(
                 onTap: () {
                   Navigator.pop(context);
-                  _sendAppointment(a['title']!, a['date']!, a['time']!);
+                  _shareAppointment(a);
                 },
                 child: Container(margin: const EdgeInsets.only(bottom: 10), padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(color: _cardBg, borderRadius: BorderRadius.circular(18),
@@ -1107,9 +1228,9 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
                           child: Icon(Icons.calendar_month_rounded, color: _accent, size: 22)),
                       const SizedBox(width: 14),
                       Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Text(a['title']!, style: GoogleFonts.dmSans(fontSize: 15, fontWeight: FontWeight.w700, color: _txtMain)),
+                        Text(a.name, style: GoogleFonts.dmSans(fontSize: 15, fontWeight: FontWeight.w700, color: _txtMain)),
                         const SizedBox(height: 3),
-                        Text('${a['date']}  •  ${a['time']}',
+                        Text('$date  •  $time  •  ${a.status.name}',
                             style: GoogleFonts.dmSans(fontSize: 12, color: _txtSub)),
                       ])),
                       Container(width: 34, height: 34,
@@ -1188,18 +1309,10 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
               : GestureDetector(
               onLongPressStart: (_) {
                 HapticFeedback.heavyImpact();
-                _recSeconds = 0;
-                _recTimer   = Timer.periodic(const Duration(seconds: 1), (_) { if (mounted) setState(() => _recSeconds++); });
-                setState(() => _recording = true);
+                _startRecording();
               },
               onLongPressEnd: (_) {
-                if (_recording) {
-                  _recTimer?.cancel();
-                  final m = _recSeconds ~/ 60;
-                  final s = (_recSeconds % 60).toString().padLeft(2, '0');
-                  setState(() { _recording = false; _recSeconds = 0; });
-                  _sendVoice('$m:$s');
-                }
+                if (_recording) _finishRecording(send: true);
               },
               child: AnimatedBuilder(animation: _recCtrl, builder: (_, __) => Container(width: 44, height: 44,
                   decoration: BoxDecoration(color: _bg, borderRadius: BorderRadius.circular(14),
@@ -1367,7 +1480,29 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   }
 
   // ── Forward message ────────────────────────────────────────────────────────
+  // Text/emoji/appointment forwards are sent for real over the live
+  // connection; the server echo renders them. Media and old
+  // device-only voice notes cannot be forwarded yet.
+  String? _forwardText(ChatMessage original) {
+    switch (original.type) {
+      case MessageType.text:
+      case MessageType.emoji:
+        return original.text;
+      case MessageType.appointment:
+        return '📅 Appointment: ${original.appointmentTitle ?? 'Consultation'}'
+            ' — ${original.appointmentDate ?? ''} at ${original.appointmentTime ?? ''}';
+      case MessageType.image:
+      case MessageType.file:
+      case MessageType.voice:
+        return null;
+    }
+  }
+
   void _showForwardSheet(ChatMessage original) {
+    // Hoisted out of the builder: filter once, not per row (O(n²)).
+    final targets = widget.allConversations
+        .where((c) => !c.isArchived)
+        .toList();
     showModalBottomSheet(context: context, backgroundColor: Colors.transparent, isScrollControlled: true,
         builder: (ctx) => Container(
           height: MediaQuery.of(ctx).size.height * 0.62,
@@ -1391,25 +1526,11 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
             Divider(color: _border, height: 1),
             Expanded(child: ListView.builder(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-              itemCount: widget.allConversations.where((c) => !c.isArchived).length,
+              itemCount: targets.length,
               itemBuilder: (_, i) {
-                final c = widget.allConversations.where((c) => !c.isArchived).toList()[i];
+                final c = targets[i];
                 return GestureDetector(
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    if (c.id == _convId) {
-                      final fwd = ChatMessage(id: _mkId(), text: original.text, fromMe: true,
-                          time: _fmt(DateTime.now()), type: original.type, isForwarded: true, voiceDuration: original.voiceDuration);
-                      setState(() => _msgs.add(fwd));
-                      ChatDB.save(_convId, fwd).catchError((_) {});
-                      _scrollDown();
-                    } else {
-                      // Forwarding to another room needs a second live
-                      // connection; not wired yet — say so honestly
-                      // instead of showing a fake success dialog.
-                      _toast('Forwarding to other chats is not available yet.');
-                    }
-                  },
+                  onTap: () => _forwardTo(c, original),
                   child: Container(margin: const EdgeInsets.only(bottom: 8), padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                       decoration: BoxDecoration(color: _cardBg, borderRadius: BorderRadius.circular(18),
                           border: Border.all(color: _border, width: 1.3),
@@ -1439,6 +1560,47 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         ));
   }
 
+  Future<void> _forwardTo(ChatConversation target, ChatMessage original) async {
+    Navigator.pop(context);
+    if (target.id != _convId) {
+      // Forwarding to another room needs a second live connection;
+      // not wired yet — say so honestly instead of showing a fake
+      // success dialog.
+      _toast('Forwarding to other chats is not available yet.');
+      return;
+    }
+    final text = _forwardText(original);
+    if (text == null || text.isEmpty) {
+      _toast('This message can\'t be forwarded yet.');
+      return;
+    }
+    if (_connection == null || !_wsLive) {
+      unawaited(_connection?.reconnect());
+      _toast('Not connected — reconnecting. Please try again in a moment.');
+      return;
+    }
+    final fwd = ChatMessage(
+      id: _mkId(), text: text, fromMe: true,
+      time: _fmt(DateTime.now()), type: MessageType.text,
+      isForwarded: true, status: MessageStatus.sent,
+    );
+    setState(() {
+      _msgs.add(fwd);
+      _pending.add(fwd);
+    });
+    _scrollDown();
+    try {
+      await _connection!.sendText(text);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _msgs.remove(fwd);
+        _pending.remove(fwd);
+      });
+      _toast(e.message);
+    }
+  }
+
   // ── Delete menu ────────────────────────────────────────────────────────────
   void _deleteMenu(ChatMessage msg) => showModalBottomSheet(context: context, backgroundColor: Colors.transparent,
       builder: (_) => Container(padding: const EdgeInsets.fromLTRB(20, 12, 20, 32),
@@ -1449,17 +1611,13 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
                 decoration: BoxDecoration(color: _txtSub.withOpacity(0.3), borderRadius: BorderRadius.circular(4))),
             Text('Delete Message?', style: GoogleFonts.dmSans(fontSize: 17, fontWeight: FontWeight.w800, color: _txtMain)),
             const SizedBox(height: 20),
-            _delBtn('Delete for Me', const Color(0xFFE05C5C), () {
+            _delBtn('Delete for me', const Color(0xFFE05C5C), () {
+              // Local only: there is no server delete endpoint, so
+              // the message stays on the server and for the other
+              // side. The label says so honestly.
               setState(() => msg.isDeleted = true);
               ChatDB.update(_convId, msg).catchError((_) {});
             }),
-            if (msg.fromMe) ...[
-              const SizedBox(height: 10),
-              _delBtn('Delete for Everyone', const Color(0xFFE05C5C), () {
-                setState(() { msg.isDeleted = true; msg.text = 'This message was deleted'; });
-                ChatDB.update(_convId, msg).catchError((_) {});
-              }),
-            ],
             const SizedBox(height: 10),
             _delBtn('Cancel', _txtSub, () {}, outline: true),
           ])));
@@ -1494,10 +1652,10 @@ class _FullScreenImageView extends StatelessWidget {
     ),
     body: Center(
       child: InteractiveViewer(
-        child: Image.network(
-          url,
+        child: CachedNetworkImage(
+          imageUrl: url,
           fit: BoxFit.contain,
-          errorBuilder: (_, __, ___) => const Column(
+          errorWidget: (_, __, ___) => const Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Icon(Icons.broken_image_rounded, size: 48, color: Colors.white54),
