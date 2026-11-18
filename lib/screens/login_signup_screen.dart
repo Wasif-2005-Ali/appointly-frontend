@@ -162,6 +162,10 @@ class WelcomeScreen extends StatelessWidget {
     Map<String, dynamic>? user;
     try {
       user = await AuthService.instance.signInWithGoogle();
+    } on GoogleSignInCancelledException {
+      // The user dismissed the picker — not an error, stay silent.
+      if (context.mounted) Navigator.pop(context); // Dismiss loading.
+      return;
     } on ApiException catch (e) {
       // Brand-new Google users need a profession (backend 400);
       // ask for it and retry once with the chosen value.
@@ -173,6 +177,10 @@ class WelcomeScreen extends StatelessWidget {
         _showLoading(context);
         try {
           user = await AuthService.instance.signInWithGoogle(profession: profession);
+        } on GoogleSignInCancelledException {
+          // Cancelled on the retry too — still not an error.
+          if (context.mounted) Navigator.pop(context);
+          return;
         } on ApiException catch (e2) {
           if (context.mounted) Navigator.pop(context);
           if (context.mounted) _showGoogleError(context, e2.message);
@@ -323,7 +331,12 @@ class WelcomeScreen extends StatelessWidget {
 //  LoginScreen
 // ─────────────────────────────────────────────────────────────────────────────
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
+  /// Optional informational banner shown above the form, e.g.
+  /// "Account created — please sign in" after a register-then-login
+  /// race, or the session-expired notice. Not an error — it renders
+  /// in the neutral info style, never the red error box.
+  final String? message;
+  const LoginScreen({super.key, this.message});
   @override
   State<LoginScreen> createState() => _LoginScreenState();
 }
@@ -431,6 +444,24 @@ class _LoginScreenState extends State<LoginScreen> {
                             color: accent, fontWeight: FontWeight.w500)),
                       ),
                     ),
+                    if (widget.message != null && widget.message!.isNotEmpty) ...[
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: accent.withOpacity(0.10),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: accent.withOpacity(0.35)),
+                        ),
+                        child: Row(children: [
+                          Icon(Icons.info_outline_rounded, color: accent, size: 18),
+                          const SizedBox(width: 8),
+                          Expanded(child: Text(widget.message!, style: GoogleFonts.poppins(
+                              fontSize: 12.5, color: txtMain, fontWeight: FontWeight.w500))),
+                        ]),
+                      ),
+                      const SizedBox(height: 12),
+                    ],
                     if (_error.isNotEmpty) ...[
                       Container(
                         width: double.infinity,
@@ -621,7 +652,21 @@ class _SignupScreenState extends State<SignupScreen> {
         password: _passCtrl.text, confirmPassword: _confCtrl.text,
         profession: _profCtrl.text.trim(),
       );
-      // Register returns no tokens, so log in right away.
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() { _loading = false; _error = e.message; });
+      return;
+    } catch (_) {
+      if (!mounted) return;
+      setState(() { _loading = false; _error = 'Registration failed. Please try again.'; });
+      return;
+    }
+    // The account now EXISTS — register returns no tokens, so log in
+    // right away. If the auto-login fails (e.g. a network blip), do
+    // NOT report "Registration failed": send the user to the login
+    // screen instead, or retrying register would fail with "email
+    // already exists".
+    try {
       final user = await AuthService.instance.login(
         email: _emailCtrl.text.trim(), password: _passCtrl.text,
       );
@@ -630,12 +675,14 @@ class _SignupScreenState extends State<SignupScreen> {
       await AppStateProvider.of(context).loadUserData();
       if (!mounted) return;
       Navigator.pushAndRemoveUntil(context, _slide(const DashboardScreen()), (r) => false);
-    } on ApiException catch (e) {
-      if (!mounted) return;
-      setState(() { _loading = false; _error = e.message; });
     } catch (_) {
       if (!mounted) return;
-      setState(() { _loading = false; _error = 'Registration failed. Please try again.'; });
+      setState(() { _loading = false; });
+      Navigator.pushAndRemoveUntil(
+        context,
+        _slide(const LoginScreen(message: 'Account created — please sign in.')),
+        (r) => false,
+      );
     }
   }
 
@@ -876,33 +923,5 @@ class _AppointlyFieldState extends State<_AppointlyField> {
         errorStyle: GoogleFonts.poppins(fontSize: 11.5, color: const Color(0xFFB83232)),
       ),
     );
-  }
-}
-
-// kept for any SVG-based references in this file
-class _GlowLogo extends StatelessWidget {
-  final double size;
-  const _GlowLogo({required this.size});
-  @override
-  Widget build(BuildContext context) {
-    final accent = AppStateProvider.of(context).accent;
-    return Stack(alignment: Alignment.center, children: [
-      Container(width: size * 1.15, height: size * 1.15,
-          decoration: BoxDecoration(shape: BoxShape.circle,
-              gradient: RadialGradient(colors: [
-                accent.withOpacity(0.22), accent.withOpacity(0.08), Colors.transparent,
-              ], stops: const [0.0, 0.5, 1.0]))),
-      Container(width: size, height: size,
-          decoration: BoxDecoration(shape: BoxShape.circle,
-              gradient: LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight,
-                  colors: [accent, HSLColor.fromColor(accent).withLightness(0.18).toColor()]),
-              boxShadow: [
-                BoxShadow(color: accent.withOpacity(0.40), blurRadius: size * 0.45, offset: Offset(0, size * 0.06)),
-              ]),
-          child: Padding(padding: EdgeInsets.all(size * 0.040),
-              child: Container(decoration: const BoxDecoration(shape: BoxShape.circle, color: Colors.white),
-                  child: Padding(padding: EdgeInsets.all(size * 0.11),
-                      child: SvgPicture.asset('assets/logo.svg', fit: BoxFit.contain))))),
-    ]);
   }
 }

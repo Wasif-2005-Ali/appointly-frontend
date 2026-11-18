@@ -39,19 +39,36 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
   int _selectedFilter = 0;
   final List<String> _filters = ['All', 'Today', 'Upcoming', 'Past', 'Cancelled'];
 
+  // Local text search (header search icon) + status filter (tune icon).
+  final _searchCtrl = TextEditingController();
+  String _searchQuery = '';
+  bool _searching = false;
+  ApptStatus? _statusFilter; // null = All statuses
+
   List<Appointment> get _allAppts =>
       List<Appointment>.from(AppStateProvider.of(context).appointments)
         ..sort((a, b) => a.dateTime.compareTo(b.dateTime));
 
   List<Appointment> get _filtered {
     final all = _allAppts;
+    List<Appointment> base;
     switch (_selectedFilter) {
-      case 1: return all.where((a) => a.isToday).toList();
-      case 2: return all.where((a) => a.isFuture && a.status != ApptStatus.cancelled && a.status != ApptStatus.rejected && a.status != ApptStatus.completed).toList();
-      case 3: return all.where((a) => a.status == ApptStatus.completed || (a.isPast && a.status != ApptStatus.cancelled && a.status != ApptStatus.rejected)).toList();
-      case 4: return all.where((a) => a.status == ApptStatus.cancelled || a.status == ApptStatus.rejected).toList();
-      default: return all;
+      case 1: base = all.where((a) => a.isToday).toList(); break;
+      case 2: base = all.where((a) => a.isFuture && a.status != ApptStatus.cancelled && a.status != ApptStatus.rejected && a.status != ApptStatus.completed).toList(); break;
+      case 3: base = all.where((a) => a.status == ApptStatus.completed || (a.isPast && a.status != ApptStatus.cancelled && a.status != ApptStatus.rejected)).toList(); break;
+      case 4: base = all.where((a) => a.status == ApptStatus.cancelled || a.status == ApptStatus.rejected).toList(); break;
+      default: base = all;
     }
+    if (_statusFilter != null) {
+      base = base.where((a) => a.status == _statusFilter).toList();
+    }
+    final q = _searchQuery.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      base = base.where((a) =>
+          a.name.toLowerCase().contains(q) ||
+          a.service.toLowerCase().contains(q)).toList();
+    }
+    return base;
   }
 
   @override
@@ -70,6 +87,7 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
   void dispose() {
     _tabCtrl.dispose();
     _headerCtrl.dispose();
+    _searchCtrl.dispose();
     super.dispose();
   }
 
@@ -92,8 +110,13 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
       value: SystemUiOverlayStyle.light,
       child: Scaffold(
         backgroundColor: dmBg,
-        body: CustomScrollView(
-          slivers: [
+        body: RefreshIndicator(
+          onRefresh: () => AppStateProvider.of(context).loadAppointments(),
+          child: CustomScrollView(
+            cacheExtent: 300,
+            physics: const AlwaysScrollableScrollPhysics(
+                parent: BouncingScrollPhysics()),
+            slivers: [
             SliverToBoxAdapter(
               child: SlideTransition(
                 position: _headerSlide,
@@ -101,6 +124,7 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
                     child: _buildHeader(confirmed, todayAppts.length)),
               ),
             ),
+            if (_searching) SliverToBoxAdapter(child: _buildSearchField()),
             SliverToBoxAdapter(child: _buildStatsRow()),
             SliverToBoxAdapter(child: _buildFilterRow()),
             if (items.isEmpty)
@@ -111,10 +135,17 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
                     Icon(Icons.event_busy_rounded, size: 56,
                         color: dmTxtSub.withOpacity(0.4)),
                     const SizedBox(height: 14),
-                    Text('No appointments yet', style: GoogleFonts.dmSans(
+                    Text(
+                        (_searchQuery.trim().isNotEmpty || _statusFilter != null)
+                            ? 'No matching appointments'
+                            : 'No appointments yet',
+                        style: GoogleFonts.dmSans(
                         fontSize: 18, fontWeight: FontWeight.w800, color: dmTxtMain)),
                     const SizedBox(height: 6),
-                    Text('Book your first appointment with the + button below.',
+                    Text(
+                        (_searchQuery.trim().isNotEmpty || _statusFilter != null)
+                            ? 'Try a different search or filter.'
+                            : 'Book your first appointment with the + button below.',
                         textAlign: TextAlign.center,
                         style: GoogleFonts.dmSans(
                             fontSize: 13, color: dmTxtSub, fontWeight: FontWeight.w500)),
@@ -136,22 +167,6 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
                         appointment: appt,
                         index: i,
                         dayNumber: dayNumbers[i],
-                        onStatusChanged: (id, newStatus) async {
-                          try {
-                            await AppStateProvider.of(context)
-                                .updateAppointmentStatus(id, newStatus);
-                          } on ApiException catch (e) {
-                            if (!context.mounted) return;
-                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                              content: Text(e.message,
-                                  style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
-                              backgroundColor: const Color(0xFFE05C5C),
-                              behavior: SnackBarBehavior.floating,
-                              shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(14)),
-                            ));
-                          }
-                        },
                         onReschedule: (appt) => _openReschedule(appt),
                       ),
                     ]);
@@ -160,7 +175,8 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
                 ),
               ),
             ),
-          ],
+            ],
+          ),
         ),
         floatingActionButton: _buildFab(context),
       ),
@@ -174,10 +190,13 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
         pageBuilder: (_, __, ___) => RescheduleScreen(
           appointment: appt,
           onConfirm: (newDateTime, {String note = ''}) async {
+            // Reschedule only: a reschedule does not change the status
+            // on the server, so no status is passed here (passing
+            // `confirmed` would try to accept a pending appointment
+            // and fail for requesters).
             await AppStateProvider.of(context).updateAppointment(
               appt.copyWith(
                 dateTime: newDateTime,
-                status: ApptStatus.confirmed,
                 cancellationNote: note,
               ),
             );
@@ -238,9 +257,17 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
                 ),
                 const SizedBox(width: 14),
                 const Spacer(),
-                _glassBtn(Icons.search_rounded),
+                _glassBtn(Icons.search_rounded, onTap: () {
+                  setState(() {
+                    _searching = !_searching;
+                    if (!_searching) {
+                      _searchCtrl.clear();
+                      _searchQuery = '';
+                    }
+                  });
+                }),
                 const SizedBox(width: 10),
-                _glassBtn(Icons.tune_rounded),
+                _glassBtn(Icons.tune_rounded, onTap: _showStatusFilterSheet),
               ]),
               const SizedBox(height: 24),
               Text('My Appointments',
@@ -421,13 +448,129 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
     );
   }
 
-  Widget _glassBtn(IconData icon) => Container(
-    width: 40, height: 40,
-    decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.12),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withOpacity(0.2))),
-    child: Icon(icon, color: Colors.white, size: 20),
+  /// Local text search over client name / service (header search icon).
+  Widget _buildSearchField() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14),
+        decoration: BoxDecoration(
+          color: dmCard,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: dmBorder, width: 1.5),
+        ),
+        child: Row(children: [
+          Icon(Icons.search_rounded, size: 19, color: dmAccent),
+          const SizedBox(width: 10),
+          Expanded(child: TextField(
+            controller: _searchCtrl,
+            autofocus: true,
+            onChanged: (v) => setState(() => _searchQuery = v),
+            style: GoogleFonts.dmSans(fontSize: 14,
+                fontWeight: FontWeight.w600, color: dmTxtMain),
+            decoration: InputDecoration(
+              border: InputBorder.none,
+              hintText: 'Search by client or service…',
+              hintStyle: GoogleFonts.dmSans(color: dmTxtSub, fontSize: 13),
+            ),
+          )),
+          if (_searchQuery.isNotEmpty)
+            GestureDetector(
+              onTap: () => setState(() {
+                _searchCtrl.clear();
+                _searchQuery = '';
+              }),
+              child: Icon(Icons.close_rounded, size: 18, color: dmTxtSub),
+            ),
+        ]),
+      ),
+    );
+  }
+
+  /// Status filter (header tune icon): All / Pending / Confirmed /
+  /// Completed / Cancelled.
+  void _showStatusFilterSheet() {
+    final options = <ApptStatus?>[
+      null,
+      ApptStatus.pending,
+      ApptStatus.confirmed,
+      ApptStatus.completed,
+      ApptStatus.cancelled,
+    ];
+    String label(ApptStatus? s) {
+      switch (s) {
+        case ApptStatus.pending:   return 'Pending';
+        case ApptStatus.confirmed: return 'Confirmed';
+        case ApptStatus.completed: return 'Completed';
+        case ApptStatus.cancelled: return 'Cancelled';
+        case ApptStatus.rejected:  return 'Rejected';
+        case null:                 return 'All';
+      }
+    }
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => Container(
+        padding: EdgeInsets.fromLTRB(
+            20, 12, 20, MediaQuery.of(context).padding.bottom + 20),
+        decoration: BoxDecoration(
+          color: dmCard,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+          border: Border.all(color: dmBorder),
+        ),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(width: 36, height: 4,
+              margin: const EdgeInsets.only(bottom: 16),
+              decoration: BoxDecoration(
+                  color: dmBorder, borderRadius: BorderRadius.circular(2))),
+          Row(children: [
+            Icon(Icons.tune_rounded, size: 18, color: dmAccent),
+            const SizedBox(width: 8),
+            Text('Filter by status', style: GoogleFonts.dmSans(
+                fontSize: 16, fontWeight: FontWeight.w800, color: dmTxtMain)),
+          ]),
+          const SizedBox(height: 12),
+          ...options.map((opt) {
+            final sel = _statusFilter == opt;
+            return GestureDetector(
+              onTap: () {
+                setState(() => _statusFilter = opt);
+                Navigator.pop(context);
+              },
+              child: Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                decoration: BoxDecoration(
+                  color: sel ? dmAccent.withOpacity(0.12) : dmCard2,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                      color: sel ? dmAccent.withOpacity(0.5) : dmBorder),
+                ),
+                child: Row(children: [
+                  Expanded(child: Text(label(opt), style: GoogleFonts.dmSans(
+                      fontSize: 14, fontWeight: FontWeight.w700,
+                      color: sel ? dmAccent : dmTxtMain))),
+                  if (sel) Icon(Icons.check_circle_rounded,
+                      color: dmAccent, size: 20),
+                ]),
+              ),
+            );
+          }),
+        ]),
+      ),
+    );
+  }
+
+  Widget _glassBtn(IconData icon, {VoidCallback? onTap}) => GestureDetector(
+    onTap: onTap,
+    child: Container(
+      width: 40, height: 40,
+      decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.12),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white.withOpacity(0.2))),
+      child: Icon(icon, color: Colors.white, size: 20),
+    ),
   );
 
   Widget _orb(double size, Color color, double opacity) => Container(
@@ -445,14 +588,12 @@ class _ApptCard extends StatefulWidget {
   final Appointment appointment;
   final int index;
   final int? dayNumber;
-  final Future<void> Function(int id, ApptStatus) onStatusChanged;
   final void Function(Appointment) onReschedule;
 
   const _ApptCard({
     required this.appointment,
     required this.index,
     required this.dayNumber,
-    required this.onStatusChanged,
     required this.onReschedule,
   });
 
@@ -747,41 +888,32 @@ class _ApptCardState extends State<_ApptCard>
                   color: const Color(0xFF2E7D32))),
             ]),
           )
-        else if (a.status == ApptStatus.cancelled)
-          Column(children: [
-            Row(children: [
-              Expanded(child: _actionBtn(
-                'Reschedule',
-                Icons.edit_calendar_rounded,
-                dmAccent.withOpacity(0.1),
-                dmAccent,
-                () {
-                  setState(() => _expanded = false);
-                  widget.onReschedule(a);
-                },
-              )),
-              const SizedBox(width: 10),
-              Expanded(child: _actionBtn(
-                '✓ Re-confirm',
-                Icons.check_circle_rounded,
-                const Color(0xFF2ECC96).withOpacity(0.1),
-                const Color(0xFF2ECC96),
-                () {
-                  if (a.id == null) return;
-                  widget.onStatusChanged(a.id!, ApptStatus.confirmed);
-                  setState(() => _expanded = false);
-                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                    content: Text('Appointment re-confirmed!',
-                        style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
-                    backgroundColor: const Color(0xFF2ECC96),
-                    behavior: SnackBarBehavior.floating,
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14)),
-                  ));
-                },
+        else if (a.status == ApptStatus.cancelled ||
+            a.status == ApptStatus.rejected)
+          // Cancelled/rejected appointments cannot be re-confirmed or
+          // rescheduled — the server rejects both (409). No dead
+          // action buttons; just say so honestly.
+          Container(
+            padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+            decoration: BoxDecoration(
+              color: const Color(0xFFE05C5C).withOpacity(0.08),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: const Color(0xFFE05C5C).withOpacity(0.25)),
+            ),
+            child: Row(children: [
+              const Icon(Icons.info_outline_rounded,
+                  color: Color(0xFFE05C5C), size: 16),
+              const SizedBox(width: 8),
+              Expanded(child: Text(
+                a.status == ApptStatus.cancelled
+                    ? 'This appointment was cancelled. Book a new one to schedule again.'
+                    : 'This request was declined by the provider.',
+                style: GoogleFonts.dmSans(
+                    fontSize: 12.5, fontWeight: FontWeight.w600,
+                    color: const Color(0xFFE05C5C)),
               )),
             ]),
-          ])
+          )
         else
           Row(children: [
             Expanded(child: _actionBtn(
@@ -1397,7 +1529,12 @@ class _EmergencyActionSheetState extends State<_EmergencyActionSheet> with DarkM
   List<DateTime> _nextFreeSlots(Appointment appt, int count) {
     final results     = <DateTime>[];
     final durMins     = _durMinsFromStr(appt.duration);
-    final allAppts    = PersonalTaskStore.instance.tasks; // used below for tasks
+    // Real appointments that block a slot: everything except the one
+    // being rescheduled and cancelled/rejected ones (which free the slot).
+    final allAppts    = AppStateProvider.of(context).appointments.where((a) =>
+        (appt.id == null || a.id != appt.id) &&
+        a.status != ApptStatus.cancelled &&
+        a.status != ApptStatus.rejected).toList();
     var   candidate   = DateTime(
         appt.dateTime.year, appt.dateTime.month, appt.dateTime.day,
         appt.dateTime.hour, appt.dateTime.minute)
@@ -1409,19 +1546,23 @@ class _EmergencyActionSheetState extends State<_EmergencyActionSheet> with DarkM
           appt.dateTime.hour, appt.dateTime.minute);
       final end = dt.add(Duration(minutes: durMins));
 
-      // Check no appointment overlap
-      final apptFree = !PersonalTaskStore.instance.tasks.any((t) => false) &&
-          true; // placeholder — real check below via imported list
-
       bool blocked = false;
+      // Check no appointment overlap
+      for (final a in allAppts) {
+        final aStart = a.dateTime;
+        final aEnd = aStart.add(Duration(minutes: _durMinsFromStr(a.duration)));
+        if (dt.isBefore(aEnd) && end.isAfter(aStart)) { blocked = true; break; }
+      }
       // Check personal tasks
-      for (final t in PersonalTaskStore.instance.tasks) {
-        if (!t.hasTime || t.dueDate == null || t.startTime == null || t.done) continue;
-        if (!t.blockAppointments) continue;
-        final ts = DateTime(t.dueDate!.year, t.dueDate!.month, t.dueDate!.day,
-            t.startTime!.hour, t.startTime!.minute);
-        final te = ts.add(Duration(minutes: _durMinsFromStr(t.duration)));
-        if (dt.isBefore(te) && end.isAfter(ts)) { blocked = true; break; }
+      if (!blocked) {
+        for (final t in PersonalTaskStore.instance.tasks) {
+          if (!t.hasTime || t.dueDate == null || t.startTime == null || t.done) continue;
+          if (!t.blockAppointments) continue;
+          final ts = DateTime(t.dueDate!.year, t.dueDate!.month, t.dueDate!.day,
+              t.startTime!.hour, t.startTime!.minute);
+          final te = ts.add(Duration(minutes: _durMinsFromStr(t.duration)));
+          if (dt.isBefore(te) && end.isAfter(ts)) { blocked = true; break; }
+        }
       }
       if (!blocked) results.add(dt);
       candidate = candidate.add(const Duration(days: 1));

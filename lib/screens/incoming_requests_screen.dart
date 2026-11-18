@@ -135,7 +135,10 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
             Text('Incoming Requests', style: GoogleFonts.dmSans(
                 fontSize: 18, fontWeight: FontWeight.w800, color: Colors.white, letterSpacing: -0.3)),
             const Spacer(),
-            _glass(child: const Icon(Icons.filter_list_rounded, color: Colors.white, size: 20)),
+            GestureDetector(
+              onTap: _showFilterSheet,
+              child: _glass(child: const Icon(Icons.filter_list_rounded, color: Colors.white, size: 20)),
+            ),
           ]),
           const SizedBox(height: 20),
           Row(children: [
@@ -162,6 +165,64 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
     ]),
   ));
 
+  /// Filter picker for the hero filter icon — same filters as the
+  /// filter row below (All / Pending / Accepted / Declined).
+  void _showFilterSheet() {
+    final filters = ['All', 'Pending', 'Accepted', 'Declined'];
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => Container(
+        padding: EdgeInsets.fromLTRB(
+            20, 12, 20, MediaQuery.of(context).padding.bottom + 20),
+        decoration: BoxDecoration(
+          color: dmCard,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+          border: Border.all(color: dmBorder),
+        ),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(width: 36, height: 4,
+              margin: const EdgeInsets.only(bottom: 16),
+              decoration: BoxDecoration(
+                  color: dmBorder, borderRadius: BorderRadius.circular(2))),
+          Row(children: [
+            Icon(Icons.filter_list_rounded, size: 18, color: dmAccent),
+            const SizedBox(width: 8),
+            Text('Filter requests', style: GoogleFonts.dmSans(
+                fontSize: 16, fontWeight: FontWeight.w800, color: dmTxtMain)),
+          ]),
+          const SizedBox(height: 12),
+          ...filters.asMap().entries.map((e) {
+            final sel = _selectedFilter == e.key;
+            return GestureDetector(
+              onTap: () {
+                setState(() => _selectedFilter = e.key);
+                Navigator.pop(context);
+              },
+              child: Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                decoration: BoxDecoration(
+                  color: sel ? dmAccent.withOpacity(0.12) : dmCard2,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                      color: sel ? dmAccent.withOpacity(0.5) : dmBorder),
+                ),
+                child: Row(children: [
+                  Expanded(child: Text(e.value, style: GoogleFonts.dmSans(
+                      fontSize: 14, fontWeight: FontWeight.w700,
+                      color: sel ? dmAccent : dmTxtMain))),
+                  if (sel) Icon(Icons.check_circle_rounded,
+                      color: dmAccent, size: 20),
+                ]),
+              ),
+            );
+          }),
+        ]),
+      ),
+    );
+  }
+
   Widget _buildFilterRow() {
     final filters = ['All','Pending','Accepted','Declined'];
     return Container(color: dmCard, padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
@@ -186,6 +247,7 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
   }
 
   Widget _buildList() => ListView.separated(
+    cacheExtent: 200,
     physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
     padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
     itemCount: _filtered.length,

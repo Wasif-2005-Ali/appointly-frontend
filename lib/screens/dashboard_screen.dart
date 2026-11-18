@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../app_state.dart';
-import '../services/api_client.dart';
 import '../services/chat_service.dart';
 import '../widgets/drawer_widget.dart';
 import '../widgets/appointly_hand_icon.dart';
@@ -18,7 +17,6 @@ import '../screens/personal_tasks_screen.dart';
 import 'appointment_detail_screen.dart';
 import '../chat/chat.dart';
 import 'my_availability_screen.dart';
-import 'my_appointments_screen.dart';
 
 
 class DashboardScreen extends StatefulWidget {
@@ -67,6 +65,10 @@ class _DashboardScreenState extends State<DashboardScreen>
   // ── Chart filters ──────────────────────────────────────────────────────────
   String _chartPeriod = 'This Week';
   String _chartMetric = 'All';
+
+  // ── Header search (filters the appointments list) ───────────────────────
+  final _searchCtrl = TextEditingController();
+  String _searchQuery = '';
 
   // ── Schedule: computed real-date week (Sun=0..Sat=6) ─────────────────────
   static int _todayWeekIdx() {
@@ -137,68 +139,43 @@ class _DashboardScreenState extends State<DashboardScreen>
               ])),
             ]),
             const SizedBox(height: 20),
-            Row(children: [
-              Expanded(child: _sheetBtn(
-                label: 'Reschedule',
-                icon: Icons.edit_calendar_rounded,
+            // A cancelled appointment can neither be re-confirmed nor
+            // rescheduled — the server rejects both (409). Say so
+            // honestly and offer to book a fresh appointment instead.
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE05C5C).withOpacity(0.08),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                    color: const Color(0xFFE05C5C).withOpacity(0.25)),
+              ),
+              child: Row(children: [
+                const Icon(Icons.info_outline_rounded,
+                    color: Color(0xFFE05C5C), size: 18),
+                const SizedBox(width: 10),
+                Expanded(child: Text(
+                  'This appointment was cancelled and can\'t be brought back.',
+                  style: GoogleFonts.dmSans(
+                      fontSize: 12.5, fontWeight: FontWeight.w600,
+                      color: const Color(0xFFE05C5C)),
+                )),
+              ]),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: _sheetBtn(
+                label: 'Book new appointment',
+                icon: Icons.add_circle_outline_rounded,
                 bg: _accent.withOpacity(0.1),
                 fg: _accent,
                 onTap: () {
                   Navigator.pop(context);
-                  Navigator.push(context, MaterialPageRoute(
-                      builder: (_) => RescheduleScreen(
-                        appointment: a,
-                        onConfirm: (newDt, {String note = ''}) async {
-                          await AppStateProvider.of(context).updateAppointment(
-                            a.copyWith(
-                              dateTime: newDt,
-                              status: ApptStatus.confirmed,
-                              cancellationNote: note,
-                            ),
-                          );
-                        },
-                      )));
+                  Navigator.push(context, _route(const NewAppointmentScreen()));
                 },
-              )),
-              const SizedBox(width: 12),
-              Expanded(child: _sheetBtn(
-                label: 'Re-confirm',
-                icon: Icons.check_circle_rounded,
-                bg: const Color(0xFF2ECC96).withOpacity(0.1),
-                fg: const Color(0xFF2ECC96),
-                onTap: () async {
-                  Navigator.pop(context);
-                  if (a.id == null) return;
-                  try {
-                    await AppStateProvider.of(context)
-                        .updateAppointmentStatus(a.id!, ApptStatus.confirmed);
-                  } on ApiException catch (e) {
-                    // Accept is provider-only and pending-only — a
-                    // cancelled appointment cannot be re-confirmed.
-                    if (!mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                      content: Text(e.message,
-                          style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
-                      backgroundColor: const Color(0xFFE05C5C),
-                      behavior: SnackBarBehavior.floating,
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14)),
-                    ));
-                    return;
-                  }
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                      content: Text('Appointment re-confirmed!',
-                          style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
-                      backgroundColor: const Color(0xFF2ECC96),
-                      behavior: SnackBarBehavior.floating,
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14)),
-                    ));
-                  }
-                },
-              )),
-            ]),
+              ),
+            ),
           ]),
         ),
       ),
@@ -206,7 +183,8 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   void _showAppointmentSheet(Appointment a) {
-    // For cancelled: show reschedule/re-confirm options
+    // For cancelled: show an honest note (it can't be re-confirmed
+    // or rescheduled) with a book-new option.
     if (a.status == ApptStatus.cancelled) {
       _showCancelledOptions(a);
       return;
@@ -403,6 +381,7 @@ class _DashboardScreenState extends State<DashboardScreen>
     _clientsScrollCtrl.dispose();
     _headerProgress.dispose();
     _fabPosNotifier.dispose();
+    _searchCtrl.dispose();
     super.dispose();
   }
 
@@ -561,7 +540,9 @@ class _DashboardScreenState extends State<DashboardScreen>
               );
             },
           ),
-          Expanded(child: TabBarView(controller: _tabController, children: [
+          Expanded(child: _searchQuery.isNotEmpty
+              ? _buildSearchResults()
+              : TabBarView(controller: _tabController, children: [
             _buildHomeTab(), _buildScheduleTab(), _buildActionsTab(), _buildClientsTab(),
           ])),
         ]),
@@ -941,32 +922,6 @@ class _DashboardScreenState extends State<DashboardScreen>
     );
   }
 
-  // ── FULL HERO HEADER ──────────────────────────────────────────────────────
-  Widget _buildHero() {
-    final heroColors = AppStateProvider.of(context).heroGradient;
-    return Container(
-      decoration: BoxDecoration(gradient: LinearGradient(
-        begin: Alignment.topLeft, end: Alignment.bottomRight,
-        colors: heroColors,
-        stops: const [0.0, 0.35, 0.7, 1.0],
-      )),
-      child: Stack(children: [
-        Positioned(right: -50, top: -50,
-            child: _orb(220, _accent, 0.14)),
-        Positioned(left: -40, bottom: 20,
-            child: _orb(160, Colors.white, 0.05)),
-        Positioned(right: 80, bottom: -15,
-            child: _orb(90, _accent, 0.18)),
-        SafeArea(bottom: false, child: Column(children: [
-          _buildTopRow(),
-          _buildGreeting(),
-          _buildStatPills(),
-          _buildSearchBar(),
-        ])),
-      ]),
-    );
-  }
-
   Widget _buildTopRow() {
     final unreadChats = _unreadChats;
     return Padding(
@@ -1117,9 +1072,6 @@ class _DashboardScreenState extends State<DashboardScreen>
         !a.dateTime.isBefore(weekStart) &&
         a.dateTime.isBefore(weekEnd)).length;
 
-    final confirmedToday = all.where((a) =>
-    a.isToday && a.status == ApptStatus.confirmed).length;
-
     final pills = [
       {'label': 'TODAY',     'value': '$todayCount',         'trend': 'Appointments'},
       {'label': 'CLIENTS',   'value': '$clientCount',        'trend': 'Unique'},
@@ -1130,6 +1082,7 @@ class _DashboardScreenState extends State<DashboardScreen>
     return SizedBox(
       height: 80,
       child: ListView.separated(
+        cacheExtent: 200,
         clipBehavior: Clip.none,
         padding: const EdgeInsets.fromLTRB(18, 6, 18, 6),
         scrollDirection: Axis.horizontal,
@@ -1185,8 +1138,26 @@ class _DashboardScreenState extends State<DashboardScreen>
           child: Row(children: [
             Icon(Icons.search_rounded, color: Colors.white.withOpacity(0.4), size: 19),
             const SizedBox(width: 10),
-            Text('Search appointments...', style: GoogleFonts.dmSans(
-                color: Colors.white.withOpacity(0.35), fontSize: 13)),
+            Expanded(child: TextField(
+              controller: _searchCtrl,
+              onChanged: (v) => setState(() => _searchQuery = v.trim()),
+              style: GoogleFonts.dmSans(
+                  color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+              decoration: InputDecoration.collapsed(
+                hintText: 'Search appointments...',
+                hintStyle: GoogleFonts.dmSans(
+                    color: Colors.white.withOpacity(0.35), fontSize: 13),
+              ),
+            )),
+            if (_searchQuery.isNotEmpty)
+              GestureDetector(
+                onTap: () => setState(() {
+                  _searchCtrl.clear();
+                  _searchQuery = '';
+                }),
+                child: Icon(Icons.close_rounded,
+                    color: Colors.white.withOpacity(0.6), size: 18),
+              ),
           ]),
         )),
         const SizedBox(width: 10),
@@ -1223,62 +1194,55 @@ class _DashboardScreenState extends State<DashboardScreen>
     );
   }
 
-  // ── MINIMIZED SEARCH‑ONLY BAR ─────────────────────────────────────────────
-  Widget _buildMinimizedSearchOnly() {
-    final heroColors = AppStateProvider.of(context).heroGradient;
-    return Container(
-      decoration: BoxDecoration(gradient: LinearGradient(
-        begin: Alignment.topLeft, end: Alignment.bottomRight,
-        colors: heroColors,
-        stops: const [0.0, 0.35, 0.7, 1.0],
-      )),
-      child: SafeArea(bottom: false, child: Padding(
-        padding: const EdgeInsets.fromLTRB(18, 10, 18, 14),
-        child: Row(children: [
-          Expanded(child: Container(
-            height: 44,
-            padding: const EdgeInsets.symmetric(horizontal: 14),
-            decoration: BoxDecoration(
-              color: Colors.white.withOpacity(0.08),
-              borderRadius: BorderRadius.circular(13),
-              border: Border.all(color: Colors.white.withOpacity(0.18)),
-            ),
-            child: Row(children: [
-              Icon(Icons.search_rounded, color: Colors.white.withOpacity(0.4), size: 19),
-              const SizedBox(width: 10),
-              Text('Search appointments...', style: GoogleFonts.dmSans(
-                  color: Colors.white.withOpacity(0.35), fontSize: 13)),
-            ]),
-          )),
-          const SizedBox(width: 10),
-          GestureDetector(
-            onTap: () => setState(() {
-              _isPinned = !_isPinned;
-              if (!_isPinned) {
-                _syncHeaderWithCurrentTab();
-              } else {
-                _headerProgress.value = 0.0;
-              }
-            }),
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              height: 44, width: 44,
-              decoration: BoxDecoration(
-                gradient: _isPinned ? LinearGradient(colors: _btnGradient) : null,
-                color: _isPinned ? null : Colors.white.withOpacity(0.1),
-                borderRadius: BorderRadius.circular(13),
-                border: Border.all(color: Colors.white.withOpacity(0.22)),
-              ),
-              child: Center(
-                child: Icon(
-                  _isPinned ? Icons.push_pin_rounded : Icons.push_pin_outlined,
-                  color: Colors.white, size: 20,
-                ),
+  // ── SEARCH RESULTS (replaces the tabs while a query is typed) ─────────────
+  // Real local text search over the appointments list, by client name
+  // or service. Tapping a result opens it, like the schedule tiles.
+  Widget _buildSearchResults() {
+    final q = _searchQuery.toLowerCase();
+    final results = AppStateProvider.of(context).appointments
+        .where((a) =>
+            a.name.toLowerCase().contains(q) ||
+            a.service.toLowerCase().contains(q))
+        .toList()
+      ..sort((a, b) => a.dateTime.compareTo(b.dateTime));
+    return RefreshIndicator(
+      onRefresh: () => AppStateProvider.of(context).loadAppointments(),
+      child: results.isEmpty
+          ? ListView(
+              cacheExtent: 200,
+              physics: const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics()),
+              padding: const EdgeInsets.fromLTRB(16, 48, 16, 32),
+              children: [
+                Icon(Icons.search_off_rounded, size: 48,
+                    color: _txtSub.withOpacity(0.4)),
+                const SizedBox(height: 14),
+                Text('No appointments match "$_searchQuery"',
+                    textAlign: TextAlign.center,
+                    style: GoogleFonts.dmSans(
+                        fontSize: 15, fontWeight: FontWeight.w800,
+                        color: _txtMain)),
+                const SizedBox(height: 6),
+                Text('Try a different name or service.',
+                    textAlign: TextAlign.center,
+                    style: GoogleFonts.dmSans(
+                        fontSize: 13, color: _txtSub,
+                        fontWeight: FontWeight.w500)),
+              ],
+            )
+          : ListView.separated(
+              cacheExtent: 200,
+              physics: const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics()),
+              padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
+              itemCount: results.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 10),
+              itemBuilder: (_, i) => Container(
+                decoration: _card(),
+                padding: const EdgeInsets.all(8),
+                child: _apptTile(results[i]),
               ),
             ),
-          ),
-        ]),
-      )),
     );
   }
 
@@ -1406,37 +1370,40 @@ class _DashboardScreenState extends State<DashboardScreen>
   Widget _buildHomeTab() {
     return LayoutBuilder(
       builder: (context, constraints) {
-        return SingleChildScrollView(
-          controller: _homeScrollCtrl,
-          physics: const BouncingScrollPhysics(
-              parent: AlwaysScrollableScrollPhysics()),
-          padding: const EdgeInsets.fromLTRB(16, 24, 16, 32),
-          child: ConstrainedBox(
-            // Guarantee the content is always tall enough to scroll
-            // _collapseRange px — prevents the bouncing-header glitch on
-            // short content where over-pull snaps back and jitters the header.
-            constraints: BoxConstraints(
-                minHeight: constraints.maxHeight + _collapseRange),
-            child: FadeTransition(
-              opacity: _cardsFade,
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start, children: [
-                _sectionLabel('Overview'),
-                const SizedBox(height: 4),
-                Text('Your business at a glance', style: GoogleFonts.dmSans(
-                    fontSize: 13.5, color: _txtSub,
-                    fontWeight: FontWeight.w500)),
-                const SizedBox(height: 20),
-                _buildStatCards(),
-                const SizedBox(height: 14),
-                _buildIncomingBanner(),
-                const SizedBox(height: 18),
-                _buildUpcomingSection(),
-                const SizedBox(height: 18),
-                RepaintBoundary(child: _buildWeeklyChart()),
-                const SizedBox(height: 18),
-                RepaintBoundary(child: _buildAnalyticsDonut()),
-              ]),
+        return RefreshIndicator(
+          onRefresh: () => AppStateProvider.of(context).loadAppointments(),
+          child: SingleChildScrollView(
+            controller: _homeScrollCtrl,
+                        physics: const BouncingScrollPhysics(
+                parent: AlwaysScrollableScrollPhysics()),
+            padding: const EdgeInsets.fromLTRB(16, 24, 16, 32),
+            child: ConstrainedBox(
+              // Guarantee the content is always tall enough to scroll
+              // _collapseRange px — prevents the bouncing-header glitch on
+              // short content where over-pull snaps back and jitters the header.
+              constraints: BoxConstraints(
+                  minHeight: constraints.maxHeight + _collapseRange),
+              child: FadeTransition(
+                opacity: _cardsFade,
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  _sectionLabel('Overview'),
+                  const SizedBox(height: 4),
+                  Text('Your business at a glance', style: GoogleFonts.dmSans(
+                      fontSize: 13.5, color: _txtSub,
+                      fontWeight: FontWeight.w500)),
+                  const SizedBox(height: 20),
+                  _buildStatCards(),
+                  const SizedBox(height: 14),
+                  _buildIncomingBanner(),
+                  const SizedBox(height: 18),
+                  _buildUpcomingSection(),
+                  const SizedBox(height: 18),
+                  RepaintBoundary(child: _buildWeeklyChart()),
+                  const SizedBox(height: 18),
+                  RepaintBoundary(child: _buildAnalyticsDonut()),
+                ]),
+              ),
             ),
           ),
         );
@@ -1861,11 +1828,13 @@ class _DashboardScreenState extends State<DashboardScreen>
     final confirmedN = todayAll.where((a) => a.status == ApptStatus.confirmed).length;
     final completedN = todayAll.where((a) => a.status == ApptStatus.completed).length;
     final cancelledN = todayAll.where((a) => a.status == ApptStatus.cancelled).length;
+    final pendingN   = todayAll.where((a) => a.status == ApptStatus.pending).length;
     final totalN     = todayAll.length;
 
     final cFrac  = totalN > 0 ? confirmedN / totalN : 0.0;
     final dFrac  = totalN > 0 ? completedN / totalN : 0.0;
     final xFrac  = totalN > 0 ? cancelledN / totalN : 0.0;
+    final pFrac  = totalN > 0 ? pendingN / totalN : 0.0;
 
     return Container(
       padding: const EdgeInsets.all(20),
@@ -1887,6 +1856,7 @@ class _DashboardScreenState extends State<DashboardScreen>
               confirmedFrac: cFrac,
               completedFrac: dFrac,
               cancelledFrac: xFrac,
+              pendingFrac: pFrac,
             ),
             child: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
               Text('$totalN', style: GoogleFonts.dmSans(
@@ -1900,6 +1870,8 @@ class _DashboardScreenState extends State<DashboardScreen>
             _donutLeg(_accent, 'Confirmed', '$confirmedN'),
             const SizedBox(height: 10),
             _donutLeg(_btnShadow, 'Completed', '$completedN'),
+            const SizedBox(height: 10),
+            _donutLeg(const Color(0xFFF4A24A), 'Pending', '$pendingN'),
             const SizedBox(height: 10),
             _donutLeg(const Color(0xFFE05C5C), 'Cancelled', '$cancelledN'),
           ])),
@@ -1987,48 +1959,51 @@ class _DashboardScreenState extends State<DashboardScreen>
         Expanded(
           child: LayoutBuilder(
             builder: (context, constraints) {
-              return SingleChildScrollView(
-                controller: _scheduleScrollCtrl,
-                physics: const BouncingScrollPhysics(
-                    parent: AlwaysScrollableScrollPhysics()),
-                padding: const EdgeInsets.fromLTRB(16, 6, 16, 100),
-                child: ConstrainedBox(
-                  // Guarantee at least _collapseRange px of scrollable space
-                  // so the header can always collapse fully without bouncing back.
-                  constraints: BoxConstraints(
-                      minHeight: constraints.maxHeight + _collapseRange),
-                  child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const SizedBox(height: 16),
-                        Row(crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Expanded(child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(headerLabel, style: GoogleFonts.dmSans(
-                                        fontSize: 26, fontWeight: FontWeight.w900,
-                                        color: _txtMain, letterSpacing: -1)),
-                                    Container(margin: const EdgeInsets.only(top: 5),
-                                        width: 40, height: 4,
-                                        decoration: BoxDecoration(
-                                          gradient: LinearGradient(colors: _btnGradient),
-                                          borderRadius: BorderRadius.circular(2),
-                                        )),
-                                    const SizedBox(height: 6),
-                                    Text(
-                                        '${appts.length} appointment${appts.length == 1 ? '' : 's'}',
-                                        style: GoogleFonts.dmSans(
-                                            fontSize: 13, color: _txtSub,
-                                            fontWeight: FontWeight.w500)),
-                                  ])),
-                            ]),
-                        const SizedBox(height: 22),
-                        if (appts.isEmpty)
-                          _buildEmptySchedule()
-                        else
-                          _buildScheduleCard(appts),
-                      ]),
+              return RefreshIndicator(
+                onRefresh: () => AppStateProvider.of(context).loadAppointments(),
+                child: SingleChildScrollView(
+                  controller: _scheduleScrollCtrl,
+                                    physics: const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics()),
+                  padding: const EdgeInsets.fromLTRB(16, 6, 16, 100),
+                  child: ConstrainedBox(
+                    // Guarantee at least _collapseRange px of scrollable space
+                    // so the header can always collapse fully without bouncing back.
+                    constraints: BoxConstraints(
+                        minHeight: constraints.maxHeight + _collapseRange),
+                    child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const SizedBox(height: 16),
+                          Row(crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Expanded(child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(headerLabel, style: GoogleFonts.dmSans(
+                                          fontSize: 26, fontWeight: FontWeight.w900,
+                                          color: _txtMain, letterSpacing: -1)),
+                                      Container(margin: const EdgeInsets.only(top: 5),
+                                          width: 40, height: 4,
+                                          decoration: BoxDecoration(
+                                            gradient: LinearGradient(colors: _btnGradient),
+                                            borderRadius: BorderRadius.circular(2),
+                                          )),
+                                      const SizedBox(height: 6),
+                                      Text(
+                                          '${appts.length} appointment${appts.length == 1 ? '' : 's'}',
+                                          style: GoogleFonts.dmSans(
+                                              fontSize: 13, color: _txtSub,
+                                              fontWeight: FontWeight.w500)),
+                                    ])),
+                              ]),
+                          const SizedBox(height: 22),
+                          if (appts.isEmpty)
+                            _buildEmptySchedule()
+                          else
+                            _buildScheduleCard(appts),
+                        ]),
+                  ),
                 ),
               );
             },
@@ -2151,6 +2126,7 @@ class _DashboardScreenState extends State<DashboardScreen>
             (i) => appState.appointmentsForDate(days[i]).length);
 
     return SizedBox(height: 88, child: ListView.separated(
+      cacheExtent: 200,
       scrollDirection: Axis.horizontal,
       separatorBuilder: (_, __) => const SizedBox(width: 8),
       itemCount: days.length,
@@ -2262,7 +2238,6 @@ class _DashboardScreenState extends State<DashboardScreen>
       // YAHAN YEH NAYI LINE ADD KI HAI (Video Call ke liye)
       {'label': 'Video Call', 'desc': 'Call another user',   'icon': Icons.video_camera_front_rounded, 's': const StartCallScreen()},
 
-      {'label': 'Add Client',      'desc': 'Register new client', 'icon': Icons.person_add_rounded,     's': const AddClientScreen()},
       {'label': 'My Availability', 'desc': 'Set your open slots', 'icon': Icons.event_available_rounded, 's': const MyAvailabilityScreen()},
       {'label': 'My Reviews',      'desc': 'See client feedback', 'icon': Icons.star_rounded,            's': const MyReviewsScreen()},
       {'label': 'Personal Tasks',  'desc': 'Manage your to-dos',  'icon': Icons.check_circle_rounded,    's': const PersonalTasksScreen()},
@@ -2316,41 +2291,130 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   // ── CLIENTS TAB ────────────────────────────────────────────────────────────
   Widget _buildClientsTab() {
+    // Real client list derived from appointments: unique client names
+    // with their appointment count (same grouping as the CLIENTS pill).
+    final all = AppStateProvider.of(context).appointments;
+    final Map<String, List<Appointment>> byClient = {};
+    for (final a in all) {
+      final key = a.name.trim().toLowerCase();
+      if (key.isEmpty) continue;
+      (byClient[key] ??= []).add(a);
+    }
+    final clients = byClient.entries.toList()
+      ..sort((x, y) {
+        final byCount = y.value.length.compareTo(x.value.length);
+        if (byCount != 0) return byCount;
+        return x.value.first.name.compareTo(y.value.first.name);
+      });
     return LayoutBuilder(
       builder: (context, constraints) {
-        return SingleChildScrollView(
-          controller: _clientsScrollCtrl,
-          physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-          padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
-          child: ConstrainedBox(
-            // Ensure content is always taller than the viewport so scroll
-            // events fire and the header collapse/expand animation works
-            // even when there is limited content on this tab.
-            constraints: BoxConstraints(minHeight: constraints.maxHeight + _collapseRange),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              _sectionLabel('Recent Clients'),
-              const SizedBox(height: 16),
-              // No client list exists yet — honest empty state instead
-              // of hardcoded fake clients and a fake total.
-              Container(
-                decoration: _card(),
-                padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 20),
-                child: Center(
-                  child: Column(mainAxisSize: MainAxisSize.min, children: [
-                    Icon(Icons.people_alt_outlined, size: 40,
-                        color: _txtSub.withOpacity(0.5)),
-                    const SizedBox(height: 12),
-                    Text('No client list yet', style: GoogleFonts.dmSans(
-                        fontSize: 15, fontWeight: FontWeight.w800, color: _txtMain)),
-                    const SizedBox(height: 4),
-                    Text('Clients appear here after appointments.',
-                        textAlign: TextAlign.center,
-                        style: GoogleFonts.dmSans(
-                            fontSize: 12.5, color: _txtSub, fontWeight: FontWeight.w500)),
-                  ]),
-                ),
-              ),
-            ]),
+        return RefreshIndicator(
+          onRefresh: () => AppStateProvider.of(context).loadAppointments(),
+          child: SingleChildScrollView(
+            controller: _clientsScrollCtrl,
+                        physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+            padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
+            child: ConstrainedBox(
+              // Ensure content is always taller than the viewport so scroll
+              // events fire and the header collapse/expand animation works
+              // even when there is limited content on this tab.
+              constraints: BoxConstraints(minHeight: constraints.maxHeight + _collapseRange),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                _sectionLabel('Recent Clients'),
+                const SizedBox(height: 6),
+                Text(
+                    clients.isEmpty
+                        ? 'People you have appointments with'
+                        : '${clients.length} client${clients.length == 1 ? '' : 's'}',
+                    style: GoogleFonts.dmSans(
+                        fontSize: 13.5, color: _txtSub, fontWeight: FontWeight.w500)),
+                const SizedBox(height: 16),
+                if (clients.isEmpty)
+                  Container(
+                    decoration: _card(),
+                    padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 20),
+                    child: Center(
+                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(Icons.people_alt_outlined, size: 40,
+                            color: _txtSub.withOpacity(0.5)),
+                        const SizedBox(height: 12),
+                        Text('No clients yet', style: GoogleFonts.dmSans(
+                            fontSize: 15, fontWeight: FontWeight.w800, color: _txtMain)),
+                        const SizedBox(height: 4),
+                        Text('Clients appear here after appointments.',
+                            textAlign: TextAlign.center,
+                            style: GoogleFonts.dmSans(
+                                fontSize: 12.5, color: _txtSub, fontWeight: FontWeight.w500)),
+                      ]),
+                    ),
+                  )
+                else
+                  Container(
+                    decoration: _card(),
+                    padding: const EdgeInsets.all(8),
+                    child: Column(children: clients.map((e) {
+                      final appts = e.value;
+                      final first = appts.first;
+                      final latest = appts
+                          .map((a) => a.dateTime)
+                          .reduce((x, y) => x.isAfter(y) ? x : y);
+                      final now = DateTime.now();
+                      final today = DateTime(now.year, now.month, now.day);
+                      final latestDay = DateTime(latest.year, latest.month, latest.day);
+                      final latestLabel = latestDay == today
+                          ? 'Today'
+                          : latestDay == today.add(const Duration(days: 1))
+                              ? 'Tomorrow'
+                              : '${latest.day}/${latest.month}/${latest.year}';
+                      return Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 10),
+                        child: Row(children: [
+                          CircleAvatar(
+                            radius: 20,
+                            backgroundColor:
+                                first.avatarColor.withOpacity(_dark ? 0.2 : 0.15),
+                            child: Text(first.initials,
+                                style: GoogleFonts.dmSans(
+                                    fontSize: 11, fontWeight: FontWeight.w900,
+                                    color: first.avatarColor)),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(first.name,
+                                    style: GoogleFonts.dmSans(
+                                        fontSize: 13.5,
+                                        fontWeight: FontWeight.w700,
+                                        color: _txtMain, letterSpacing: -0.1)),
+                                const SizedBox(height: 2),
+                                Text('Latest: $latestLabel',
+                                    style: GoogleFonts.dmSans(
+                                        fontSize: 11.5, color: _txtSub,
+                                        fontWeight: FontWeight.w500)),
+                              ])),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: _accent.withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(
+                                  color: _accent.withOpacity(0.25)),
+                            ),
+                            child: Text(
+                                '${appts.length} appt${appts.length == 1 ? '' : 's'}',
+                                style: GoogleFonts.dmSans(
+                                    fontSize: 11, fontWeight: FontWeight.w800,
+                                    color: _accent)),
+                          ),
+                        ]),
+                      );
+                    }).toList()),
+                  ),
+              ]),
+            ),
           ),
         );
       },
@@ -2595,6 +2659,7 @@ class _DonutPainter extends CustomPainter {
   final double confirmedFrac;
   final double completedFrac;
   final double cancelledFrac;
+  final double pendingFrac;
   const _DonutPainter({
     required this.trackColor,
     required this.accentColor,
@@ -2602,6 +2667,7 @@ class _DonutPainter extends CustomPainter {
     this.confirmedFrac = 5 / 8,
     this.completedFrac = 2 / 8,
     this.cancelledFrac = 1 / 8,
+    this.pendingFrac = 0,
   });
 
   @override
@@ -2616,12 +2682,13 @@ class _DonutPainter extends CustomPainter {
     canvas.drawCircle(Offset(cx, cy), radius, track);
 
     // If no data at all, draw a single grey arc
-    final total = confirmedFrac + completedFrac + cancelledFrac;
+    final total = confirmedFrac + completedFrac + cancelledFrac + pendingFrac;
     if (total <= 0) return;
 
     final segs = [
       [accentColor,                    confirmedFrac / total],
       [secondColor,                    completedFrac / total],
+      [const Color(0xFFF4A24A),        pendingFrac / total],
       [const Color(0xFFE05C5C),        cancelledFrac / total],
     ];
 
@@ -2641,5 +2708,6 @@ class _DonutPainter extends CustomPainter {
   @override bool shouldRepaint(_DonutPainter old) =>
       old.confirmedFrac != confirmedFrac ||
       old.completedFrac != completedFrac ||
-      old.cancelledFrac != cancelledFrac;
+      old.cancelledFrac != cancelledFrac ||
+      old.pendingFrac != pendingFrac;
 }
