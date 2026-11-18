@@ -8,6 +8,8 @@
 //    path_drawing: ^1.0.1
 // ═══════════════════════════════════════════════════════════════════
 
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:path_drawing/path_drawing.dart';
 import '../database/bd_helper.dart';
@@ -53,6 +55,12 @@ class _SplashScreenState extends State<SplashScreen>
   late final Animation<double> _glow;
 
   final List<Animation<double>> _letterFade = [];
+
+  /// True once the 4s logo animation has finished. While the session
+  /// restore is still pending after that, the splash shows a spinner
+  /// + honest text instead of sitting static for up to ~90s.
+  bool _animationDone = false;
+  bool _restorePending = true;
 
 
   Animation<double> _interval(double start, double end,
@@ -108,6 +116,11 @@ class _SplashScreenState extends State<SplashScreen>
     // Animation is purely cosmetic: session restore starts immediately,
     // in parallel, and we navigate as soon as it finishes (after a
     // minimum ~1s so the splash is actually seen).
+    _ctrl.addStatusListener((status) {
+      if (status == AnimationStatus.completed && mounted) {
+        setState(() => _animationDone = true);
+      }
+    });
     _ctrl.forward();
     _restoreAndNavigate();
   }
@@ -134,6 +147,7 @@ class _SplashScreenState extends State<SplashScreen>
       await Future.delayed(minSplash - elapsed);
       if (!mounted) return;
     }
+    _restorePending = false;
     // Crossfade directly — no pre-fade so no black flash
     Navigator.of(context).pushReplacement(PageRouteBuilder(
       pageBuilder: (_, __, ___) => next,
@@ -154,101 +168,144 @@ class _SplashScreenState extends State<SplashScreen>
     super.dispose();
   }
 
+  // The glow shadows, built ONCE as const widgets. They used to be
+  // recreated inside the AnimatedBuilder on every frame for 4s —
+  // two large blurred containers (blurRadius 100/60) rebuilt 60x/s.
+  // The per-frame builder now only recreates the cheap Opacity
+  // wrappers around these; the RepaintBoundary caches the raster.
+  // (Alpha baked in: 0xFF2D4C70 at 0.85 -> 0xD9, 0xFF3D6FA8 at
+  // 0.6 -> 0x99 — identical to the old withOpacity calls.)
+  static const _glowOuter = RepaintBoundary(
+    child: SizedBox(
+      width: 320,
+      height: 320,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          boxShadow: [
+            BoxShadow(
+              color: Color(0xD92D4C70),
+              blurRadius: 100,
+              spreadRadius: 30,
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+
+  static const _glowInner = RepaintBoundary(
+    child: SizedBox(
+      width: 200,
+      height: 200,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          boxShadow: [
+            BoxShadow(
+              color: Color(0x993D6FA8),
+              blurRadius: 60,
+              spreadRadius: 10,
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
         backgroundColor: const Color(0xFF0B1E3D), // matches login hero gradient start
         body: Center(
-          child: AnimatedBuilder(
-            animation: _ctrl,
-            builder: (context, _) {
-              return Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      Opacity(
-                        opacity: _glow.value,
-                        child: Container(
-                          width: 320,
-                          height: 320,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            boxShadow: [
-                              BoxShadow(
-                                color: const Color(0xFF2D4C70).withOpacity(0.85),
-                                blurRadius: 100,
-                                spreadRadius: 30,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      Opacity(
-                        opacity: _glow.value * 0.7,
-                        child: Container(
-                          width: 200,
-                          height: 200,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            boxShadow: [
-                              BoxShadow(
-                                color: const Color(0xFF3D6FA8).withOpacity(0.6),
-                                blurRadius: 60,
-                                spreadRadius: 10,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      CustomPaint(
-                        size: const Size(290, 290),
-                        painter: _LogoPainter(
-                          arc1Draw: _arc1Draw.value, arc1Fill: _arc1Fill.value,
-                          arc2Draw: _arc2Draw.value, arc2Fill: _arc2Fill.value,
-                          arc3Draw: _arc3Draw.value, arc3Fill: _arc3Fill.value,
-                          arc4Draw: _arc4Draw.value, arc4Fill: _arc4Fill.value,
-                          tri1Draw: _tri1Draw.value, tri1Fill: _tri1Fill.value,
-                          tri2Draw: _tri2Draw.value, tri2Fill: _tri2Fill.value,
-                          tri3Draw: _tri3Draw.value, tri3Fill: _tri3Fill.value,
-                          checkDraw: _checkDraw.value, checkFill: _checkFill.value,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 26),
-                  Row(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              AnimatedBuilder(
+                animation: _ctrl,
+                builder: (context, _) {
+                  return Column(
                     mainAxisSize: MainAxisSize.min,
-                    children: 'APPOINTLY'.split('').asMap().entries.map((e) {
-                      final t = _letterFade[e.key].value;
-                      final lerp = e.key / 8.0;
-                      final color = Color.lerp(
-                        const Color(0xFF1C3F6A),
-                        const Color(0xFF2D6FAA),
-                        lerp,
-                      )!;
-                      return Opacity(
-                        opacity: t,
-                        child: Transform.translate(
-                          offset: Offset(0, 14.0 * (1.0 - t)),
-                          child: Text(
-                            e.value,
-                            style: TextStyle(
-                              color: color,
-                              fontSize: 22,
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: 4,
-                              fontFamily: 'sans-serif',
+                    children: [
+                      Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          Opacity(
+                            opacity: _glow.value,
+                            child: _glowOuter,
+                          ),
+                          Opacity(
+                            opacity: _glow.value * 0.7,
+                            child: _glowInner,
+                          ),
+                          CustomPaint(
+                            size: const Size(290, 290),
+                            painter: _LogoPainter(
+                              arc1Draw: _arc1Draw.value, arc1Fill: _arc1Fill.value,
+                              arc2Draw: _arc2Draw.value, arc2Fill: _arc2Fill.value,
+                              arc3Draw: _arc3Draw.value, arc3Fill: _arc3Fill.value,
+                              arc4Draw: _arc4Draw.value, arc4Fill: _arc4Fill.value,
+                              tri1Draw: _tri1Draw.value, tri1Fill: _tri1Fill.value,
+                              tri2Draw: _tri2Draw.value, tri2Fill: _tri2Fill.value,
+                              tri3Draw: _tri3Draw.value, tri3Fill: _tri3Fill.value,
+                              checkDraw: _checkDraw.value, checkFill: _checkFill.value,
                             ),
                           ),
-                        ),
-                      );
-                    }).toList(),
+                        ],
+                      ),
+                      const SizedBox(height: 26),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: 'APPOINTLY'.split('').asMap().entries.map((e) {
+                          final t = _letterFade[e.key].value;
+                          final lerp = e.key / 8.0;
+                          final color = Color.lerp(
+                            const Color(0xFF1C3F6A),
+                            const Color(0xFF2D6FAA),
+                            lerp,
+                          )!;
+                          return Opacity(
+                            opacity: t,
+                            child: Transform.translate(
+                              offset: Offset(0, 14.0 * (1.0 - t)),
+                              child: Text(
+                                e.value,
+                                style: TextStyle(
+                                  color: color,
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.w800,
+                                  letterSpacing: 4,
+                                  fontFamily: 'sans-serif',
+                                ),
+                              ),
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                    ],
+                  );
+                },
+              ),
+              // Cold start: the animation ends at 4s but the session
+              // restore can take up to ~90s. Say so instead of
+              // sitting on a static screen.
+              if (_animationDone && _restorePending) ...[
+                const SizedBox(height: 36),
+                const SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white70,
                   ),
-                ],
-              );
-            },
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  'Waking up the server…',
+                  style: TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+              ],
+            ],
           ),
         ),
       );
@@ -336,13 +393,34 @@ class _LogoPainter extends CustomPainter {
     ], true);
 
   static const Color _navyFill    = Color(0xFF132E4D);
-  static const Color _navyLight   = Color(0xFF2D4C70);
   static const Color _silverFill  = Color(0xFFB0B3AB);
   static const Color _navyStroke  = Color(0xFF2D4C70);
   static const Color _silverStroke = Color(0xFF9FA39B);
 
-  Path _scale(Path raw, Size size) {
-    final sx = size.width  / _svgWidth;
+  // The 8 logo paths, in draw order.
+  static final List<Path> _svgPaths = [
+    _pArc1, _pArc2, _pArc3, _pArc4, _pTri1, _pTri2, _pTri3, _pCheck,
+  ];
+
+  // Scaled paths + their metrics, cached per canvas size. paint()
+  // runs every animation frame, and a fresh _LogoPainter is built
+  // each frame, so the cache must be static to survive. Recomputing
+  // computeMetrics() per path per frame was the expensive part; the
+  // size never changes here, so this is computed once.
+  static Size? _cacheSize;
+  static List<Path>? _cachedScaled;
+  static List<List<ui.PathMetric>>? _cachedMetrics;
+
+  static void _ensureCache(Size size) {
+    if (_cacheSize == size && _cachedScaled != null) return;
+    _cacheSize = size;
+    _cachedScaled = _svgPaths.map((p) => _scalePath(p, size)).toList();
+    _cachedMetrics =
+        _cachedScaled!.map((p) => p.computeMetrics().toList()).toList();
+  }
+
+  static Path _scalePath(Path raw, Size size) {
+    final sx = size.width / _svgWidth;
     final sy = size.height / _svgHeight;
     final m = Matrix4.identity()
       ..translate(-_svgLeft * sx, -_svgTop * sy)
@@ -350,25 +428,27 @@ class _LogoPainter extends CustomPainter {
     return raw.transform(m.storage);
   }
 
-  Path _trim(Path p, double t) {
+  Path _trim(int pathIndex, double t) {
+    final scaled = _cachedScaled![pathIndex];
     if (t <= 0.0) return Path();
-    if (t >= 1.0) return p;
+    if (t >= 1.0) return scaled;
     final out = Path();
-    for (final metric in p.computeMetrics()) {
+    for (final metric in _cachedMetrics![pathIndex]) {
       out.addPath(metric.extractPath(0.0, metric.length * t), Offset.zero);
     }
     return out;
   }
 
   void _draw(Canvas canvas, Size size, {
-    required Path svgPath,
+    required int pathIndex,
     required double drawT,
     required double fillT,
     required Color strokeColor,
     required Color fillColor,
     double strokeWidth = 2.8,
   }) {
-    final scaled = _scale(svgPath, size);
+    _ensureCache(size);
+    final scaled = _cachedScaled![pathIndex];
     if (fillT > 0) {
       canvas.drawPath(
         scaled,
@@ -381,7 +461,7 @@ class _LogoPainter extends CustomPainter {
       final strokeAlpha = (1.0 - fillT).clamp(0.0, 1.0);
       if (strokeAlpha > 0.01) {
         canvas.drawPath(
-          _trim(scaled, drawT),
+          _trim(pathIndex, drawT),
           Paint()
             ..color = strokeColor.withOpacity(strokeAlpha)
             ..style = PaintingStyle.stroke
@@ -395,28 +475,28 @@ class _LogoPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    _draw(canvas, size, svgPath: _pArc1,
+    _draw(canvas, size, pathIndex: 0,
         drawT: arc1Draw, fillT: arc1Fill,
         strokeColor: _navyStroke, fillColor: _navyFill);
-    _draw(canvas, size, svgPath: _pArc2,
+    _draw(canvas, size, pathIndex: 1,
         drawT: arc2Draw, fillT: arc2Fill,
         strokeColor: _navyStroke, fillColor: _navyFill);
-    _draw(canvas, size, svgPath: _pArc3,
+    _draw(canvas, size, pathIndex: 2,
         drawT: arc3Draw, fillT: arc3Fill,
         strokeColor: _navyStroke, fillColor: _navyFill);
-    _draw(canvas, size, svgPath: _pArc4,
+    _draw(canvas, size, pathIndex: 3,
         drawT: arc4Draw, fillT: arc4Fill,
         strokeColor: _silverStroke, fillColor: _silverFill);
-    _draw(canvas, size, svgPath: _pTri1,
+    _draw(canvas, size, pathIndex: 4,
         drawT: tri1Draw, fillT: tri1Fill,
         strokeColor: _navyStroke, fillColor: _navyFill, strokeWidth: 2.2);
-    _draw(canvas, size, svgPath: _pTri2,
+    _draw(canvas, size, pathIndex: 5,
         drawT: tri2Draw, fillT: tri2Fill,
         strokeColor: _navyStroke, fillColor: _navyFill, strokeWidth: 2.2);
-    _draw(canvas, size, svgPath: _pTri3,
+    _draw(canvas, size, pathIndex: 6,
         drawT: tri3Draw, fillT: tri3Fill,
         strokeColor: _navyStroke, fillColor: _navyFill, strokeWidth: 2.2);
-    _draw(canvas, size, svgPath: _pCheck,
+    _draw(canvas, size, pathIndex: 7,
         drawT: checkDraw, fillT: checkFill,
         strokeColor: _silverStroke, fillColor: _silverFill, strokeWidth: 3.2);
   }
