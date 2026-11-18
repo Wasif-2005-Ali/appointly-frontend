@@ -2,6 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:audioplayers/audioplayers.dart';
+import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -37,9 +40,37 @@ enum CallState {
 class CallEndReason {
   static const ended = 'ended';
   static const declined = 'declined';
+
+  /// The callee was already in another call (`call.rejected` with
+  /// `reason: 'busy'`).
+  static const busy = 'busy';
   static const noAnswer = 'noAnswer';
   static const connectionLost = 'connectionLost';
   static const failed = 'failed';
+}
+
+/// Time-limited TURN credentials for Metered's Open Relay static-auth
+/// scheme (https://www.metered.ca/tools/openrelay/ — "TURN Server
+/// Credentials API" / static auth): the username is
+/// `<unix-expiry>:appointly` and the credential is the base64 HMAC-SHA1
+/// of that username under the shared secret `openrelayprojectsecret`.
+///
+/// The old no-signup credentials (`openrelayproject` /
+/// `openrelayproject` on `turn:openrelay.metered.ca`) are dead — the
+/// hostname resolves to the 192.0.2.1 TEST-NET sinkhole — so without
+/// these credentials phones behind carrier NATs never establish a
+/// media path. Kept as a pure top-level function so it is unit-testable
+/// (see `test/call_service_test.dart`).
+Map<String, String> meteredTurnCredentials({required int expiryUnix}) {
+  final username = '$expiryUnix:appointly';
+  final digest = Hmac(
+    sha1,
+    utf8.encode('openrelayprojectsecret'),
+  ).convert(utf8.encode(username));
+  return {
+    'username': username,
+    'credential': base64Encode(digest.bytes),
+  };
 }
 
 /// An incoming call, as pushed by the server on `ws/notify/`
@@ -131,11 +162,19 @@ class CallSessionInfo {
 ///   the caller. Close codes: 4001 bad/expired token, 4003 not a
 ///   participant, 4008 call already in a terminal state.
 /// - Caller: connect → `call.initiate` {callee_id, call_type} →
-///   `call.initiated` → wait for `call.accepted` → SDP offer.
+///   `call.initiated` → `call.ringing` when the callee's client is
+///   notified → wait for `call.accepted` → SDP offer.
 /// - Callee: `call.incoming` → connect to the call socket →
 ///   `call.accept` (or `call.reject`) → `call.accepted` → wait
 ///   for `call.sdp_offer` → SDP answer.
 /// - Either side: `call.end` → `call.ended` (group broadcast).
+/// - The caller cancelling before accept sends `call.cancelled`
+///   {call_id} on the notify socket, so the callee's incoming-call
+///   UI can dismiss itself instead of ringing the full 30s.
+/// - `call.rejected` carries an optional `reason` field: `'busy'`
+///   when the callee was already in a call.
+/// - When a peer's app dies mid-call the server sends
+///   `peer_disconnected` on the call socket.
 /// - SDP/ICE frames (`call.sdp_offer`, `call.sdp_answer`,
 ///   `call.ice_candidate`) are only accepted by the server while
 ///   the session is CONNECTED, and only from the right party
@@ -147,10 +186,11 @@ class CallSessionInfo {
 /// ends the call locally after [_ringTimeout] ([CallConnection]
 /// sends `call.end`, which moves the session to ENDED).
 ///
-/// ICE uses Google's free public STUN server plus the Open Relay
-/// Project's free public TURN servers as a fallback, so calls can
-/// connect across symmetric NATs and mobile data (STUN alone cannot
-/// relay media) — see [CallConnection._iceServers].
+/// ICE uses Google's free public STUN servers plus Metered Open
+/// Relay TURN servers with time-limited static-auth credentials
+/// (see [meteredTurnCredentials] and [CallConnection.iceServers]),
+/// so calls can connect across symmetric NATs and mobile data
+/// (STUN alone cannot relay media).
 class CallService {
   CallService._();
   static final CallService instance = CallService._();
@@ -207,10 +247,17 @@ class CallService {
 
   final _incomingController = StreamController<IncomingCall>.broadcast();
   final _notifyErrorsController = StreamController<String>.broadcast();
+  final _callCancelledController = StreamController<String>.broadcast();
 
   /// Incoming calls pushed by the server. The app listens to this
-  /// (see `main.dart`) and shows the incoming-call dialog.
+  /// (see `main.dart`) and shows the incoming-call screen.
   Stream<IncomingCall> get incomingCalls => _incomingController.stream;
+
+  /// Call IDs the caller cancelled before accept (`call.cancelled`
+  /// on the notify socket). The app listens to this (see `main.dart`)
+  /// and dismisses the matching incoming-call screen immediately
+  /// instead of letting it ring the full 30s.
+  Stream<String> get callCancelled => _callCancelledController.stream;
 
   /// Problems with the notify connection. Emitted on auth failures
   /// and when the escalating retry budget is spent (a slow 60s retry
@@ -351,17 +398,25 @@ class CallService {
     } catch (_) {
       return;
     }
-    if (frame['type'] == 'call.incoming') {
-      try {
-        final incoming = IncomingCall.fromFrame(frame);
-        if (!_incomingController.isClosed) {
-          _incomingController.add(incoming);
+    switch (frame['type']) {
+      case 'call.incoming':
+        try {
+          final incoming = IncomingCall.fromFrame(frame);
+          if (!_incomingController.isClosed) {
+            _incomingController.add(incoming);
+          }
+        } catch (_) {
+          // Malformed frame — ignore.
         }
-      } catch (_) {
-        // Malformed frame — ignore.
-      }
+      case 'call.cancelled':
+        // The caller hung up before the callee answered: dismiss
+        // the incoming-call UI for this call right away.
+        final callId = frame['call_id'] as String?;
+        if (callId != null && !_callCancelledController.isClosed) {
+          _callCancelledController.add(callId);
+        }
+      // The notify endpoint is read-only; anything else is ignored.
     }
-    // The notify endpoint is read-only; anything else is ignored.
   }
 
   void _onNotifyClosed() {
@@ -626,26 +681,41 @@ class CallConnection {
   final String _token;
   final CallService _service;
 
-  /// Google STUN plus the Open Relay Project's free public TURN
-  /// servers as a fallback, so calls can connect across symmetric
-  /// NATs and mobile data (STUN alone cannot relay media). The Open
-  /// Relay Project (openrelayproject.org) is a free public service;
-  /// its demo credentials below are published for anyone to use. If
-  /// call reliability matters long-term, the team should run its own
-  /// TURN server (e.g. coturn) or use a paid provider.
-  static const _iceServers = [
-    {'urls': 'stun:stun.l.google.com:19302'},
-    {
-      'urls': 'turn:openrelay.metered.ca:80',
-      'username': 'openrelayproject',
-      'credential': 'openrelayproject',
-    },
-    {
-      'urls': 'turn:openrelay.metered.ca:443',
-      'username': 'openrelayproject',
-      'credential': 'openrelayproject',
-    },
-  ];
+  /// ICE servers for the peer connection: Google's free public STUN
+  /// servers plus Metered Open Relay TURN servers with time-limited
+  /// static-auth credentials (see [meteredTurnCredentials]), so
+  /// calls can connect across symmetric NATs and mobile data (STUN
+  /// alone cannot relay media).
+  ///
+  /// The old `turn:openrelay.metered.ca` host with the
+  /// `openrelayproject` / `openrelayproject` credentials is dead
+  /// (the hostname resolves to the 192.0.2.1 TEST-NET sinkhole and
+  /// the no-signup credentials are stale) — with TURN dead, phones
+  /// behind carrier NATs never established a media path (ICE stuck
+  /// in "checking", 0 RTP frames). The static-auth host
+  /// `staticauth.openrelay.metered.ca` replaces it; the `?transport=
+  /// tcp` variants are the most firewall-proof (443 TCP looks like
+  /// ordinary HTTPS traffic). Credentials expire an hour after the
+  /// call starts, which is far longer than any call setup takes.
+  /// [expiryUnix] is injectable for tests; pass null for "now + 1h".
+  static List<Map<String, dynamic>> iceServers({int? expiryUnix}) {
+    final expiry =
+        expiryUnix ?? DateTime.now().millisecondsSinceEpoch ~/ 1000 + 3600;
+    final creds = meteredTurnCredentials(expiryUnix: expiry);
+    Map<String, dynamic> turn(String url) => <String, dynamic>{
+      'urls': url,
+      'username': creds['username'],
+      'credential': creds['credential'],
+    };
+    return [
+      {'urls': 'stun:stun.l.google.com:19302'},
+      {'urls': 'stun:stun1.l.google.com:19302'},
+      turn('turn:staticauth.openrelay.metered.ca:80'),
+      turn('turn:staticauth.openrelay.metered.ca:443'),
+      turn('turn:staticauth.openrelay.metered.ca:80?transport=tcp'),
+      turn('turn:staticauth.openrelay.metered.ca:443?transport=tcp'),
+    ];
+  }
 
   WebSocketChannel? _channel;
   StreamSubscription? _subscription;
@@ -660,6 +730,12 @@ class CallConnection {
   /// One of [CallEndReason].
   String endReason = CallEndReason.ended;
 
+  /// Human-readable message for a [CallState.failed] ending, set by
+  /// [_fail] (e.g. the ICE watchdog's "Couldn't establish a media
+  /// connection"). The call screen shows this instead of a generic
+  /// "Call failed" so the user learns what actually went wrong.
+  String? failureMessage;
+
   /// True once the server confirmed a session exists (initiated /
   /// accepted), i.e. `call.end` is meaningful.
   bool _sessionStarted = false;
@@ -670,6 +746,25 @@ class CallConnection {
   final List<RTCIceCandidate> _pendingCandidates = [];
 
   Timer? _ringTimer;
+
+  /// ICE watchdog: started when the remote description is set; if
+  /// ICE is still not connected after [_iceWatchdogTimeout] the call
+  /// fails honestly instead of showing "Connected" forever.
+  Timer? _iceWatchdog;
+  static const _iceWatchdogTimeout = Duration(seconds: 15);
+
+  /// Grace timer for a transient ICE "disconnected": the connection
+  /// may recover on its own, so the call only ends if it is still
+  /// down after [_disconnectGrace].
+  Timer? _disconnectGraceTimer;
+  static const _disconnectGrace = Duration(seconds: 5);
+
+  /// The outgoing ringback tone, played only once the callee's
+  /// client is actually ringing (`call.ringing`) — never before,
+  /// since the callee may be offline. Stopped on accept, end,
+  /// failure and every cleanup path.
+  AudioPlayer? _ringbackPlayer;
+
   bool _disposed = false;
 
   Completer<void>? _initiateCompleter;
@@ -679,9 +774,17 @@ class CallConnection {
   final _errorsController = StreamController<String>.broadcast();
   final _localStreamController = StreamController<MediaStream>.broadcast();
   final _remoteStreamController = StreamController<MediaStream>.broadcast();
+  final _peerRingingController = StreamController<bool>.broadcast();
 
   Stream<CallState> get states => _statesController.stream;
   Stream<String> get errors => _errorsController.stream;
+
+  /// True once the server sent `call.ringing` for this call — the
+  /// callee's client was notified and is ringing. The call screen
+  /// switches its status text from "Calling…" to "Ringing…" on this.
+  /// Fires on [peerRingingChanges]; only meaningful for outgoing calls.
+  bool peerRinging = false;
+  Stream<bool> get peerRingingChanges => _peerRingingController.stream;
 
   /// Fires once with my camera/mic stream (for the local preview).
   Stream<MediaStream> get localStream => _localStreamController.stream;
@@ -791,6 +894,10 @@ class CallConnection {
       if (!_localStreamController.isClosed) {
         _localStreamController.add(stream);
       }
+      // Video calls default to the loudspeaker (standard pattern —
+      // the phone is held away from the ear); voice calls stay on
+      // the earpiece. The manual speaker toggle still works.
+      if (isVideoCall) await setSpeakerOn(true);
     } catch (e) {
       throw ApiException(
         'Could not access the camera/microphone. '
@@ -818,10 +925,29 @@ class CallConnection {
         _sessionStarted = true;
         _complete(_acceptCompleter);
         _onAccepted();
+      case 'call.ringing':
+        // The callee's client was notified and is ringing: show
+        // "Ringing…" (not "Calling…") and start the ringback tone —
+        // only now, since before this the callee may be offline.
+        if (!peerRinging) {
+          peerRinging = true;
+          if (!_peerRingingController.isClosed) {
+            _peerRingingController.add(true);
+          }
+          if (isOutgoing) _startRingback();
+        }
       case 'call.rejected':
-        _finishWithReason(CallEndReason.declined);
+        _finishWithReason(
+          frame['reason'] == 'busy'
+              ? CallEndReason.busy
+              : CallEndReason.declined,
+        );
       case 'call.ended':
         _finishWithReason(CallEndReason.ended);
+      case 'peer_disconnected':
+        // The peer's app died mid-call: end the survivor's screen
+        // instead of leaving it open with the timer running forever.
+        _finishWithReason(CallEndReason.connectionLost);
       case 'call.peer_connected':
         // The peer joined the call group (they are about to accept
         // or reject). No state change needed.
@@ -877,6 +1003,7 @@ class CallConnection {
   void _onAccepted() {
     _ringTimer?.cancel();
     _ringTimer = null;
+    _stopRingback();
     if (_state == CallState.ended || _state == CallState.failed) return;
     _setState(CallState.connecting);
     if (isOutgoing) {
@@ -886,13 +1013,45 @@ class CallConnection {
     }
   }
 
+  /// Start the outgoing ringback tone (looping), owned by this
+  /// connection: it plays only while the peer is ringing and stops
+  /// on accept, end, failure and every cleanup path.
+  Future<void> _startRingback() async {
+    if (_ringbackPlayer != null || _disposed) return;
+    try {
+      final player = AudioPlayer();
+      _ringbackPlayer = player;
+      await player.setReleaseMode(ReleaseMode.loop);
+      await player.play(AssetSource('ringback.mp3'));
+    } catch (_) {
+      // No audio on this device — the call still works.
+      _ringbackPlayer = null;
+    }
+  }
+
+  Future<void> _stopRingback() async {
+    final player = _ringbackPlayer;
+    _ringbackPlayer = null;
+    if (player == null) return;
+    try {
+      await player.stop();
+    } catch (_) {
+      // Already stopped.
+    }
+    try {
+      await player.dispose();
+    } catch (_) {
+      // Already disposed.
+    }
+  }
+
   // ------------------------------------------------------------------
   // WebRTC
   // ------------------------------------------------------------------
 
   Future<void> _createPeerConnection() async {
     if (_pc != null) return;
-    final pc = await createPeerConnection({'iceServers': _iceServers});
+    final pc = await createPeerConnection({'iceServers': iceServers()});
     _pc = pc;
 
     pc.onIceCandidate = (candidate) {
@@ -905,16 +1064,41 @@ class CallConnection {
     };
     pc.onAddStream = (stream) => _setRemoteStream(stream);
     pc.onIceConnectionState = (state) {
+      // Log every ICE transition: with no WebRTC in the dev VM these
+      // logs are the only diagnosis for "no voice" reports.
+      debugPrint('[Call $callId] ICE state: $state');
       if (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
           state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+        // `connected` comes ONLY from here: onTrack fires on SDP
+        // exchange with zero media, so it must never set it.
+        _iceWatchdog?.cancel();
+        _iceWatchdog = null;
+        _disconnectGraceTimer?.cancel();
+        _disconnectGraceTimer = null;
         _setState(CallState.connected);
+      } else if (state ==
+          RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
+        // Transient drops recover on their own (network switch, ...),
+        // so give it a few seconds before ending the call.
+        _disconnectGraceTimer?.cancel();
+        _disconnectGraceTimer = Timer(_disconnectGrace, () {
+          if (_disposed) return;
+          if (_state == CallState.ended || _state == CallState.failed) return;
+          _finishWithReason(CallEndReason.connectionLost);
+        });
       } else if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
-        if (!_errorsController.isClosed) {
+        if (_state == CallState.connected) {
+          // Mid-call ICE failure is terminal — end honestly instead
+          // of leaving a dead call screen up.
+          _finishWithReason(CallEndReason.connectionLost);
+        } else if (!_errorsController.isClosed) {
           _errorsController.add(
             'Connection failed. The call may not work across some '
             'networks without a TURN server.',
           );
         }
+        // Before `connected`, the ICE watchdog ends the call with
+        // its honest message if media never arrives.
       }
     };
 
@@ -934,6 +1118,21 @@ class CallConnection {
     _send({'type': 'call.sdp_offer', 'sdp': offer.toMap()});
   }
 
+  /// Start the ICE watchdog: if ICE is still not connected
+  /// [_iceWatchdogTimeout] after the remote description was set, the
+  /// media path never came up (typically a NAT/TURN problem) — fail
+  /// the call with an honest message instead of showing "Connected"
+  /// (or "Connecting…") forever.
+  void _startIceWatchdog() {
+    _iceWatchdog?.cancel();
+    _iceWatchdog = Timer(_iceWatchdogTimeout, () {
+      if (_disposed) return;
+      if (_state == CallState.ended || _state == CallState.failed) return;
+      if (_state == CallState.connected) return;
+      _fail("Couldn't establish a media connection — check your network");
+    });
+  }
+
   Future<void> _onSdpOffer(Map<String, dynamic> frame) async {
     if (_disposed) return;
     final raw = frame['sdp'];
@@ -945,6 +1144,7 @@ class CallConnection {
         RTCSessionDescription(raw['sdp'] as String?, raw['type'] as String?),
       );
       _remoteDescriptionSet = true;
+      _startIceWatchdog();
       await _flushPendingCandidates();
       final answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
@@ -965,6 +1165,7 @@ class CallConnection {
         RTCSessionDescription(raw['sdp'] as String?, raw['type'] as String?),
       );
       _remoteDescriptionSet = true;
+      _startIceWatchdog();
       await _flushPendingCandidates();
     } catch (_) {
       _fail('Could not set up the call. Please try again.');
@@ -1013,9 +1214,11 @@ class CallConnection {
     if (!_remoteStreamController.isClosed) {
       _remoteStreamController.add(stream);
     }
-    // Media arrived — the call is effectively connected even if the
-    // ICE state callback has not fired yet.
-    if (_state == CallState.connecting) _setState(CallState.connected);
+    // Deliberately no state transition here: onTrack fires on SDP
+    // exchange with ZERO media (observed live: onTrack with ICE
+    // state "new"), so `connected` must come only from the ICE
+    // connected/completed callback — otherwise the screen shows
+    // "Connected" while no voice flows.
   }
 
   // ------------------------------------------------------------------
@@ -1091,7 +1294,15 @@ class CallConnection {
       return;
     }
     if (code == 4008) {
-      // The call is already over server-side.
+      // The call is already over server-side. If accept/initiate is
+      // still pending, fail it now with the honest reason — otherwise
+      // the caller/callee waits the full 15s timeout and gets the
+      // misleading "The server did not answer."
+      _failPendingSetup(
+        _acceptCompleter != null
+            ? 'The caller hung up.'
+            : 'The call ended.',
+      );
       _finishWithReason(CallEndReason.ended);
       return;
     }
@@ -1148,6 +1359,23 @@ class CallConnection {
     _setState(CallState.ended);
   }
 
+  /// Fail any still-pending setup step (`call.initiate` /
+  /// `call.accept`) so `startCall`/`answerCall` throw now instead of
+  /// hanging until the 15s timeout. Called with the specific reason
+  /// by [_onSocketClosed] (4008) and [_fail], and with a generic
+  /// message by [_cleanup] as a backstop — a completer must never be
+  /// dropped uncompleted.
+  void _failPendingSetup([String message = 'The call ended.']) {
+    if (_initiateCompleter != null && !_initiateCompleter!.isCompleted) {
+      _initiateCompleter!.completeError(ApiException(message));
+    }
+    if (_acceptCompleter != null && !_acceptCompleter!.isCompleted) {
+      _acceptCompleter!.completeError(ApiException(message));
+    }
+    _initiateCompleter = null;
+    _acceptCompleter = null;
+  }
+
   void _finishWithReason(String reason) {
     if (_state == CallState.ended || _state == CallState.failed) return;
     endReason = reason;
@@ -1158,7 +1386,9 @@ class CallConnection {
   void _fail(String message) {
     if (_state == CallState.ended || _state == CallState.failed) return;
     endReason = CallEndReason.failed;
+    failureMessage = message;
     if (!_errorsController.isClosed) _errorsController.add(message);
+    _failPendingSetup(message);
     unawaited(_cleanup());
     _setState(CallState.failed);
   }
@@ -1182,8 +1412,12 @@ class CallConnection {
   Future<void> _cleanup() async {
     _ringTimer?.cancel();
     _ringTimer = null;
-    _initiateCompleter = null;
-    _acceptCompleter = null;
+    _iceWatchdog?.cancel();
+    _iceWatchdog = null;
+    _disconnectGraceTimer?.cancel();
+    _disconnectGraceTimer = null;
+    await _stopRingback();
+    _failPendingSetup();
     _pendingCandidates.clear();
     await _subscription?.cancel();
     _subscription = null;
@@ -1238,5 +1472,6 @@ class CallConnection {
     await _errorsController.close();
     await _localStreamController.close();
     await _remoteStreamController.close();
+    await _peerRingingController.close();
   }
 }

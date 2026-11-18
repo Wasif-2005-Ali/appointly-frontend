@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../user_session.dart';
@@ -16,12 +17,20 @@ class ChatRoomInfo {
   final bool isGroup;
   final DateTime? createdAt;
 
+  /// Enriched preview fields from the rooms list (`last_message` +
+  /// `unread_count`). Null on older backends — callers fall back to a
+  /// per-room fetch when they are missing.
+  final ChatApiMessage? lastMessage;
+  final int? unreadCount;
+
   const ChatRoomInfo({
     required this.roomId,
     required this.name,
     required this.participants,
     required this.isGroup,
     required this.createdAt,
+    this.lastMessage,
+    this.unreadCount,
   });
 
   factory ChatRoomInfo.fromJson(Map<String, dynamic> json) => ChatRoomInfo(
@@ -31,9 +40,13 @@ class ChatRoomInfo {
         (json['participants'] as List?)?.map((e) => e.toString()).toList() ??
         const [],
     isGroup: json['is_group'] as bool? ?? false,
-    createdAt: json['created_at'] == null
-        ? null
-        : DateTime.tryParse(json['created_at'] as String),
+    createdAt: ChatApiMessage.parseServerTime(
+      json['created_at'] as String?,
+    ),
+    lastMessage: json['last_message'] is Map<String, dynamic>
+        ? ChatApiMessage.fromJson(json['last_message'] as Map<String, dynamic>)
+        : null,
+    unreadCount: (json['unread_count'] as num?)?.toInt(),
   );
 }
 
@@ -50,6 +63,10 @@ class ChatApiMessage {
   // Media-only fields (image/file messages). Old messages lack them.
   final String? fileName;
   final int? fileSize;
+  // Reply-quote fields (added by the backend alongside `reply_to_id`
+  // / `reply_to_text` on the send frame). Old messages lack them.
+  final String? replyToId;
+  final String? replyToText;
 
   const ChatApiMessage({
     required this.id,
@@ -62,7 +79,21 @@ class ChatApiMessage {
     required this.createdAt,
     this.fileName,
     this.fileSize,
+    this.replyToId,
+    this.replyToText,
   });
+
+  /// Parse a server timestamp defensively: the backend sends UTC ISO
+  /// strings, but if one ever arrives without an offset Dart would
+  /// parse it as local time — shifting the day for PKT users (UTC+5).
+  /// A string with no `Z` or `±hh:mm` offset is assumed to be UTC.
+  /// Pure — unit-tested.
+  static DateTime? parseServerTime(String? raw) {
+    if (raw == null || raw.isEmpty) return null;
+    final hasOffset =
+        raw.endsWith('Z') || RegExp(r'[+-]\d{2}:?\d{2}$').hasMatch(raw);
+    return DateTime.tryParse(hasOffset ? raw : '${raw}Z');
+  }
 
   factory ChatApiMessage.fromJson(Map<String, dynamic> json) {
     final rawId = json['id'];
@@ -78,10 +109,11 @@ class ChatApiMessage {
           (json['read_by'] as List?)?.map((e) => e.toString()).toList() ??
           const [],
       createdAt:
-          DateTime.tryParse(json['created_at'] as String? ?? '') ??
-          DateTime.now(),
+          parseServerTime(json['created_at'] as String?) ?? DateTime.now(),
       fileName: json['file_name'] as String?,
       fileSize: rawSize is num ? rawSize.toInt() : null,
+      replyToId: json['reply_to_id']?.toString(),
+      replyToText: json['reply_to_text'] as String?,
     );
   }
 
@@ -424,9 +456,29 @@ class ChatService {
   /// messages newer than the stamp.
   final Map<String, DateTime> _lastReadAt = {};
 
+  /// Short-lived preview cache (30s TTL): the dashboard badge and
+  /// the inbox both ask for previews, and navigating back from a
+  /// thread refires the fetch — the cache keeps that to one network
+  /// round-trip per window. [_previewFetchInFlight] dedupes
+  /// concurrent callers into a single fetch.
+  Map<String, RoomPreview>? _previewCache;
+  DateTime? _previewCacheAt;
+  Future<Map<String, RoomPreview>>? _previewFetchInFlight;
+  static const _previewCacheTtl = Duration(seconds: 30);
+
   /// Remember that the user has seen this room's messages up to now.
   void markRoomReadLocally(String roomId) {
     _lastReadAt[roomId] = DateTime.now().toUtc();
+    // The cached preview would otherwise keep showing the stale
+    // unread count until the TTL expires.
+    final preview = _previewCache?[roomId];
+    if (preview != null && preview.unreadCount != 0) {
+      _previewCache![roomId] = RoomPreview(
+        roomId: roomId,
+        lastMessage: preview.lastMessage,
+        unreadCount: 0,
+      );
+    }
   }
 
   /// Count unread messages in [messages] for [myId]: messages from
@@ -451,16 +503,65 @@ class ChatService {
   }
 
   /// Fetch a preview for each room: the latest message + unread count.
-  /// Rooms are fetched in parallel; a room that fails to load gets an
-  /// empty preview instead of failing the whole inbox. The messages
-  /// endpoint returns the 50 most recent messages, so the unread count
-  /// is capped at 50 per room — fine for a small number of rooms.
+  ///
+  /// Rooms whose list entry already carries `last_message` +
+  /// `unread_count` (enriched rooms list) need no extra call. Only
+  /// rooms missing those fields fall back to one `listMessages`
+  /// (50 msgs) each, so the inbox stays fast on the new backend and
+  /// still works if the backend change deploys later than the
+  /// client. Results are cached for 30s (see [_previewCache]) and
+  /// concurrent callers share one in-flight fetch. A room that fails
+  /// to load gets an empty preview instead of failing the whole
+  /// inbox. The fallback unread count is capped at 50 per room.
   Future<Map<String, RoomPreview>> fetchRoomPreviews(
+    List<ChatRoomInfo> rooms, {
+    bool forceRefresh = false,
+  }) async {
+    final now = DateTime.now();
+    final cache = _previewCache;
+    final cacheAt = _previewCacheAt;
+    if (!forceRefresh &&
+        cache != null &&
+        cacheAt != null &&
+        now.difference(cacheAt) < _previewCacheTtl &&
+        rooms.every((r) => cache.containsKey(r.roomId))) {
+      return {for (final r in rooms) r.roomId: cache[r.roomId]!};
+    }
+    final inFlight = _previewFetchInFlight;
+    if (inFlight != null && !forceRefresh) return inFlight;
+    final future = _fetchRoomPreviewsFresh(rooms);
+    _previewFetchInFlight = future;
+    try {
+      return await future;
+    } finally {
+      if (identical(_previewFetchInFlight, future)) {
+        _previewFetchInFlight = null;
+      }
+    }
+  }
+
+  Future<Map<String, RoomPreview>> _fetchRoomPreviewsFresh(
     List<ChatRoomInfo> rooms,
   ) async {
     final myId = _myId;
     final entries = await Future.wait(
       rooms.map((room) async {
+        // Enriched entry: trust the list fields. An unread count
+        // above zero with no last message is inconsistent, so fall
+        // through to the per-room fetch for that room.
+        final enriched =
+            room.unreadCount != null &&
+            (room.lastMessage != null || room.unreadCount == 0);
+        if (enriched) {
+          return MapEntry(
+            room.roomId,
+            RoomPreview(
+              roomId: room.roomId,
+              lastMessage: room.lastMessage,
+              unreadCount: room.unreadCount ?? 0,
+            ),
+          );
+        }
         try {
           final page = await listMessages(room.roomId);
           final msgs = page.messages;
@@ -484,15 +585,23 @@ class ChatService {
         }
       }),
     );
-    return Map.fromEntries(entries);
+    final result = Map<String, RoomPreview>.fromEntries(entries);
+    _previewCache = result;
+    _previewCacheAt = DateTime.now();
+    return result;
   }
 
   /// Total unread messages across all my rooms (for the dashboard
-  /// badge). Throws [ApiException] like [listRooms] — callers that
-  /// only show a badge should catch and hide it.
+  /// badge). When the rooms list already carries `unread_count` for
+  /// every room, no per-room fetch is needed at all. Throws
+  /// [ApiException] like [listRooms] — callers that only show a
+  /// badge should catch and hide it.
   Future<int> fetchTotalUnread() async {
     final rooms = await listRooms();
     if (rooms.isEmpty) return 0;
+    if (rooms.every((r) => r.unreadCount != null)) {
+      return rooms.fold<int>(0, (sum, r) => sum + (r.unreadCount ?? 0));
+    }
     final previews = await fetchRoomPreviews(rooms);
     return previews.values.fold<int>(0, (sum, p) => sum + p.unreadCount);
   }
@@ -516,32 +625,45 @@ class ChatService {
 /// Protocol (see backend `chat/consumers.py`):
 /// - Connect: `wss://<host>/ws/chat/<room_id>/?token=<access JWT>`
 ///   (close codes: 4001 bad/expired token, 4003 not a member,
-///   4004 room not found).
+///   4004 room not found — though rejected sockets deliver NO close
+///   frame live, just a TCP drop, so the client also treats a
+///   frameless/null-code drop shortly after connect as auth-suspect).
 /// - Send: `{"type": "chat.message", "content": "…",
-///   "message_type": "text"}` — the server persists the message and
-///   broadcasts it back to the whole room, including the sender.
+///   "message_type": "text", "reply_to_id": "…", "reply_to_text": "…"}`
+///   — the server persists the message and broadcasts it back to the
+///   whole room, including the sender. `reply_to_*` are only sent
+///   when replying.
 /// - Receive: `{"type": "chat.message", "message": {…}}`.
+/// - Read receipts: `{"type": "chat.read", "room_id": "…",
+///   "reader_id": "…"}` — surfaced on [readReceipts].
 /// - History: `{"type": "chat.history", "before": "<iso>|null"}` →
 ///   `{"type": "chat.history", "messages": […]}` (50 max).
 /// - Errors: `{"type": "error", "code": "…", "detail": "…"}`.
 ///
-/// The connection reconnects automatically with escalating delays
-/// (2s, 5s, 10s, 20s, 30s, 30s, 30s — about 2–3 minutes of budget)
-/// when the socket drops unexpectedly; after the budget is spent it
-/// enters [ChatConnectionState.failed] and waits for a manual
-/// [ChatRoomConnection.reconnect]. On a 4001 close it refreshes the
-/// access token through a REST call first. The backend may also
-/// reject the handshake outright (HTTP 403) before any close code is
-/// delivered — that looks like a socket that closed before it ever
-/// connected, so the first retry after such a failure refreshes the
-/// token too, instead of burning all 7 attempts on a dead token.
-/// Manual [ChatRoomConnection.reconnect] always refreshes the token
-/// first, so "Live connection lost" → Reconnect works for a token
-/// that expired mid-thread. The connection is only
-/// reported as connected once the WebSocket handshake is confirmed
-/// (via the channel's `ready` future or the first inbound frame) —
-/// never optimistically — so sends during the handshake window are
-/// refused (and trigger a reconnect) instead of being lost.
+/// Reconnect behaviour (true budget, after the fixes below): the
+/// socket reconnects automatically with escalating delays (2s, 5s,
+/// 10s, 20s, 30s, 30s, 30s — 127s of waiting plus handshake time).
+/// Each failure burns exactly ONE attempt (the socket-closed handler
+/// is deduped: the stream wires both onError and onDone to it).
+/// After the budget is spent the connection enters
+/// [ChatConnectionState.failed] and keeps retrying every 60s
+/// indefinitely (long-tail) while the connection is alive, so it
+/// never silently gives up; the banner stays visible until actually
+/// connected. A manual [ChatRoomConnection.reconnect] (or
+/// [handleAppResumed]) restarts the cycle immediately. On a 4001
+/// close — or an auth-suspect drop — the access token is refreshed
+/// through a REST call (capped at 10s) before the first retry; if
+/// the server rejected the token AND the refresh fails, the session
+/// is reported expired instead of burning the budget on a dead
+/// token. The handshake is capped at 20s (a Render cold start can
+/// otherwise hang silently forever), the socket sends a ping every
+/// 30s so a half-open socket errors promptly, and every send has a
+/// 15s echo timeout reported on [sendTimeouts]. The connection is
+/// only reported as connected once the WebSocket handshake is
+/// confirmed (via the channel's `ready` future or the first inbound
+/// frame) — never optimistically — so sends during the handshake
+/// window are refused (and trigger a reconnect) instead of being
+/// lost.
 class ChatRoomConnection {
   ChatRoomConnection._(this.roomId, String token) : _token = token;
 
@@ -560,15 +682,50 @@ class ChatRoomConnection {
     Duration(seconds: 30),
   ];
 
+  /// How long a handshake may hang (Render cold start) before the
+  /// socket is treated as closed and a reconnect is scheduled.
+  static const _handshakeTimeout = Duration(seconds: 20);
+
+  /// How long a send may wait for its server echo before the send
+  /// is reported failed on [sendTimeouts].
+  static const _echoTimeout = Duration(seconds: 15);
+
+  /// Long-tail retry interval after the escalating budget is spent.
+  static const _longTailInterval = Duration(seconds: 60);
+
+  /// How long the token refresh on the reconnect path may take.
+  static const _refreshTimeout = Duration(seconds: 10);
+
   WebSocketChannel? _channel;
   StreamSubscription? _subscription;
   Timer? _reconnectTimer;
+  Timer? _handshakeTimer;
+  Timer? _longTailTimer;
   bool _closed = false;
   int _attempts = 0;
+
+  /// Whether any frame arrived on the current socket, and when the
+  /// current connect started — used to spot auth-suspect drops.
+  bool _gotFrame = false;
+  DateTime _connectStartedAt = DateTime.now();
+
+  /// True when the last close was an explicit 4001 token rejection.
+  bool _lastCloseWasAuthRejection = false;
+
+  /// True when the server rejected the token and the refresh failed:
+  /// the session is dead and retries must not burn the budget.
+  bool _sessionExpired = false;
+
+  /// Sends awaiting their server echo, oldest first.
+  final List<({String id, String content, Timer timer})> _pendingSends = [];
+  int _sendCounter = 0;
 
   final _messagesController = StreamController<ChatApiMessage>.broadcast();
   final _errorsController = StreamController<String>.broadcast();
   final _statesController = StreamController<ChatConnectionState>.broadcast();
+  final _sendTimeoutsController = StreamController<String>.broadcast();
+  final _readReceiptsController =
+      StreamController<({String roomId, String readerId})>.broadcast();
 
   Completer<List<ChatApiMessage>>? _historyCompleter;
 
@@ -581,6 +738,25 @@ class ChatRoomConnection {
   /// Connection lifecycle events.
   Stream<ChatConnectionState> get states => _statesController.stream;
 
+  /// IDs of my sends whose server echo never arrived within
+  /// [_echoTimeout] (half-open socket). The thread marks the
+  /// matching optimistic message failed, with a tap-to-retry
+  /// affordance.
+  Stream<String> get sendTimeouts => _sendTimeoutsController.stream;
+
+  /// Read receipts broadcast by the server when someone reads the
+  /// room (`chat.read` frames).
+  Stream<({String roomId, String readerId})> get readReceipts =>
+      _readReceiptsController.stream;
+
+  /// Latest lifecycle state (so a late subscriber can read it
+  /// without waiting for the next event).
+  ChatConnectionState _currentState = ChatConnectionState.connecting;
+  ChatConnectionState get currentState => _currentState;
+
+  /// True when the server rejected the token and the refresh failed.
+  bool get sessionExpired => _sessionExpired;
+
   bool get isConnected => !_closed && _connected && _channel != null;
 
   bool _connected = false;
@@ -589,14 +765,25 @@ class ChatRoomConnection {
       .replace(path: '/ws/chat/$roomId/', queryParameters: {'token': _token});
 
   Future<void> _connect() async {
+    if (_closed) return;
     _emit(
       _attempts == 0
           ? ChatConnectionState.connecting
           : ChatConnectionState.reconnecting,
     );
+    _gotFrame = false;
+    _connectStartedAt = DateTime.now();
     WebSocketChannel channel;
     try {
-      channel = WebSocketChannel.connect(_wsUri);
+      // IOWebSocketChannel (not the generic connect): `pingInterval`
+      // makes a half-open socket error promptly instead of losing
+      // messages silently, and `connectTimeout` caps the TCP-level
+      // handshake wait (Render cold start).
+      channel = IOWebSocketChannel.connect(
+        _wsUri,
+        pingInterval: const Duration(seconds: 30),
+        connectTimeout: _handshakeTimeout,
+      );
     } catch (_) {
       _scheduleReconnect();
       return;
@@ -608,6 +795,20 @@ class ChatRoomConnection {
       onDone: _onSocketClosed,
       cancelOnError: false,
     );
+    // Handshake timeout: even with `connectTimeout`, the handshake
+    // can hang silently (measured 30s+ with zero client events, no
+    // banner, no retry). If neither `ready` nor a first frame
+    // arrives in time, treat the socket as closed so the reconnect
+    // loop runs.
+    _handshakeTimer?.cancel();
+    _handshakeTimer = Timer(_handshakeTimeout, () {
+      if (_closed || _connected || !identical(_channel, channel)) return;
+      // Drop the hanging channel WITHOUT awaiting its close — a
+      // hanging sink.close() never completes — then run the normal
+      // closed path so a reconnect is scheduled.
+      unawaited(channel.sink.close().catchError((_) {}));
+      _onSocketClosed();
+    });
     // Do NOT mark the connection live yet: the handshake has not
     // completed. Confirm it via `ready` (or the first inbound frame,
     // see [_onData]) and only then reset the retry budget and report
@@ -630,6 +831,11 @@ class ChatRoomConnection {
     if (_closed || _connected) return;
     _connected = true;
     _attempts = 0;
+    _handshakeTimer?.cancel();
+    _handshakeTimer = null;
+    _longTailTimer?.cancel();
+    _longTailTimer = null;
+    _sessionExpired = false;
     _emit(ChatConnectionState.connected);
   }
 
@@ -644,13 +850,12 @@ class ChatRoomConnection {
     _attempts = 0;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _longTailTimer?.cancel();
+    _longTailTimer = null;
+    _sessionExpired = false;
     await _subscription?.cancel();
     _subscription = null;
-    try {
-      await _channel?.sink.close();
-    } catch (_) {
-      // Already closed.
-    }
+    await _closeSink();
     _channel = null;
     _connected = false;
     await _refreshToken();
@@ -658,22 +863,55 @@ class ChatRoomConnection {
     await _connect();
   }
 
-  /// Force a token refresh through the REST client, which refreshes
-  /// on 401, then read the fresh token for the next handshake. A
-  /// failed refresh is swallowed — the reconnect proceeds with the
-  /// old token and the server rejects it again if it is dead.
-  Future<void> _refreshToken() async {
+  /// Called when the app returns to the foreground: if the socket is
+  /// down, start a fresh reconnect cycle now instead of waiting for
+  /// the next scheduled attempt.
+  void handleAppResumed() {
+    if (_closed || isConnected || _sessionExpired) return;
+    unawaited(reconnect());
+  }
+
+  /// Close the sink without ever hanging: `sink.close()` on a
+  /// half-open channel may never complete, so cap the wait at 3s.
+  /// Never bare-await `sink.close()` anywhere — a hanging close
+  /// wedges [reconnect] and [close] forever.
+  Future<void> _closeSink() async {
+    final channel = _channel;
+    if (channel == null) return;
     try {
-      await ChatService.instance.getRoom(roomId);
-      final fresh = await TokenStorage.instance.accessToken;
-      if (fresh != null && fresh.isNotEmpty) _token = fresh;
+      await channel.sink.close().timeout(
+        const Duration(seconds: 3),
+        onTimeout: () {},
+      );
     } catch (_) {
-      // Refresh failed — reconnect with the old token.
+      // Already closed.
+    }
+  }
+
+  /// Force a token refresh through the REST client, which refreshes
+  /// on 401, then read the fresh token for the next handshake.
+  /// Returns false when the refresh failed (or timed out, capped at
+  /// [_refreshTimeout]) — the caller decides whether to reconnect
+  /// with the old token or report the session expired.
+  Future<bool> _refreshToken() async {
+    try {
+      await ChatService.instance
+          .getRoom(roomId)
+          .timeout(_refreshTimeout);
+      final fresh = await TokenStorage.instance.accessToken;
+      if (fresh != null && fresh.isNotEmpty) {
+        _token = fresh;
+        return true;
+      }
+      return false;
+    } catch (_) {
+      return false;
     }
   }
 
   void _onData(dynamic data) {
     // Any inbound frame proves the handshake completed.
+    _gotFrame = true;
     _markConnected();
     Map<String, dynamic> frame;
     try {
@@ -685,7 +923,17 @@ class ChatRoomConnection {
       case 'chat.message':
         final raw = frame['message'];
         if (raw is Map<String, dynamic>) {
-          _messagesController.add(ChatApiMessage.fromJson(raw));
+          final msg = ChatApiMessage.fromJson(raw);
+          _ackEcho(msg);
+          _messagesController.add(msg);
+        }
+      case 'chat.read':
+        final roomId = frame['room_id'] as String?;
+        final readerId = frame['reader_id']?.toString();
+        if (roomId != null &&
+            readerId != null &&
+            !_readReceiptsController.isClosed) {
+          _readReceiptsController.add((roomId: roomId, readerId: readerId));
         }
       case 'chat.history':
         final completer = _historyCompleter;
@@ -708,12 +956,42 @@ class ChatRoomConnection {
     }
   }
 
+  /// Cancel the echo-timeout timer for my oldest unacked send with
+  /// matching content — the server echo proves it landed. Only
+  /// echoes of my own messages ack a send.
+  void _ackEcho(ChatApiMessage msg) {
+    if (_pendingSends.isEmpty) return;
+    final myId = ChatService.instance._myId;
+    if (myId != null && msg.senderId != myId) return;
+    for (var i = 0; i < _pendingSends.length; i++) {
+      if (_pendingSends[i].content == msg.content) {
+        _pendingSends.removeAt(i).timer.cancel();
+        return;
+      }
+    }
+  }
+
   void _onSocketClosed() {
-    // Capture the close code and the connected flag before dropping
-    // the channel reference.
-    final code = _lastCloseCode;
+    // DEDUPE: the stream wires BOTH onError and onDone to this
+    // handler (with cancelOnError: false), so every failure fires
+    // it twice. The first firing nulls [_channel]; a second firing
+    // sees null and returns, so one failure burns one retry attempt
+    // — not two — and cannot cancel the first firing's timer (which
+    // would kill the promised token refresh).
+    final channel = _channel;
+    if (channel == null) return;
+    int? code;
+    try {
+      code = channel.closeCode;
+    } catch (_) {
+      code = null;
+    }
     final wasConnected = _connected;
+    final gotFrame = _gotFrame;
+    final sinceConnect = DateTime.now().difference(_connectStartedAt);
     _connected = false;
+    _handshakeTimer?.cancel();
+    _handshakeTimer = null;
     _subscription?.cancel();
     _subscription = null;
     _channel = null;
@@ -721,6 +999,7 @@ class ChatRoomConnection {
       _emit(ChatConnectionState.closed);
       return;
     }
+    _lastCloseWasAuthRejection = code == 4001;
     if (code == 4003) {
       _errorsController.add('You are not a member of this chat.');
       _emit(ChatConnectionState.failed);
@@ -731,34 +1010,41 @@ class ChatRoomConnection {
       _emit(ChatConnectionState.failed);
       return;
     }
-    // Handshake failure: the backend closes pre-accept, so the
+    // Handshake failure: the backend may close pre-accept, so the
     // client gets an HTTP 403 and no close code is ever delivered —
-    // the socket closed before it was ever connected. The most
-    // likely cause is a dead token, so refresh it before the first
-    // retry instead of burning the whole budget on the same token.
-    // (A drop after a successful connect is a network problem, not
-    // auth, so it does not refresh.)
-    final handshakeFailed = !wasConnected && code == null && _attempts == 0;
+    // the socket closed before it was ever connected. Live,
+    // rejected sockets deliver NO close frame at all (101 then a
+    // TCP drop at ~10–21s, no code), so the 4001/4003/4004 design
+    // is dead live: treat an abnormal close (null/1006 code)
+    // shortly after connect, or a connect that yielded no frames
+    // before dropping, as auth-suspect and refresh the token before
+    // the first retry — even when the socket had briefly been
+    // connected (`wasConnected` is no longer proof of a good
+    // token). A drop long after a healthy connect is a network
+    // problem, not auth, so it does not refresh.
+    final authSuspect =
+        code == 4001 ||
+        ((code == null || code == 1006) &&
+            (!gotFrame ||
+                sinceConnect < const Duration(seconds: 25) ||
+                !wasConnected));
     _scheduleReconnect(
-      refreshTokenFirst: code == 4001 || handshakeFailed,
+      refreshTokenFirst: authSuspect && _attempts == 0,
     );
-  }
-
-  int? get _lastCloseCode {
-    try {
-      return _channel?.closeCode;
-    } catch (_) {
-      return null;
-    }
   }
 
   void _scheduleReconnect({bool refreshTokenFirst = false}) {
     if (_closed) return;
     if (_attempts >= _retryDelays.length) {
+      // Budget spent: cancel any pending timer first — the exhausted
+      // branch used to emit `failed` without cancelling it, leaving
+      // one zombie _connect ~30s later. The toast comes from the
+      // thread's state listener ONLY — this branch must not also add
+      // to the errors stream, or the user sees two identical toasts.
+      _reconnectTimer?.cancel();
+      _reconnectTimer = null;
       _emit(ChatConnectionState.failed);
-      _errorsController.add(
-        'Live connection lost. Tap Reconnect to try again.',
-      );
+      _startLongTailRetry();
       return;
     }
     final delay = _retryDelays[_attempts];
@@ -767,15 +1053,64 @@ class ChatRoomConnection {
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(delay, () async {
       if (_closed) return;
-      if (refreshTokenFirst) await _refreshToken();
+      if (refreshTokenFirst) {
+        final ok = await _refreshToken();
+        if (!ok && _lastCloseWasAuthRejection) {
+          // The server rejected the token (4001) and the refresh
+          // failed too — the session is dead. Say so honestly
+          // instead of burning the budget on a known-dead token.
+          // (A refresh failure after a merely auth-*suspect* close
+          // may just be the network, so that path still retries
+          // with the old token.)
+          _sessionExpired = true;
+          _reconnectTimer?.cancel();
+          _reconnectTimer = null;
+          _emit(ChatConnectionState.failed);
+          _errorsController.add(
+            'Your session expired. Please log in again.',
+          );
+          return;
+        }
+      }
       if (!_closed) await _connect();
+    });
+  }
+
+  /// Long-tail retry: after the escalating budget is spent, keep
+  /// trying every 60s indefinitely while the connection is alive, so
+  /// the chat never silently gives up. A tick skips while a
+  /// reconnect cycle is already in progress (pending timer or live
+  /// channel). Stops on connect, on manual reconnect, on close, and
+  /// when the session is expired.
+  void _startLongTailRetry() {
+    if (_closed || _sessionExpired || _longTailTimer != null) return;
+    _longTailTimer = Timer.periodic(_longTailInterval, (_) async {
+      if (_closed ||
+          _connected ||
+          _sessionExpired ||
+          _reconnectTimer != null ||
+          _channel != null) {
+        return;
+      }
+      _attempts = 0;
+      await _connect();
     });
   }
 
   /// Send a text message. The server broadcasts it back to the room
   /// (including this client) — callers should render from the
-  /// broadcast, not from this call.
-  Future<void> sendText(String content, {String messageType = 'text'}) async {
+  /// broadcast, not from this call. Returns a local send id: if the
+  /// server echo never arrives within the echo timeout, the id is
+  /// reported on [sendTimeouts] so the UI can mark the optimistic
+  /// message failed. When replying, [replyToId] is the quoted
+  /// message's server id and [replyToText] its snippet — both are
+  /// sent in the frame so the other side renders the quote.
+  Future<String> sendText(
+    String content, {
+    String messageType = 'text',
+    String? replyToId,
+    String? replyToText,
+  }) async {
     final text = content.trim();
     if (text.isEmpty) {
       throw const ApiException('Message must not be empty.');
@@ -784,23 +1119,41 @@ class ChatRoomConnection {
     if (_closed || channel == null || !_connected) {
       // Reconnect-on-send: kick off a fresh attempt instead of
       // silently dropping the message, then refuse loudly so the
-      // caller can tell the user to retry.
+      // caller can queue the message and tell the user honestly.
       unawaited(reconnect());
       throw const ApiException(
-        'Connection lost. Reconnecting — please try again.',
+        'Not connected. Your message will send when reconnected.',
       );
     }
+    final frame = <String, dynamic>{
+      'type': 'chat.message',
+      'content': text,
+      'message_type': messageType,
+    };
+    if (replyToId != null && replyToId.isNotEmpty) {
+      frame['reply_to_id'] = replyToId;
+    }
+    if (replyToText != null && replyToText.isNotEmpty) {
+      frame['reply_to_text'] = replyToText;
+    }
     try {
-      channel.sink.add(
-        jsonEncode({
-          'type': 'chat.message',
-          'content': text,
-          'message_type': messageType,
-        }),
-      );
+      channel.sink.add(jsonEncode(frame));
     } catch (_) {
       throw const ApiException('Could not send the message. Please try again.');
     }
+    // Echo timeout: a half-open socket accepts the send but the echo
+    // never comes back — without this the optimistic bubble sits in
+    // "sending" forever. The timeout is cancelled by [_ackEcho].
+    final sendId =
+        'send_${_sendCounter++}_${DateTime.now().millisecondsSinceEpoch}';
+    final timer = Timer(_echoTimeout, () {
+      _pendingSends.removeWhere((p) => p.id == sendId);
+      if (!_sendTimeoutsController.isClosed) {
+        _sendTimeoutsController.add(sendId);
+      }
+    });
+    _pendingSends.add((id: sendId, content: text, timer: timer));
+    return sendId;
   }
 
   /// Ask the server for message history over the socket (50 max,
@@ -837,6 +1190,7 @@ class ChatRoomConnection {
   }
 
   void _emit(ChatConnectionState state) {
+    _currentState = state;
     if (!_statesController.isClosed) _statesController.add(state);
   }
 
@@ -845,17 +1199,21 @@ class ChatRoomConnection {
   Future<void> close() async {
     _closed = true;
     _reconnectTimer?.cancel();
+    _handshakeTimer?.cancel();
+    _longTailTimer?.cancel();
+    for (final p in _pendingSends) {
+      p.timer.cancel();
+    }
+    _pendingSends.clear();
     await _subscription?.cancel();
     _subscription = null;
-    try {
-      await _channel?.sink.close();
-    } catch (_) {
-      // Already closed.
-    }
+    await _closeSink();
     _channel = null;
     _historyCompleter = null;
     await _messagesController.close();
     await _errorsController.close();
+    await _sendTimeoutsController.close();
+    await _readReceiptsController.close();
     _emit(ChatConnectionState.closed);
     await _statesController.close();
   }
