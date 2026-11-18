@@ -2,10 +2,16 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'app_state.dart';
+import 'database/bd_helper.dart';
 import 'screens/call_screen.dart';
+import 'screens/login_signup_screen.dart';
 import 'screens/splash_screen.dart';
+import 'services/api_client.dart';
+import 'services/auth_service.dart';
 import 'services/call_service.dart';
+import 'theme/app_theme.dart';
 
 /// Global navigator key, so the incoming-call handler in
 /// [_AppointlyRootState] can show the incoming-call dialog from
@@ -15,6 +21,9 @@ final GlobalKey<NavigatorState> appNavigatorKey =
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Fonts are bundled with the app — never fetch them at runtime
+  // (avoids a network dependency on every first paint).
+  GoogleFonts.config.allowRuntimeFetching = false;
   // Do NOT await DB here — let runApp fire immediately so the Flutter
   // engine can paint the splash background before any heavy work.
   // DB is initialised inside SplashScreen.initState() during the animation.
@@ -49,6 +58,10 @@ class _AppointlyRootState extends State<AppointlyRoot> {
   StreamSubscription<IncomingCall>? _incomingSub;
   StreamSubscription<String>? _notifyErrorSub;
   bool _incomingDialogOpen = false;
+  // Last time the session-expiry callback ran: parallel requests can
+  // each trigger it, so repeats within a few seconds are ignored to
+  // avoid rebuilding the login screen under the user's fingers.
+  DateTime? _lastSessionExpiredAt;
   // Last theme-relevant values, so AppState notifications that only
   // change data (appointments, chat badges, ...) do NOT rebuild the
   // whole MaterialApp — only a real theme change does.
@@ -71,6 +84,41 @@ class _AppointlyRootState extends State<AppointlyRoot> {
     // of letting them fail silently.
     _notifyErrorSub = CallService.instance.notifyErrors.listen(
       _onNotifyError,
+    );
+    // If the refresh token is rejected (401) mid-app, the session is
+    // over: clear it and send the user back to login instead of
+    // leaving them on a dead dashboard.
+    ApiClient.onSessionExpired = _onSessionExpired;
+  }
+
+  /// The refresh token was rejected — the session is really over.
+  /// Clears local state and routes to the login screen with an
+  /// explanation. (Transient refresh failures never reach here:
+  /// ApiClient only fires the callback on a 401.)
+  void _onSessionExpired() {
+    final now = DateTime.now();
+    if (_lastSessionExpiredAt != null &&
+        now.difference(_lastSessionExpiredAt!) <
+            const Duration(seconds: 10)) {
+      return;
+    }
+    _lastSessionExpiredAt = now;
+    unawaited(_handleSessionExpired());
+  }
+
+  Future<void> _handleSessionExpired() async {
+    await AuthService.instance.logout();
+    await DBHelper.instance.clearSession();
+    if (!mounted) return;
+    final navigator = appNavigatorKey.currentState;
+    if (navigator == null) return;
+    navigator.pushAndRemoveUntil(
+      MaterialPageRoute(
+        builder: (_) => const LoginScreen(
+          message: 'Your session has expired. Please log in again.',
+        ),
+      ),
+      (route) => false,
     );
   }
 
@@ -109,11 +157,25 @@ class _AppointlyRootState extends State<AppointlyRoot> {
   }
 
   /// An incoming call arrived on the notify socket. Shows the
-  /// accept/decline dialog (unless one is already open or a call is
-  /// already in progress), then acts on the answer.
+  /// accept/decline dialog, then acts on the answer. A second call
+  /// arriving while a dialog is open or a call is in progress is
+  /// auto-declined so its caller gets a busy signal.
   Future<void> _onIncomingCall(IncomingCall incoming) async {
-    if (_incomingDialogOpen) return;
-    if (CallService.instance.hasActiveCall) return;
+    if (_incomingDialogOpen) {
+      // A dialog is already open for another call: reject this one
+      // right away so its caller gets a busy signal instead of
+      // ringing 30s into a no-answer.
+      unawaited(CallService.instance.declineCall(incoming));
+      return;
+    }
+    if (CallService.instance.hasActiveCall) {
+      // Already in a call: reject right away so the caller gets a
+      // busy signal instead of ringing 30s into a no-answer.
+      // declineCall() opens a short-lived socket for this callId and
+      // sends `call.reject` — it never touches the active call.
+      unawaited(CallService.instance.declineCall(incoming));
+      return;
+    }
     final navigator = appNavigatorKey.currentState;
     if (navigator == null) return;
     _incomingDialogOpen = true;
@@ -144,6 +206,7 @@ class _AppointlyRootState extends State<AppointlyRoot> {
 
   @override
   void dispose() {
+    ApiClient.onSessionExpired = null;
     _incomingSub?.cancel();
     _notifyErrorSub?.cancel();
     _appState.dispose();
@@ -190,14 +253,17 @@ class _AppointlyRootState extends State<AppointlyRoot> {
         debugShowCheckedModeBanner: false,
         navigatorKey: appNavigatorKey,
         scrollBehavior: const _SmoothScrollBehavior(),
-        theme: ThemeData(
+        // Base theme from AppTheme (DM Sans text theme, Material 3),
+        // with the dynamic per-mode colours layered on top — so
+        // unstyled text (SnackBars, dialogs) renders in DM Sans
+        // instead of the default Roboto.
+        theme: AppTheme.theme().copyWith(
           scaffoldBackgroundColor: scaffoldBg,
           colorScheme: ColorScheme.fromSeed(
             seedColor: seedColor,
             primary: seedColor,
             brightness: isDark ? Brightness.dark : Brightness.light,
           ),
-          useMaterial3: true,
           drawerTheme: DrawerThemeData(backgroundColor: _appState.cardBg),
         ),
         home: const SplashScreen(),

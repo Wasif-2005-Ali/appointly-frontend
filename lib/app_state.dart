@@ -640,23 +640,27 @@ class AppState extends ChangeNotifier {
   /// Marks expired ACCEPTED appointments as [ApptStatus.completed].
   /// Only `confirmed` (backend: accepted) appointments are completed:
   /// a never-accepted PENDING appointment must stay pending, and
-  /// rejected/cancelled ones are never completed. The completion is
-  /// synced to the server when the backend accepts it (provider-only
-  /// endpoint, so a requester's device keeps it as a local display
-  /// state when the server refuses).
+  /// rejected/cancelled ones are never completed. The server is the
+  /// source of truth: the local state is only marked completed when
+  /// the server complete call SUCCEEDS (complete is provider-only, so
+  /// a requester's device keeps the appointment as accepted instead
+  /// of claiming "completed" while the server says "accepted").
   Future<void> autoCompleteExpired() async {
     bool changed = false;
     for (final a in _appointments) {
       if (a.status != ApptStatus.confirmed) continue;
       if (!a.isExpired) continue;
-      await DBHelper.instance.updateAppointmentStatus(a.id!, ApptStatus.completed);
-      a.status = ApptStatus.completed;
-      changed = true;
+      if (a.id == null) continue;
       try {
         await AppointmentService.instance.completeAppointment(a.id!);
       } on ApiException {
-        // Provider-only endpoint: requesters keep the local state.
+        // Server refused (e.g. requester hitting the provider-only
+        // endpoint, or offline) — leave the local state alone.
+        continue;
       }
+      await DBHelper.instance.updateAppointmentStatus(a.id!, ApptStatus.completed);
+      a.status = ApptStatus.completed;
+      changed = true;
     }
     if (changed) notifyListeners();
   }
@@ -712,7 +716,7 @@ class AppState extends ChangeNotifier {
     final providerId = appt.providerId;
     if (providerId == null || providerId.isEmpty) {
       throw const ApiException(
-          'Enter the provider\'s user ID to book an appointment.');
+          'Please choose a provider to book an appointment.');
     }
     final endsAt =
         appt.dateTime.add(Duration(minutes: _durationMins(appt.duration)));
@@ -747,10 +751,10 @@ class AppState extends ChangeNotifier {
   /// Updates an appointment. The backend decides what is allowed:
   /// - a changed start time → PATCH reschedule (requester only, and only
   ///   while the appointment is pending or accepted; the status is NOT
-  ///   changed by a reschedule, so a `confirmed` status passed in by the
-  ///   reschedule screens is ignored);
+  ///   changed by a reschedule on the server);
   /// - a changed status → the matching status endpoint (see
-  ///   [updateAppointmentStatus]);
+  ///   [updateAppointmentStatus]) — applied as well when the date also
+  ///   changes, instead of being silently dropped;
   /// - anything else (e.g. the cancellation note) is local-only and is
   ///   kept in SQLite + memory, since the API has no such field.
   /// Throws [ApiException] when the backend rejects the change.
@@ -770,9 +774,13 @@ class AppState extends ChangeNotifier {
       // Server is authoritative for times/status; keep the local note.
       _replaceInMemory(
           updated.copyWith(cancellationNote: appt.cancellationNote));
-      return;
-    }
-    if (stored != null && appt.status != stored.status) {
+      // A status change the caller asked for alongside the new time is
+      // applied too (compared against the pre-reschedule status, so a
+      // reschedule alone never triggers a spurious status call).
+      if (appt.status != stored.status) {
+        await updateAppointmentStatus(appt.id!, appt.status);
+      }
+    } else if (stored != null && appt.status != stored.status) {
       await updateAppointmentStatus(appt.id!, appt.status);
     }
     // Local-only fields (notes): persist to SQLite and keep in memory.
@@ -790,9 +798,10 @@ class AppState extends ChangeNotifier {
   /// Changes an appointment's status through the backend:
   /// - `cancelled` → POST cancel (either participant, pending/accepted);
   /// - `confirmed` → POST accept (provider only, pending only);
-  /// - `completed` → POST complete (provider only, accepted only).
-  /// `pending` and `rejected` have no API transition and stay
-  /// local-only. Throws [ApiException] when the backend rejects the change.
+  /// - `completed` → POST complete (provider only, accepted only);
+  /// - `rejected` → POST reject (provider only, pending only).
+  /// `pending` has no API transition and stays local-only.
+  /// Throws [ApiException] when the backend rejects the change.
   Future<void> updateAppointmentStatus(int id, ApptStatus status) async {
     if (status == ApptStatus.cancelled) {
       _replaceInMemory(await AppointmentService.instance.cancelAppointment(id));
@@ -804,6 +813,10 @@ class AppState extends ChangeNotifier {
     }
     if (status == ApptStatus.completed) {
       _replaceInMemory(await AppointmentService.instance.completeAppointment(id));
+      return;
+    }
+    if (status == ApptStatus.rejected) {
+      _replaceInMemory(await AppointmentService.instance.rejectAppointment(id));
       return;
     }
     await DBHelper.instance.updateAppointmentStatus(id, status);
