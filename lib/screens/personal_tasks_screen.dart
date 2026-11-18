@@ -29,8 +29,19 @@ class _PersonalTasksState extends State<PersonalTasksScreen>
   final _searchCtrl  = TextEditingController();
   bool    _searching = false;
 
+  // One-shot entrance pulse — it used to repeat(reverse: true)
+  // forever, rebuilding the FAB at 60fps for the screen's lifetime.
   late final _fabCtrl = AnimationController(vsync: this,
-      duration: const Duration(milliseconds: 600))..repeat(reverse: true);
+      duration: const Duration(milliseconds: 600))..forward();
+
+  @override
+  void initState() {
+    super.initState();
+    // Tasks are persisted in SQLite now — load them once on entry.
+    _store.load().then((_) {
+      if (mounted) setState(() {});
+    });
+  }
 
   @override
   void dispose() { _fabCtrl.dispose(); _searchCtrl.dispose(); super.dispose(); }
@@ -182,7 +193,10 @@ class _PersonalTasksState extends State<PersonalTasksScreen>
         onDelete: () { Navigator.pop(context); _delete(task.id); },
         onEdit:   () { Navigator.pop(context); _showAddSheet(task); },
         onSubtaskToggle: (idx) {
-          setState(() => task.subtasks[idx].done = !task.subtasks[idx].done);
+          setState(() {
+            task.subtasks[idx].done = !task.subtasks[idx].done;
+            _store.save();
+          });
         },
       ),
     );
@@ -399,13 +413,18 @@ class _PersonalTasksState extends State<PersonalTasksScreen>
   Widget _buildTaskList() {
     final grouped = _grouped;
     if (grouped.isEmpty) {
+      // A brand-new user has no tasks at all (the old build shipped
+      // 11 fake samples) — say so honestly instead of "All clear!".
+      final noTasksAtAll = _totalCount == 0;
       return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
         Icon(Icons.check_circle_outline_rounded, size: 64, color: dmTxtSub.withOpacity(0.3)),
         const SizedBox(height: 14),
-        Text('All clear!', style: GoogleFonts.dmSans(
+        Text(noTasksAtAll ? 'No tasks yet' : 'All clear!', style: GoogleFonts.dmSans(
             fontSize: 20, fontWeight: FontWeight.w800, color: dmTxtSub.withOpacity(0.4))),
         const SizedBox(height: 6),
-        Text('No tasks match this filter.', style: GoogleFonts.dmSans(
+        Text(noTasksAtAll
+            ? 'Tap + New Task below to add your first task.'
+            : 'No tasks match this filter.', style: GoogleFonts.dmSans(
             fontSize: 13.5, color: dmTxtSub.withOpacity(0.35))),
       ]));
     }
@@ -602,11 +621,7 @@ class _PersonalTasksState extends State<PersonalTasksScreen>
                             fontWeight: FontWeight.w600, color: dmTxtSub)),
                     const SizedBox(width: 8),
                   ],
-                  if (task.hasReminder)
-                    Icon(Icons.notifications_active_rounded, size: 12,
-                        color: AppColors.warning.withOpacity(0.7)),
                   if (task.repeat != TaskRepeat.none) ...[
-                    if (task.hasReminder) const SizedBox(width: 4),
                     Icon(Icons.repeat_rounded, size: 12, color: dmTxtSub.withOpacity(0.7)),
                   ],
                 ]),
@@ -731,7 +746,6 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
   late TimeOfDay?    _startTime;
   late String        _duration;
   late bool          _hasTime;
-  late bool          _hasReminder;
   late TaskRepeat    _repeat;
   late List<SubTask> _subtasks;
   late List<String>  _tags;
@@ -754,7 +768,6 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
     _startTime   = e?.startTime;
     _duration    = e?.duration    ?? '30 min';
     _hasTime     = e?.hasTime     ?? false;
-    _hasReminder = e?.hasReminder ?? false;
     _repeat      = e?.repeat      ?? TaskRepeat.none;
     _subtasks    = List.from(e?.subtasks ?? []);
     _tags        = List.from(e?.tags ?? []);
@@ -931,7 +944,6 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
       startTime:         _hasTime ? _startTime : null,
       duration:          _duration,
       hasTime:           _hasTime && _startTime != null,
-      hasReminder:       _hasReminder,
       repeat:            _repeat,
       subtasks:          _subtasks,
       tags:              _tags,
@@ -1298,29 +1310,10 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
               ])),
               const SizedBox(height: 14),
               // ── Options row ───────────────────────────────────────────────
+              // NOTE: the old "Reminder" toggle was removed — there is no
+              // notification system, so it promised a reminder that
+              // would never fire.
               Row(children: [
-                // Reminder
-                Expanded(child: GestureDetector(
-                  onTap: () => setState(() => _hasReminder = !_hasReminder),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 180),
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
-                    decoration: BoxDecoration(
-                        color: _hasReminder ? AppColors.warning.withOpacity(0.15) : c.card2,
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: _hasReminder ? AppColors.warning : c.border,
-                            width: _hasReminder ? 1.5 : 1)),
-                    child: Row(mainAxisSize: MainAxisSize.min, children: [
-                      Icon(Icons.notifications_rounded, size: 16,
-                          color: _hasReminder ? AppColors.warning : c.txtSub),
-                      const SizedBox(width: 6),
-                      Text('Reminder', style: GoogleFonts.dmSans(
-                          fontSize: 12, fontWeight: FontWeight.w700,
-                          color: _hasReminder ? AppColors.warning : c.txtSub)),
-                    ]),
-                  ),
-                )),
-                const SizedBox(width: 10),
                 // Repeat
                 Expanded(child: GestureDetector(
                   onTap: () {
@@ -1878,7 +1871,6 @@ class _TaskDetailSheetState extends State<_TaskDetailSheet> {
               _fmtDateFull(task.dueDate!), c.txtSub),
           if (task.hasTime && task.startTime != null) _chip(c, Icons.schedule_rounded,
               '${_fmtTOD(task.startTime!)} · ${task.duration}', c.accent),
-          if (task.hasReminder) _chip(c, Icons.notifications_rounded, 'Reminder set', AppColors.warning),
           if (task.repeat != TaskRepeat.none) _chip(c, task.repeat.icon, task.repeat.label, c.accent),
         ]),
         // Subtasks

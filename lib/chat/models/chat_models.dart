@@ -98,6 +98,11 @@ class ChatMessage {
   final MessageType type;
   MessageStatus status;
   bool isStarred, isDeleted, isForwarded;
+  // True when the send's server echo never arrived (see
+  // ChatRoomConnection.sendTimeouts): the bubble shows a failed
+  // state with a tap-to-retry affordance. Not persisted — a failed
+  // send is retried or dropped in the same session.
+  bool sendFailed;
   ChatMessage? replyTo;
   Map<String, int> reactions;
   String? myReaction;
@@ -148,6 +153,7 @@ class ChatMessage {
     this.isStarred = false,
     this.isDeleted = false,
     this.isForwarded = false,
+    this.sendFailed = false,
     this.replyTo,
     Map<String, int>? reactions,
     this.myReaction,
@@ -164,25 +170,54 @@ class ChatMessage {
 
   /// Maps a backend message to the local model. [currentUserId] is
   /// the logged-in user's ID (as a string) — it decides [fromMe].
-  /// The backend has no replies, reactions, or stars, so those stay
-  /// at their local defaults. Voice notes and shared appointment
+  /// The backend has no reactions or stars, so those stay at their
+  /// local defaults; replies come from the server's `reply_to_*`
+  /// fields when present. Voice notes and shared appointment
   /// cards are detected from the payload: voice notes arrive as
   /// `file` messages whose name starts with `voice_note_` (or ends
   /// in `.m4a`), and appointment shares are text messages starting
   /// with the `📅 Appointment` prefix (see [_parseAppointmentShare]).
+  /// [otherMemberIds] is every other member of the room: in a group
+  /// a message is only `read` once ALL of them read it; in a 1:1
+  /// room that is just the peer. When it is null/empty the old
+  /// any-reader rule is used as a fallback.
   factory ChatMessage.fromApi(
     ChatApiMessage msg, {
     required String? currentUserId,
+    List<String>? otherMemberIds,
   }) {
     final fromMe = currentUserId != null && msg.senderId == currentUserId;
-    // read_by always contains the sender; anyone else means read.
-    final read = fromMe && msg.readBy.any((id) => id != msg.senderId);
+    // read_by always contains the sender; read means every OTHER
+    // member read it (in a 1:1 room: the peer). The old "any other
+    // user" rule was wrong for groups.
+    final others = otherMemberIds
+            ?.where((id) => id != msg.senderId)
+            .toList() ??
+        const <String>[];
+    final read =
+        fromMe &&
+        (others.isNotEmpty
+            ? others.every((id) => msg.readBy.contains(id))
+            : msg.readBy.any((id) => id != msg.senderId));
     final appt = msg.messageType == 'text'
         ? _parseAppointmentShare(msg.content)
         : null;
     final isVoice =
         msg.messageType == 'voice' ||
         (msg.messageType == 'file' && _looksLikeVoiceNote(msg.fileName));
+    // Server reply quote (broadcast `reply_to_id`/`reply_to_text`).
+    // The quoted message's sender is unknown from the quote alone,
+    // so `fromMe` is left false — the thread keeps its richer local
+    // quote for my own echoed sends.
+    final serverReply = (msg.replyToId != null && msg.replyToId!.isNotEmpty)
+        ? ChatMessage(
+            id: msg.replyToId!,
+            text: msg.replyToText ?? '',
+            fromMe: false,
+            time: '',
+            type: MessageType.text,
+          )
+        : null;
     return ChatMessage(
       id: msg.id.isNotEmpty
           ? msg.id
@@ -203,6 +238,7 @@ class ChatMessage {
       status: fromMe
           ? (read ? MessageStatus.read : MessageStatus.delivered)
           : MessageStatus.delivered,
+      replyTo: serverReply,
       fileName: msg.fileName,
       fileSize: msg.fileSize,
       appointmentId: appt?.id,
@@ -271,6 +307,75 @@ class ChatMessage {
     }
     return (id: id, title: title, date: date, time: time);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  DATE SEPARATORS (pure — unit-tested)
+// ─────────────────────────────────────────────────────────────────────────────
+/// Date-separator rules for the thread list, extracted as pure
+/// functions so they are unit-testable.
+///
+/// A message with a null `createdAt` (an old cached row from before
+/// the column existed) must NEVER silently merge into the previous
+/// day's group — that was the "sent 18 Nov, shown under Nov 17" bug.
+/// Instead it takes the effective date of its nearest dated
+/// neighbour (next dated message first, else the previous one), so
+/// it still gets its own separator when the day changes.
+class DateSeparators {
+  /// Effective date of message [i]: its own `createdAt`, or the
+  /// nearest dated neighbour's when its own is null. Null only when
+  /// NO message in [dates] has a date.
+  static DateTime? effectiveDate(List<DateTime?> dates, int i) {
+    final own = dates[i];
+    if (own != null) return own;
+    for (var j = i + 1; j < dates.length; j++) {
+      if (dates[j] != null) return dates[j];
+    }
+    for (var j = i - 1; j >= 0; j--) {
+      if (dates[j] != null) return dates[j];
+    }
+    return null;
+  }
+
+  /// True when a separator belongs above message [i]: above the
+  /// first message, and above the first message of each new
+  /// (effective) day.
+  static bool showSeparator(List<DateTime?> dates, int i) {
+    if (i == 0) return true;
+    final a = effectiveDate(dates, i);
+    final b = effectiveDate(dates, i - 1);
+    if (a == null || b == null) return a != b;
+    final la = a.toLocal();
+    final lb = b.toLocal();
+    return la.year != lb.year || la.month != lb.month || la.day != lb.day;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  RECENT EMOJIS (in-memory — unit-testable via [record]/[recent])
+// ─────────────────────────────────────────────────────────────────────────────
+/// Recently used emojis for the "Recent" tab, tracked in memory for
+/// the session (most recent first, max 16). The tab used to be a
+/// hardcoded static list; it now reflects what was actually sent.
+class RecentEmojis {
+  static const maxRecent = 16;
+
+  static final List<String> _recent = [];
+
+  /// Most recently used emojis, most recent first. Empty until the
+  /// user sends an emoji.
+  static List<String> get recent => List.unmodifiable(_recent);
+
+  static void record(String emoji) {
+    _recent.remove(emoji);
+    _recent.insert(0, emoji);
+    if (_recent.length > maxRecent) {
+      _recent.removeRange(maxRecent, _recent.length);
+    }
+  }
+
+  /// Test-only reset.
+  static void debugReset() => _recent.clear();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

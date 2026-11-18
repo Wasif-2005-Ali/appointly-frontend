@@ -84,6 +84,89 @@ void main() {
     });
   });
 
+  group('ChatApiMessage.parseServerTime', () {
+    test('parses an offset timestamp unchanged', () {
+      final parsed = ChatApiMessage.parseServerTime(
+        '2026-11-18T22:39:00Z',
+      );
+      expect(parsed, DateTime.utc(2026, 11, 18, 22, 39));
+    });
+
+    test('assumes UTC when the timestamp has no offset', () {
+      // A naive string parsed as local time would shift the day for
+      // PKT users (UTC+5) — the date-separator bug. It must parse as
+      // UTC instead.
+      final parsed = ChatApiMessage.parseServerTime('2026-11-18T22:39:00');
+      expect(parsed, DateTime.utc(2026, 11, 18, 22, 39));
+      expect(parsed!.isUtc, isTrue);
+    });
+
+    test('returns null for null or empty input', () {
+      expect(ChatApiMessage.parseServerTime(null), isNull);
+      expect(ChatApiMessage.parseServerTime(''), isNull);
+    });
+  });
+
+  group('ChatApiMessage.fromJson reply fields', () {
+    test('parses reply_to_id and reply_to_text', () {
+      final msg = ChatApiMessage.fromJson({
+        'id': '691a00000000000000000002',
+        'room_id': '5cc143928a5a',
+        'sender_id': '3',
+        'content': 'replying here',
+        'message_type': 'text',
+        'created_at': '2026-11-18T22:40:00Z',
+        'reply_to_id': '691a00000000000000000001',
+        'reply_to_text': 'original message',
+      });
+      expect(msg.replyToId, '691a00000000000000000001');
+      expect(msg.replyToText, 'original message');
+    });
+
+    test('reply fields are null on old messages', () {
+      final msg = ChatApiMessage.fromJson({'id': 'x'});
+      expect(msg.replyToId, isNull);
+      expect(msg.replyToText, isNull);
+    });
+  });
+
+  group('ChatRoomInfo.fromJson enriched fields', () {
+    test('parses last_message and unread_count', () {
+      final room = ChatRoomInfo.fromJson({
+        'room_id': '5cc143928a5a',
+        'name': 'API test chat',
+        'participants': ['2', '3'],
+        'is_group': false,
+        'created_at': '2026-11-16T20:00:00Z',
+        'unread_count': 2,
+        'last_message': {
+          'id': '691a00000000000000000001',
+          'room_id': '5cc143928a5a',
+          'sender_id': '3',
+          'content': 'latest',
+          'message_type': 'text',
+          'read_by': ['3'],
+          'created_at': '2026-11-18T22:39:00Z',
+        },
+      });
+      expect(room.unreadCount, 2);
+      expect(room.lastMessage, isNotNull);
+      expect(room.lastMessage!.content, 'latest');
+    });
+
+    test('enriched fields are null on older backends', () {
+      final room = ChatRoomInfo.fromJson({
+        'room_id': '5cc143928a5a',
+        'name': 'API test chat',
+        'participants': ['2', '3'],
+        'is_group': false,
+        'created_at': '2026-11-16T20:00:00Z',
+      });
+      expect(room.unreadCount, isNull);
+      expect(room.lastMessage, isNull);
+    });
+  });
+
   group('ChatService.countUnread', () {
     ChatApiMessage msg(
       String id,

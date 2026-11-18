@@ -82,6 +82,13 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
 
   final _nameCtrl  = TextEditingController();
   final _notesCtrl = TextEditingController();
+  final _customServiceCtrl = TextEditingController();
+  bool _booking = false;
+  // Autocomplete's field controller + listener, tracked so the
+  // listener is added once instead of on every build (the old code
+  // leaked a listener per build and reset the text each build,
+  // jumping the cursor).
+  TextEditingController? _autoCtrl;
   /// The provider being booked with, picked from the user directory.
   /// The ID is mirrored into [_providerIdCtrl] because the calendar
   /// dialog and the submit path read it from there.
@@ -96,8 +103,10 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
   String _locationType = 'At Home';
   final _locationCtrl = TextEditingController();
 
+  static const _customServiceValue = 'Other (custom)';
   final _services = ['Consultation','Deep Tissue Massage','Hair Coloring',
-    'Physiotherapy','Skin Care Session','Sports Massage','Nail Art'];
+    'Physiotherapy','Skin Care Session','Sports Massage','Nail Art',
+    _customServiceValue];
 
   final _locationTypes = [
     {'label': 'At Home',   'icon': Icons.home_rounded,        'color': const Color(0xFF4A90D9)},
@@ -142,6 +151,22 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
   }
 
   @override
+  void dispose() {
+    _autoCtrl?.removeListener(_syncNameFromAutocomplete);
+    _nameCtrl.dispose();
+    _notesCtrl.dispose();
+    _customServiceCtrl.dispose();
+    _providerIdCtrl.dispose();
+    _locationCtrl.dispose();
+    _cs.dispose();
+    super.dispose();
+  }
+
+  void _syncNameFromAutocomplete() {
+    if (_autoCtrl != null) _nameCtrl.text = _autoCtrl!.text;
+  }
+
+  @override
   Widget build(BuildContext context) {
     AppStateProvider.of(context);
     return Scaffold(
@@ -159,8 +184,12 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
             _dmCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               _dmCardTitle('Client & Service', Icons.person_search_rounded, AppColors.green),
               const SizedBox(height: 16),
-              _dmLabel('Client Name'),
+              _dmLabel('Your Name'),
               _buildClientAutocomplete(context),
+              const SizedBox(height: 6),
+              Text('Your name, as shown to the provider with this booking request.',
+                  style: GoogleFonts.dmSans(fontSize: 11.5, color: dmTxtSub,
+                      fontWeight: FontWeight.w500, height: 1.4)),
               const SizedBox(height: 14),
               _dmLabel('Service Type'),
               _dmFieldBox(DropdownButtonHideUnderline(child: DropdownButton<String>(
@@ -174,6 +203,11 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
                 items: _services.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
                 onChanged: (v) => setState(() => _service = v),
               ))),
+              if (_service == _customServiceValue) ...[
+                const SizedBox(height: 10),
+                _dmField(_customServiceCtrl, 'Enter your service',
+                    Icons.edit_rounded),
+              ],
             ])),
             const SizedBox(height: 14),
             // ── PROVIDER (who this appointment is booked with) ────────────
@@ -334,7 +368,8 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
             ])),
             const SizedBox(height: 24),
             _actionBtn('Book Appointment', Icons.check_circle_outline_rounded,
-                dmBtnGradient[0], dmBtnGradient[1], () async {
+                dmBtnGradient[0], dmBtnGradient[1], _booking ? null : () async {
+                  setState(() => _booking = true);
                   try {
                     await _saveToDb();
                   } on ApiException catch (e) {
@@ -350,6 +385,7 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
                       shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(14)),
                     ));
+                    if (mounted) setState(() => _booking = false);
                     return;
                   }
                   if (!mounted) return;
@@ -366,7 +402,8 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                   ));
                   Navigator.pop(context);
-                }),
+                },
+                busy: _booking),
           ]),
         )),
       ]),
@@ -382,6 +419,21 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
     if (!_dateSelected || !_timeSelected) {
       throw const ApiException('Please choose a date and time first.');
     }
+    // Real validation: an empty name used to silently become
+    // "Unknown Client" and a missing service "Consultation".
+    final clientName = _nameCtrl.text.trim();
+    if (clientName.isEmpty) {
+      throw const ApiException('Please enter your name.');
+    }
+    if (_service == null) {
+      throw const ApiException('Please choose a service.');
+    }
+    final service = _service == _customServiceValue
+        ? _customServiceCtrl.text.trim()
+        : _service!;
+    if (service.isEmpty) {
+      throw const ApiException('Please enter your service.');
+    }
     final dateTime = DateTime(
       _selectedDate.year, _selectedDate.month, _selectedDate.day,
       _selectedTime.hour, _selectedTime.minute,
@@ -390,24 +442,23 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
     switch (_locationType) {
       case 'At Home':   location = 'At Home'; break;
       case 'At Office': location = 'At Office'; break;
-      case 'Online':    location = 'Video Call · Online'; break;
+      // Plain "Online": no meeting link is created, so the old
+      // "Video Call · Online" label promised a call that does not
+      // exist.
+      case 'Online':    location = 'Online'; break;
       default:          location = _locationCtrl.text.trim().isNotEmpty
           ? _locationCtrl.text.trim() : 'Location TBD';
     }
     // The booking API has no service or location fields, so they are
     // folded into the notes the provider sees.
-    final service = _service ?? 'Consultation';
     final extra = _notesCtrl.text.trim();
-    // The booking API has no client-name field, so the typed client
-    // name is folded into the notes (like service/location) — it
+    // The booking API has no client-name field, so the typed name
+    // is folded into the notes (like service/location) — it
     // was previously dropped and never reached the server.
-    final clientName = _nameCtrl.text.trim().isNotEmpty
-        ? _nameCtrl.text.trim()
-        : 'Unknown Client';
     final note = 'Client: $clientName\nService: $service\nLocation: $location'
         '${extra.isEmpty ? '' : '\n$extra'}';
     final appointment = appt_model.Appointment(
-      name       : _nameCtrl.text.trim().isNotEmpty ? _nameCtrl.text.trim() : 'Unknown Client',
+      name       : clientName,
       service    : service,
       dateTime   : dateTime,
       duration   : _selectedDuration,
@@ -491,9 +542,15 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
       },
       onSelected: (s) => _nameCtrl.text = s,
       fieldViewBuilder: (ctx, ctrl, focus, onSubmitted) {
-        // keep controllers in sync
-        ctrl.text = _nameCtrl.text;
-        ctrl.addListener(() => _nameCtrl.text = ctrl.text);
+        // Keep the controllers in sync — but add the listener ONCE
+        // (the old code added one per build and reset ctrl.text on
+        // every build, jumping the cursor while typing).
+        if (_autoCtrl != ctrl) {
+          _autoCtrl?.removeListener(_syncNameFromAutocomplete);
+          _autoCtrl = ctrl;
+          ctrl.addListener(_syncNameFromAutocomplete);
+        }
+        if (ctrl.text != _nameCtrl.text) ctrl.text = _nameCtrl.text;
         return Container(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
           decoration: BoxDecoration(
@@ -691,6 +748,14 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
   }
 
   bool _hasAvailability(DateTime d, AppState appState) {
+    // Leave days offer no slots, and neither do days past the
+    // booking window.
+    if (appState.isOnLeave(d)) return false;
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    if (d.isAfter(today.add(Duration(days: appState.bookingWindowDays)))) {
+      return false;
+    }
     final key = _weekdayKey(d.weekday);
     return (appState.availabilityDays[key] ?? false) &&
         (appState.availabilitySlots[key]?.isNotEmpty ?? false);
@@ -706,6 +771,7 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
       _bookedCount(d) >= appState.maxPerDay;
 
   List<TimeOfDay> _getAvailableSlots(DateTime d, AppState appState) {
+    if (appState.isOnLeave(d)) return const [];
     final key       = _weekdayKey(d.weekday);
     final ranges    = appState.availabilitySlots[key] ?? [];
     final durationM = _durationToMins(widget.selectedDuration);
@@ -731,7 +797,14 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
       return [startM, endM];
     }).toList();
 
-    final allBlocked = [...bookedRanges, ...taskBlocks];
+    // Daily break window — the availability screen promises this
+    // time is blocked every working day, so the slot computation
+    // must honour it.
+    final breakRange = appState.breakRangeMinutes;
+    final breakBlocks =
+        breakRange == null ? <List<int>>[] : [breakRange];
+
+    final allBlocked = [...bookedRanges, ...taskBlocks, ...breakBlocks];
 
     // Past slots on today are not bookable — the backend slots
     // endpoint filters them too, so the local fallback must as well.
@@ -787,6 +860,30 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
     final slots = _selectedDate != null
         ? (_apiSlots ?? _getAvailableSlots(_selectedDate!, appState))
         : <TimeOfDay>[];
+
+    // P12: precompute each day's availability, fullness and booked
+    // count ONCE for the focused month. The old code called
+    // _getAvailableSlots (O(appointments + tasks)) and _bookedCount
+    // (O(appointments)) per grid cell, per build.
+    final monthHasAvail = <DateTime, bool>{};
+    final monthIsFull = <DateTime, bool>{};
+    final monthHasSlots = <DateTime, bool>{};
+    final monthBooked = <DateTime, int>{};
+    final providerMode =
+        widget.providerId != null && widget.providerId!.isNotEmpty;
+    for (var day = 1; day <= daysInMonth; day++) {
+      final date = DateTime(firstDay.year, firstDay.month, day);
+      final isPast = date.isBefore(today);
+      final hasAvail = _hasAvailability(date, appState) && !isPast;
+      monthHasAvail[date] = hasAvail;
+      final isFull = hasAvail && _isFullDay(date, appState);
+      monthIsFull[date] = isFull;
+      monthHasSlots[date] = providerMode
+          ? !isPast
+          : hasAvail && !isFull &&
+              _getAvailableSlots(date, appState).isNotEmpty;
+      monthBooked[date] = hasAvail ? _bookedCount(date) : 0;
+    }
 
     return Dialog(
         backgroundColor: Colors.transparent,
@@ -872,20 +969,13 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
                               final date   = DateTime(_focusedMonth.year, _focusedMonth.month, dayNum);
                               final isPast    = date.isBefore(today);
                               final isToday   = date == today;
-                              final hasAvail  = _hasAvailability(date, appState) && !isPast;
-                              final isFull    = hasAvail && _isFullDay(date, appState);
-                              // In provider mode every future day is tappable
-                              // — the provider's API decides which slots exist
-                              // on it. Otherwise days are gated on my own
-                              // availability, as before.
-                              final providerMode = widget.providerId != null &&
-                                  widget.providerId!.isNotEmpty;
-                              final hasSlots  = providerMode
-                                  ? !isPast
-                                  : hasAvail && !isFull &&
-                                      _getAvailableSlots(date, appState).isNotEmpty;
+                              // Read from the month maps precomputed
+                              // above — no per-cell slot computation.
+                              final hasAvail  = monthHasAvail[date] ?? false;
+                              final isFull    = monthIsFull[date] ?? false;
+                              final hasSlots  = monthHasSlots[date] ?? false;
                               final isSel     = _selectedDate == date;
-                              final bookedN   = hasAvail ? _bookedCount(date) : 0;
+                              final bookedN   = monthBooked[date] ?? 0;
 
                               return GestureDetector(
                                 onTap: hasSlots ? () => _selectDate(date) : null,
@@ -1231,15 +1321,19 @@ class _MyReviewsState extends State<MyReviewsScreen> with DarkMode {
 }
 
 // ─── Shared bottom action button ─────────────────────────────────────────────
-Widget _actionBtn(String label, IconData icon, Color g1, Color g2, VoidCallback onTap) =>
+Widget _actionBtn(String label, IconData icon, Color g1, Color g2, VoidCallback? onTap,
+        {bool busy = false}) =>
     GestureDetector(onTap: onTap,
         child: Container(width: double.infinity, padding: const EdgeInsets.symmetric(vertical: 17),
           decoration: BoxDecoration(gradient: LinearGradient(colors: [g1, g2]),
               borderRadius: BorderRadius.circular(16),
               boxShadow: [BoxShadow(color: g1.withOpacity(0.4), blurRadius: 16, offset: const Offset(0, 6))]),
-          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            Icon(icon, color: Colors.white, size: 20), const SizedBox(width: 10),
-            Text(label, style: GoogleFonts.dmSans(fontSize: 16,
-                fontWeight: FontWeight.w800, color: Colors.white, letterSpacing: -0.3)),
-          ]),
+          child: busy
+              ? const Center(child: SizedBox(width: 22, height: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2.5, color: Colors.white)))
+              : Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                  Icon(icon, color: Colors.white, size: 20), const SizedBox(width: 10),
+                  Text(label, style: GoogleFonts.dmSans(fontSize: 16,
+                      fontWeight: FontWeight.w800, color: Colors.white, letterSpacing: -0.3)),
+                ]),
         ));

@@ -1,12 +1,8 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:crypto/crypto.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import '../models/appointment.dart';
-
-enum RegisterResult { success, emailAlreadyExists, error }
-enum LoginResult    { success, wrongPassword, emailNotFound, error }
 
 class DBHelper {
   DBHelper._();
@@ -23,7 +19,7 @@ class DBHelper {
     final path = join(await getDatabasesPath(), 'appointly.db');
     return openDatabase(
       path,
-      version: 8,
+      version: 9,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -107,6 +103,25 @@ class DBHelper {
       final args = seeds.expand((s) => [s.$1, s.$2]).toList();
       try { await db.delete('appointments', where: where, whereArgs: args); } catch (_) {}
     }
+    if (oldV < 9) {
+      // Personal tasks are now persisted (they used to be in-memory
+      // only and vanished on restart). One JSON row per task.
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS personal_tasks (
+          id      TEXT PRIMARY KEY,
+          user_id INTEGER,
+          data    TEXT NOT NULL
+        )
+      ''');
+      // Index the per-user appointment lookups (getAllAppointments,
+      // insertAppointment's MAX query) instead of full table scans.
+      await db.execute(
+          'CREATE INDEX IF NOT EXISTS idx_appointments_user_id '
+          'ON appointments(user_id)');
+      await db.execute(
+          'CREATE INDEX IF NOT EXISTS idx_personal_tasks_user_id '
+          'ON personal_tasks(user_id)');
+    }
   }
 
   Future<void> _createTables(Database db) async {
@@ -151,50 +166,23 @@ class DBHelper {
         UNIQUE(user_id, key)
       )
     ''');
+    await db.execute('''
+      CREATE TABLE personal_tasks (
+        id      TEXT PRIMARY KEY,
+        user_id INTEGER,
+        data    TEXT NOT NULL
+      )
+    ''');
+    await db.execute(
+        'CREATE INDEX idx_appointments_user_id ON appointments(user_id)');
+    await db.execute(
+        'CREATE INDEX idx_personal_tasks_user_id ON personal_tasks(user_id)');
   }
 
   // ── Auth ──────────────────────────────────────────────────────────────────
-  static String _hash(String pw) => sha256.convert(utf8.encode(pw)).toString();
-
-  Future<RegisterResult> registerUser({
-    required String fullName,
-    required String email,
-    required String password,
-    required String profession,
-  }) async {
-    final db = await database;
-    try {
-      await db.insert('users', {
-        'full_name': fullName.trim(),
-        'email': email.trim().toLowerCase(),
-        'password_hash': _hash(password),
-        'profession': profession.trim(),
-        'created_at': DateTime.now().toIso8601String(),
-      });
-      return RegisterResult.success;
-    } on DatabaseException catch (e) {
-      if (e.isUniqueConstraintError()) return RegisterResult.emailAlreadyExists;
-      return RegisterResult.error;
-    } catch (_) { return RegisterResult.error; }
-  }
-
-  Future<({LoginResult result, Map<String, dynamic>? userRow})> loginUser({
-    required String email,
-    required String password,
-  }) async {
-    final db = await database;
-    try {
-      final rows = await db.query('users',
-          where: 'email = ?',
-          whereArgs: [email.trim().toLowerCase()],
-          limit: 1);
-      if (rows.isEmpty) return (result: LoginResult.emailNotFound, userRow: null);
-      if (rows.first['password_hash'] != _hash(password))
-        return (result: LoginResult.wrongPassword, userRow: null);
-
-      return (result: LoginResult.success, userRow: Map<String, dynamic>.from(rows.first));
-    } catch (_) { return (result: LoginResult.error, userRow: null); }
-  }
+  // NOTE: registration / login run against the backend API now
+  // (AuthService). The old local registerUser/loginUser — which
+  // compared an unsalted SHA-256 hash — were deleted, not fixed.
 
   Future<Map<String, dynamic>?> getUserById(int id) async {
     final db   = await database;
@@ -258,21 +246,9 @@ class DBHelper {
   }
 
   // ── Appointments CRUD (per-user) ───────────────────────────────────────────
-  Future<int> insertAppointment(Appointment a, int userId) async {
-    final db  = await database;
-    // Compute next sequential number for this user
-    final rows = await db.rawQuery(
-      'SELECT MAX(appt_number) as mx FROM appointments WHERE user_id = ?',
-      [userId],
-    );
-    final maxNum = (rows.first['mx'] as int?) ?? 0;
-    a.apptNumber = maxNum + 1;
-
-    final map = a.toMap();
-    map['user_id'] = userId;
-    return db.insert('appointments', map,
-        conflictAlgorithm: ConflictAlgorithm.replace);
-  }
+  // NOTE: insertAppointment / getAppointmentById had no callers and
+  // were deleted. Appointments come from the backend; SQLite only
+  // caches them (getAllAppointments) and holds local-only fields.
 
   Future<List<Appointment>> getAllAppointments(int userId) async {
     final db   = await database;
@@ -283,12 +259,6 @@ class DBHelper {
       orderBy: 'date_time ASC',
     );
     return maps.map(Appointment.fromMap).toList();
-  }
-
-  Future<Appointment?> getAppointmentById(int id) async {
-    final db   = await database;
-    final rows = await db.query('appointments', where: 'id = ?', whereArgs: [id], limit: 1);
-    return rows.isEmpty ? null : Appointment.fromMap(rows.first);
   }
 
   Future<void> updateAppointment(Appointment a) async {
@@ -345,30 +315,91 @@ class DBHelper {
   Future<void> insertOrUpdateSetting(String key, String value) => setSetting(key, value);
 
   Future<void> saveAvailability(int userId, Map<String, bool> days,
-      Map<String, List<List<String>>> slots) async {
+      Map<String, List<List<String>>> slots,
+      {int? maxPerDay,
+      int? bufferMinutes,
+      bool? breakEnabled,
+      String? breakStart,
+      String? breakEnd,
+      int? bookingWindowDays,
+      String? status}) async {
     final db = await database;
-    // Encode as two JSON strings stored in user_settings
-    final daysJson  = days.entries.map((e) => '"${e.key}":${e.value}').join(',');
-    final slotsJson = slots.entries.map((e) {
-      final arr = e.value.map((s) => '["${s[0]}","${s[1]}"]').join(',');
-      return '"${e.key}":[$arr]';
-    }).join(',');
-    await db.insert('user_settings',
-        {'user_id': userId, 'key': 'avail_days',  'value': '{$daysJson}'},
-        conflictAlgorithm: ConflictAlgorithm.replace);
-    await db.insert('user_settings',
-        {'user_id': userId, 'key': 'avail_slots', 'value': '{$slotsJson}'},
-        conflictAlgorithm: ConflictAlgorithm.replace);
+    final batch = db.batch();
+    void put(String key, String value) => batch.insert(
+          'user_settings',
+          {'user_id': userId, 'key': key, 'value': value},
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+    put('avail_days', jsonEncode(days));
+    put('avail_slots', jsonEncode(slots));
+    if (maxPerDay != null) put('avail_max_per_day', '$maxPerDay');
+    if (bufferMinutes != null) put('avail_buffer_minutes', '$bufferMinutes');
+    if (breakEnabled != null) put('avail_break_enabled', breakEnabled ? '1' : '0');
+    if (breakStart != null) put('avail_break_start', breakStart);
+    if (breakEnd != null) put('avail_break_end', breakEnd);
+    if (bookingWindowDays != null) {
+      put('avail_booking_window_days', '$bookingWindowDays');
+    }
+    if (status != null) put('avail_status', status);
+    await batch.commit(noResult: true);
   }
 
   Future<Map<String, dynamic>?> loadAvailability(int userId) async {
     final db = await database;
-    final dRows = await db.query('user_settings',
-        where: 'user_id = ? AND key = ?', whereArgs: [userId, 'avail_days']);
-    final sRows = await db.query('user_settings',
-        where: 'user_id = ? AND key = ?', whereArgs: [userId, 'avail_slots']);
-    if (dRows.isEmpty || sRows.isEmpty) return null;
-    return {'days': dRows.first['value'] as String,
-      'slots': sRows.first['value'] as String};
+    final rows = await db.query('user_settings',
+        where: 'user_id = ? AND key LIKE ?',
+        whereArgs: [userId, 'avail_%']);
+    if (rows.isEmpty) return null;
+    final byKey = <String, String>{
+      for (final r in rows) r['key'] as String: r['value'] as String,
+    };
+    if (!byKey.containsKey('avail_days') ||
+        !byKey.containsKey('avail_slots')) {
+      return null;
+    }
+    return {
+      'days': byKey['avail_days']!,
+      'slots': byKey['avail_slots']!,
+      'maxPerDay': int.tryParse(byKey['avail_max_per_day'] ?? ''),
+      'bufferMinutes': int.tryParse(byKey['avail_buffer_minutes'] ?? ''),
+      'breakEnabled': byKey['avail_break_enabled'] == '1',
+      'breakStart': byKey['avail_break_start'],
+      'breakEnd': byKey['avail_break_end'],
+      'bookingWindowDays':
+          int.tryParse(byKey['avail_booking_window_days'] ?? ''),
+      'status': byKey['avail_status'],
+    };
+  }
+
+  // ── Personal tasks (persisted per user as one JSON row each) ─────────────
+  Future<List<Map<String, dynamic>>> getPersonalTasks(int userId) async {
+    final db = await database;
+    final rows = await db.query('personal_tasks',
+        where: 'user_id = ?', whereArgs: [userId]);
+    final out = <Map<String, dynamic>>[];
+    for (final r in rows) {
+      try {
+        out.add(jsonDecode(r['data'] as String) as Map<String, dynamic>);
+      } catch (_) {
+        // Skip a corrupt row instead of losing the whole list.
+      }
+    }
+    return out;
+  }
+
+  /// Replaces the user's whole task list in one batch.
+  Future<void> savePersonalTasks(
+      int userId, List<Map<String, dynamic>> tasks) async {
+    final db = await database;
+    final batch = db.batch();
+    batch.delete('personal_tasks', where: 'user_id = ?', whereArgs: [userId]);
+    for (final t in tasks) {
+      batch.insert('personal_tasks', {
+        'id': t['id'],
+        'user_id': userId,
+        'data': jsonEncode(t),
+      });
+    }
+    await batch.commit(noResult: true);
   }
 }

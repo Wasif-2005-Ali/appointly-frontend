@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 
+import '../database/bd_helper.dart';
+import '../user_session.dart';
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENUMS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,6 +98,13 @@ class SubTask {
   String title;
   bool   done;
   SubTask({required this.title, this.done = false});
+
+  Map<String, dynamic> toJson() => {'title': title, 'done': done};
+
+  factory SubTask.fromJson(Map<String, dynamic> j) => SubTask(
+        title: j['title'] as String? ?? '',
+        done: j['done'] as bool? ?? false,
+      );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -112,7 +122,6 @@ class PersonalTask {
   String            duration;
   bool              hasTime;
   bool              done;
-  bool              hasReminder;
   TaskRepeat        repeat;
   List<SubTask>     subtasks;
   List<String>      tags;
@@ -131,7 +140,6 @@ class PersonalTask {
     this.duration          = '30 min',
     this.hasTime           = false,
     this.done              = false,
-    this.hasReminder       = false,
     this.repeat            = TaskRepeat.none,
     this.blockAppointments = true,
     List<SubTask>? subtasks,
@@ -143,27 +151,121 @@ class PersonalTask {
 
   int get completedSubtasks => subtasks.where((s) => s.done).length;
   double get subtaskProgress => subtasks.isEmpty ? 0 : completedSubtasks / subtasks.length;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'description': description,
+        'priority': priority.name,
+        'category': category.name,
+        'dueDate': dueDate?.toIso8601String(),
+        'startHour': startTime?.hour,
+        'startMinute': startTime?.minute,
+        'duration': duration,
+        'hasTime': hasTime,
+        'done': done,
+        'repeat': repeat.name,
+        'blockAppointments': blockAppointments,
+        'subtasks': subtasks.map((s) => s.toJson()).toList(),
+        'tags': tags,
+        'createdAt': createdAt.toIso8601String(),
+      };
+
+  factory PersonalTask.fromJson(Map<String, dynamic> j) {
+    T parseEnum<T extends Enum>(List<T> values, String? name, T fallback) =>
+        values.where((v) => v.name == name).firstOrNull ?? fallback;
+    final sh = j['startHour'] as int?;
+    final sm = j['startMinute'] as int?;
+    return PersonalTask(
+      id: j['id'] as String? ?? 'task_${DateTime.now().millisecondsSinceEpoch}',
+      title: j['title'] as String? ?? '',
+      description: j['description'] as String? ?? '',
+      priority: parseEnum(TaskPriority.values, j['priority'] as String?,
+          TaskPriority.medium),
+      category: parseEnum(TaskCategory.values, j['category'] as String?,
+          TaskCategory.personal),
+      dueDate: j['dueDate'] == null
+          ? null
+          : DateTime.tryParse(j['dueDate'] as String),
+      startTime: (sh == null || sm == null)
+          ? null
+          : TimeOfDay(hour: sh, minute: sm),
+      duration: j['duration'] as String? ?? '30 min',
+      hasTime: j['hasTime'] as bool? ?? false,
+      done: j['done'] as bool? ?? false,
+      repeat:
+          parseEnum(TaskRepeat.values, j['repeat'] as String?, TaskRepeat.none),
+      blockAppointments: j['blockAppointments'] as bool? ?? true,
+      subtasks: (j['subtasks'] as List? ?? [])
+          .map((e) => SubTask.fromJson(e as Map<String, dynamic>))
+          .toList(),
+      tags: (j['tags'] as List? ?? []).map((e) => e.toString()).toList(),
+      createdAt: j['createdAt'] == null
+          ? null
+          : DateTime.tryParse(j['createdAt'] as String),
+    );
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  GLOBAL TASK STORE  (in-memory, session-scoped)
-//  Shared between PersonalTasksScreen and NewAppointment's CalendarPickerDialog
+//  GLOBAL TASK STORE  (persisted to SQLite, per user)
+//  Shared between PersonalTasksScreen and NewAppointment's CalendarPickerDialog.
+//  Starts EMPTY — the old build shipped 11 hardcoded sample tasks as the
+//  user's own and lost real tasks on every restart.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class PersonalTaskStore {
   PersonalTaskStore._();
   static final PersonalTaskStore instance = PersonalTaskStore._();
 
-  final List<PersonalTask> _tasks = _defaultTasks();
+  final List<PersonalTask> _tasks = [];
+  bool _loaded = false;
+  bool get loaded => _loaded;
 
   List<PersonalTask> get tasks => List.unmodifiable(_tasks);
 
-  void add(PersonalTask t)    => _tasks.insert(0, t);
-  void remove(String id)      => _tasks.removeWhere((t) => t.id == id);
+  /// Loads the user's persisted tasks once. Safe to call repeatedly.
+  Future<void> load() async {
+    if (_loaded) return;
+    final uid = UserSession.instance.userId;
+    if (uid != null) {
+      final rows = await DBHelper.instance.getPersonalTasks(uid);
+      _tasks
+        ..clear()
+        ..addAll(rows.map(PersonalTask.fromJson));
+      // Newest first, matching the add() order.
+      _tasks.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    }
+    _loaded = true;
+  }
+
+  Future<void> _persist() async {
+    final uid = UserSession.instance.userId;
+    if (uid == null) return;
+    await DBHelper.instance.savePersonalTasks(
+        uid, _tasks.map((t) => t.toJson()).toList());
+  }
+
+  void add(PersonalTask t) {
+    _tasks.insert(0, t);
+    _persist();
+  }
+
+  void remove(String id) {
+    _tasks.removeWhere((t) => t.id == id);
+    _persist();
+  }
+
   void toggle(String id) {
     final idx = _tasks.indexWhere((t) => t.id == id);
-    if (idx != -1) _tasks[idx].done = !_tasks[idx].done;
+    if (idx != -1) {
+      _tasks[idx].done = !_tasks[idx].done;
+      _persist();
+    }
   }
+
+  /// Persists after an in-place edit (e.g. a subtask checkbox toggle).
+  void save() => _persist();
 
   /// Returns overlapping task for a given [start, end) window on [date].
   PersonalTask? conflictFor(DateTime start, DateTime end) {
@@ -210,96 +312,4 @@ class TaskTimeBlock {
   final String   label;
   final bool     isTask;
   const TaskTimeBlock({required this.start, required this.end, required this.label, required this.isTask});
-}
-
-// ── Rich sample data ──────────────────────────────────────────────────────────
-
-List<PersonalTask> _defaultTasks() {
-  final now = DateTime.now();
-  final today    = DateTime(now.year, now.month, now.day);
-  final tomorrow = today.add(const Duration(days: 1));
-  final nextWeek = today.add(const Duration(days: 5));
-  final later    = today.add(const Duration(days: 10));
-
-  return [
-    PersonalTask(
-      id: 't1', title: 'Submit tax documents',
-      description: 'Upload the Q1 financial reports to the portal before deadline.',
-      priority: TaskPriority.urgent, category: TaskCategory.finance,
-      dueDate: today, hasTime: false,
-      tags: ['deadline', 'finance'],
-      subtasks: [
-        SubTask(title: 'Gather receipts', done: true),
-        SubTask(title: 'Fill Form-A', done: true),
-        SubTask(title: 'Upload to portal', done: false),
-      ],
-    ),
-    PersonalTask(
-      id: 't2', title: 'Call insurance company',
-      description: 'Follow up on the pending health policy renewal.',
-      priority: TaskPriority.high, category: TaskCategory.finance,
-      dueDate: today, startTime: const TimeOfDay(hour: 14, minute: 0),
-      duration: '30 min', hasTime: true, hasReminder: true,
-      tags: ['insurance', 'urgent'],
-    ),
-    PersonalTask(
-      id: 't3', title: 'Reply to Mahnoor\'s inquiry',
-      priority: TaskPriority.high, category: TaskCategory.work,
-      dueDate: today, startTime: const TimeOfDay(hour: 16, minute: 30),
-      duration: '15 min', hasTime: true,
-      tags: ['client', 'email'],
-    ),
-    PersonalTask(
-      id: 't4', title: 'Buy clinic supplies',
-      description: 'Order gauze, gloves (L), sanitizer, and cotton rolls.',
-      priority: TaskPriority.medium, category: TaskCategory.shopping,
-      dueDate: tomorrow,
-      subtasks: [
-        SubTask(title: 'Gauze rolls × 4'),
-        SubTask(title: 'Latex gloves (L)'),
-        SubTask(title: 'Hand sanitizer × 2'),
-      ],
-      tags: ['supplies'],
-    ),
-    PersonalTask(
-      id: 't5', title: 'Review client feedback form',
-      priority: TaskPriority.medium, category: TaskCategory.work,
-      dueDate: tomorrow, startTime: const TimeOfDay(hour: 11, minute: 0),
-      duration: '45 min', hasTime: true, repeat: TaskRepeat.weekly,
-      tags: ['review'],
-    ),
-    PersonalTask(
-      id: 't6', title: 'Morning jog — 5 km',
-      priority: TaskPriority.medium, category: TaskCategory.health,
-      dueDate: tomorrow, startTime: const TimeOfDay(hour: 7, minute: 0),
-      duration: '45 min', hasTime: true, repeat: TaskRepeat.daily,
-      hasReminder: true,
-    ),
-    PersonalTask(
-      id: 't7', title: 'Update service pricing page',
-      priority: TaskPriority.medium, category: TaskCategory.work,
-      dueDate: nextWeek, tags: ['website'],
-    ),
-    PersonalTask(
-      id: 't8', title: 'Research new physiotherapy techniques',
-      priority: TaskPriority.low, category: TaskCategory.health,
-      dueDate: nextWeek, tags: ['learning'],
-    ),
-    PersonalTask(
-      id: 't9', title: 'Order business card reprint',
-      priority: TaskPriority.low, category: TaskCategory.work,
-      dueDate: later,
-    ),
-    PersonalTask(
-      id: 't10', title: 'Organize client database',
-      priority: TaskPriority.low, category: TaskCategory.work,
-      done: true, dueDate: today.subtract(const Duration(days: 1)),
-    ),
-    PersonalTask(
-      id: 't11', title: 'Set up appointment reminder automation',
-      priority: TaskPriority.medium, category: TaskCategory.work,
-      done: true, dueDate: today.subtract(const Duration(days: 2)),
-      subtasks: [SubTask(title: 'Configure templates', done: true), SubTask(title: 'Test with dummy client', done: true)],
-    ),
-  ];
 }

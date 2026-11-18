@@ -66,7 +66,7 @@ class _ArchivedChatsScreenState extends State<ArchivedChatsScreen> {
     const SizedBox(height: 18),
     Text('No Archived Chats', style: GoogleFonts.dmSans(fontSize: 18, fontWeight: FontWeight.w700, color: _txtMain)),
     const SizedBox(height: 8),
-    Text('Swipe a chat left to archive it', style: GoogleFonts.dmSans(fontSize: 13, color: _txtSub)),
+    Text('Swipe a chat right to archive it', style: GoogleFonts.dmSans(fontSize: 13, color: _txtSub)),
   ]));
 
   Widget _buildList() => ListView.builder(

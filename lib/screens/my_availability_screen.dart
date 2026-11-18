@@ -18,7 +18,14 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
   final _cs = ValueNotifier<int>(0);
 
   @override
-  void setState(VoidCallback fn) { super.setState(fn); _cs.value++; }
+  void setState(VoidCallback fn) {
+    super.setState(fn);
+    _cs.value++;
+    // Any edit after the initial load marks the form dirty — except
+    // the load itself (guarded by _loaded) and the save-success
+    // reset, which assigns _dirty directly instead of via setState.
+    if (_loaded) _dirty = true;
+  }
 
   late AnimationController _headerCtrl;
   late Animation<double> _headerFade;
@@ -39,7 +46,7 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
     'Sun': [],
   };
 
-  bool _breakEnabled = true;
+  bool _breakEnabled = false;
   String _breakStart = '1:00 PM';
   String _breakEnd   = '2:00 PM';
   int _bufferMinutes = 15;
@@ -48,6 +55,12 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
   int _bookingWindowDays = 30;
   String _status = 'Available';
   String _selectedDay = 'Mon';
+
+  // The in-memory defaults above are demo values — nothing is shown
+  // as real until the saved availability has loaded, and nothing is
+  // saved unless the user actually changed something.
+  bool _loaded = false;
+  bool _dirty = false;
 
   @override
   void initState() {
@@ -62,8 +75,27 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
     WidgetsBinding.instance.addPostFrameCallback((_) => _loadFromAppState());
   }
 
+  int _loadAttempts = 0;
+
   void _loadFromAppState() {
     final appState = AppStateProvider.of(context);
+    if (!appState.availabilityLoaded) {
+      // The schedule is still loading (server wake-up can take a
+      // while) — retry briefly instead of showing demo defaults.
+      // After ~6s give up and show the editor with the starting
+      // values: a brand-new user has no saved availability at all,
+      // and the _dirty guard means nothing is published until they
+      // actually change something.
+      if (_loadAttempts++ < 12) {
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (mounted) _loadFromAppState();
+        });
+        return;
+      }
+      setState(() => _loaded = true);
+      _dirty = false;
+      return;
+    }
     final days  = appState.availabilityDays;
     final slots = appState.availabilitySlots;
     setState(() {
@@ -73,7 +105,20 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
           _slots[k] = v.map((s) => _Slot(s[0], s[1])).toList();
         }
       });
+      // These used to be skipped here, so reopening the screen showed
+      // defaults and saving silently reverted the saved values.
+      _maxPerDay = appState.maxPerDay;
+      _bufferMinutes = appState.bufferMinutes;
+      _breakEnabled = appState.breakEnabled;
+      _breakStart = appState.breakStart;
+      _breakEnd = appState.breakEnd;
+      _bookingWindowDays = appState.bookingWindowDays;
+      _status = appState.availabilityStatus;
+      _loaded = true;
     });
+    // After the setState: the override above marks dirty on every
+    // setState once loaded, so the load must clear it last.
+    _dirty = false;
   }
 
   @override
@@ -86,7 +131,9 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
       value: SystemUiOverlayStyle.light,
       child: Scaffold(
         backgroundColor: dmBg,
-        body: CustomScrollView(slivers: [
+        body: !_loaded
+            ? const Center(child: CircularProgressIndicator())
+            : CustomScrollView(slivers: [
           SliverToBoxAdapter(
             child: SlideTransition(position: _headerSlide,
               child: FadeTransition(opacity: _headerFade, child: _buildHeader())),
@@ -131,7 +178,6 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
               SaveIconButton(
                 size: 42,
                 onSave: () async {
-                  await Future.delayed(const Duration(milliseconds: 400));
                   if (mounted) await _showSaved();
                 },
                 changeSignal: _cs,
@@ -148,14 +194,46 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
                     fontSize: 13, color: Colors.white.withOpacity(0.55))),
             const SizedBox(height: 20),
             Wrap(spacing: 8, runSpacing: 8, children: [
-              _statPill(Icons.calendar_today_rounded, '5 days / week'),
-              _statPill(Icons.schedule_rounded,        '8 hrs / day'),
+              _statPill(Icons.calendar_today_rounded,
+                  '${_days.values.where((v) => v).length} days / week'),
+              _statPill(Icons.schedule_rounded, _avgHoursLabel),
               _statPill(Icons.people_alt_rounded,      'Max $_maxPerDay'),
             ]),
           ]),
         )),
       ]),
     );
+  }
+
+  /// Average bookable hours per enabled day, from the real slots.
+  String get _avgHoursLabel {
+    int totalMins = 0;
+    int enabledDays = 0;
+    _days.forEach((day, enabled) {
+      if (!enabled) return;
+      enabledDays++;
+      for (final slot in _slots[day] ?? const <_Slot>[]) {
+        totalMins += _slotMinutes(slot);
+      }
+    });
+    if (enabledDays == 0) return '0 hrs / day';
+    final avg = totalMins / enabledDays / 60;
+    final rounded = (avg * 2).round() / 2;
+    final label =
+        rounded == rounded.truncateToDouble() ? '${rounded.toInt()}' : '$rounded';
+    return '$label hrs / day';
+  }
+
+  static int _slotMinutes(_Slot slot) {
+    int toMin(String t) {
+      final p = t.split(RegExp(r'[: ]'));
+      int h = int.tryParse(p[0]) ?? 0;
+      final m = int.tryParse(p[1]) ?? 0;
+      if (p.length > 2 && p[2] == 'PM' && h != 12) h += 12;
+      if (p.length > 2 && p[2] == 'AM' && h == 12) h = 0;
+      return h * 60 + m;
+    }
+    return (toMin(slot.end) - toMin(slot.start)).clamp(0, 1440);
   }
 
   Widget _statPill(IconData icon, String label) => Container(
@@ -181,7 +259,7 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
     ];
     return _section(
       title: 'Current Status',
-      subtitle: 'Visible to clients when booking',
+      subtitle: 'Saved with your availability',
       child: Row(children: statuses.map((s) {
         final active = _status == s['label'];
         final c = s['color'] as Color;
@@ -724,6 +802,28 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
   );
 
   Future<void> _persistToAppState() async {
+    // Local validation first: the server rejects overlaps, but the
+    // user deserves the message before a slow round-trip.
+    for (final day in _days.keys) {
+      if (_days[day] != true) continue;
+      final ranges = <List<int>>[];
+      for (final slot in _slots[day] ?? const <_Slot>[]) {
+        if (_slotMinutes(slot) <= 0) {
+          throw ApiException(
+              '$day: a slot ends before (or at) its start time.');
+        }
+        ranges.add([_toMin(slot.start), _toMin(slot.end)]);
+      }
+      ranges.sort((a, b) => a[0].compareTo(b[0]));
+      for (var i = 1; i < ranges.length; i++) {
+        if (ranges[i][0] < ranges[i - 1][1]) {
+          throw ApiException('$day: two time slots overlap.');
+        }
+      }
+    }
+    if (_breakEnabled && _slotMinutes(_Slot(_breakStart, _breakEnd)) <= 0) {
+      throw const ApiException('Break time must end after it starts.');
+    }
     final slotsRaw = <String, List<List<String>>>{};
     _slots.forEach((day, list) {
       slotsRaw[day] = list.map((s) => [s.start, s.end]).toList();
@@ -733,16 +833,47 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
       slots: slotsRaw,
       maxPerDay: _maxPerDay,
       bufferMinutes: _bufferMinutes,
+      breakEnabled: _breakEnabled,
+      breakStart: _breakStart,
+      breakEnd: _breakEnd,
+      bookingWindowDays: _bookingWindowDays,
+      status: _status,
     );
   }
 
+  static int _toMin(String t) {
+    final p = t.split(RegExp(r'[: ]'));
+    int h = int.tryParse(p[0]) ?? 0;
+    final m = int.tryParse(p[1]) ?? 0;
+    if (p.length > 2 && p[2] == 'PM' && h != 12) h += 12;
+    if (p.length > 2 && p[2] == 'AM' && h == 12) h = 0;
+    return h * 60 + m;
+  }
+
   Future<void> _showSaved() async {
+    if (!_dirty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: dmAccent,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        content: Row(children: [
+          const Icon(Icons.check_circle_rounded, color: Colors.white, size: 18),
+          const SizedBox(width: 10),
+          Text('Already up to date — nothing changed', style: GoogleFonts.dmSans(
+              fontWeight: FontWeight.w700, color: Colors.white)),
+        ]),
+      ));
+      return;
+    }
     try {
       await _persistToAppState();
     } on ApiException catch (e) {
       // The backend rejected the schedule (e.g. overlapping slots on
-      // the same day). Show the reason instead of "saved".
-      if (!mounted) return;
+      // the same day). Show the reason instead of "saved" — and
+      // rethrow, so the save button shows its error state instead of
+      // a success tick for a save that failed.
+      if (!mounted) rethrow;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         behavior: SnackBarBehavior.floating,
         backgroundColor: const Color(0xFFE05C5C),
@@ -754,9 +885,11 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
               fontWeight: FontWeight.w700, color: Colors.white))),
         ]),
       ));
-      return;
+      rethrow;
     }
     if (!mounted) return;
+    // Direct assignment: the setState override would re-mark dirty.
+    _dirty = false;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       behavior: SnackBarBehavior.floating,
       backgroundColor: dmAccent,

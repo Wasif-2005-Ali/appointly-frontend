@@ -13,6 +13,8 @@ import '../screens/personal_tasks_screen.dart';
 import '../user_session.dart';
 import '../services/auth_service.dart';
 import '../screens/login_signup_screen.dart';
+import '../chat/chat.dart';
+import '../models/appointment.dart';
 
 class DrawerWidget extends StatelessWidget {
   final String userName;
@@ -22,6 +24,19 @@ class DrawerWidget extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final appState = AppStateProvider.of(context);
+    // Real badge counts from AppState — the old hardcoded "5" / "3"
+    // contradicted the real pending count. No badge when the count
+    // is zero.
+    final myId = UserSession.instance.userId?.toString();
+    final todayCount = appState.appointments
+        .where((a) => a.isToday)
+        .length;
+    final pendingIncoming = appState.appointments
+        .where((a) =>
+            a.providerId != null &&
+            a.providerId == myId &&
+            a.status == ApptStatus.pending)
+        .length;
     return Drawer(
       backgroundColor: appState.cardBg,
       child: Column(children: [
@@ -32,10 +47,11 @@ class DrawerWidget extends StatelessWidget {
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               _lbl("MAIN", appState),
               _item(context, appState, Icons.grid_view_rounded,            "Home",              true,  onTap: () => Navigator.pop(context)),
-              _item(context, appState, Icons.calendar_month_rounded,       "My Appointments",   false, badge: "5", onTap: () { Navigator.pop(context); Navigator.push(context, _route(const MyAppointmentsScreen())); }),
+              _item(context, appState, Icons.calendar_month_rounded,       "My Appointments",   false, badge: todayCount > 0 ? '$todayCount' : null, onTap: () { Navigator.pop(context); Navigator.push(context, _route(const MyAppointmentsScreen())); }),
               _item(context, appState, Icons.person_outline_rounded,       "Profile",           false, onTap: () { Navigator.pop(context); Navigator.push(context, _route(const ProfileScreen())); }),
               _lbl("MANAGE", appState),
-              _item(context, appState, Icons.notifications_none_rounded,   "Incoming Requests", false, badge: "3", onTap: () { Navigator.pop(context); Navigator.push(context, _route(const IncomingRequestsScreen())); }),
+              _item(context, appState, Icons.notifications_none_rounded,   "Incoming Requests", false, badge: pendingIncoming > 0 ? '$pendingIncoming' : null, onTap: () { Navigator.pop(context); Navigator.push(context, _route(const IncomingRequestsScreen())); }),
+              _item(context, appState, Icons.chat_bubble_outline_rounded,    "Messages",          false, onTap: () { Navigator.pop(context); Navigator.push(context, _route(const ChatInboxScreen())); }),
               _item(context, appState, Icons.access_time_rounded,          "My Availability",   false, onTap: () { Navigator.pop(context); Navigator.push(context, _route(const MyAvailabilityScreen())); }),
               _item(context, appState, Icons.star_outline_rounded,         "My Reviews",        false, onTap: () { Navigator.pop(context); Navigator.push(context, _route(const MyReviewsScreen())); }),
               _item(context, appState, Icons.check_circle_outline_rounded, "Personal Tasks",    false, onTap: () { Navigator.pop(context); Navigator.push(context, _route(const PersonalTasksScreen())); }),
@@ -79,52 +95,39 @@ class DrawerWidget extends StatelessWidget {
           const SizedBox(height: 14),
           Row(children: [
             // ── Profile avatar — shows photo if set, otherwise initials ──
-            Stack(children: [
-              CircleAvatar(
-                radius: 26,
-                backgroundColor: appState.accent,
-                child: imgBytes != null
-                  ? ClipOval(
-                      child: Image.memory(
-                        imgBytes,
-                        width: 52,
-                        height: 52,
-                        cacheWidth: 104,
-                        fit: BoxFit.cover,
-                      ),
-                    )
-                  : Text(userInitials, style: GoogleFonts.dmSans(
-                      fontSize: 17, fontWeight: FontWeight.w900, color: Colors.white)),
-              ),
-              Positioned(bottom: 1, right: 1, child: Container(
-                width: 12, height: 12,
-                decoration: BoxDecoration(
-                    color: AppColors.green, shape: BoxShape.circle,
-                    border: Border.all(color: appState.cardBg, width: 2)),
-              )),
-            ]),
+            CircleAvatar(
+              radius: 26,
+              backgroundColor: appState.accent,
+              child: imgBytes != null
+                ? ClipOval(
+                    child: Image.memory(
+                      imgBytes,
+                      width: 52,
+                      height: 52,
+                      cacheWidth: 104,
+                      fit: BoxFit.cover,
+                    ),
+                  )
+                : Text(userInitials, style: GoogleFonts.dmSans(
+                    fontSize: 17, fontWeight: FontWeight.w900, color: Colors.white)),
+            ),
             const SizedBox(width: 12),
             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(userName, style: GoogleFonts.dmSans(
                   fontSize: 15, fontWeight: FontWeight.w800, color: Colors.white, letterSpacing: -0.2)),
               const SizedBox(height: 2),
-              Text('Admin · Appointly', style: GoogleFonts.dmSans(
-                  fontSize: 11.5, color: Colors.white.withOpacity(0.55))),
+              // The user's real profession — the old "Admin · Appointly"
+              // subtitle was hardcoded for everyone.
+              Text(
+                  UserSession.instance.profession.trim().isNotEmpty
+                      ? UserSession.instance.profession.trim()
+                      : 'Appointly',
+                  style: GoogleFonts.dmSans(
+                      fontSize: 11.5, color: Colors.white.withOpacity(0.55))),
             ])),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-              decoration: BoxDecoration(
-                  color: AppColors.green.withOpacity(0.18),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: AppColors.green.withOpacity(0.35))),
-              child: Row(mainAxisSize: MainAxisSize.min, children: [
-                Container(width: 6, height: 6, decoration: const BoxDecoration(color: AppColors.green, shape: BoxShape.circle)),
-                const SizedBox(width: 6),
-                Text('Online', style: GoogleFonts.dmSans(
-                    fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.green)),
-              ]),
-            ),
           ]),
+          // NOTE: no "Online" pill — there is no presence system, so a
+          // permanent Online badge would be a false claim.
         ]),
       ),
     );

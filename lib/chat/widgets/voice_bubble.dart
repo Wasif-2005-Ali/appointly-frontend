@@ -39,6 +39,10 @@ class VoiceBubble extends StatefulWidget {
 }
 
 class _VoiceBubbleState extends State<VoiceBubble> {
+  // Only one voice note plays at a time: every live bubble registers
+  // here, and starting playback pauses all the others.
+  static final Set<_VoiceBubbleState> _registry = {};
+
   AudioPlayer? _player;
   StreamSubscription<Duration>? _durationSub;
   StreamSubscription<Duration>? _positionSub;
@@ -54,13 +58,27 @@ class _VoiceBubbleState extends State<VoiceBubble> {
   bool get _hasAudio => widget.audioUrl != null && widget.audioUrl!.isNotEmpty;
 
   @override
+  void initState() {
+    super.initState();
+    _registry.add(this);
+  }
+
+  @override
   void dispose() {
+    _registry.remove(this);
     _durationSub?.cancel();
     _positionSub?.cancel();
     _stateSub?.cancel();
     _completeSub?.cancel();
     _player?.dispose();
     super.dispose();
+  }
+
+  /// Pause this bubble because another one started playing.
+  void _pauseForOther() {
+    if (_playing) {
+      _player?.pause();
+    }
   }
 
   AudioPlayer _ensurePlayer() {
@@ -95,7 +113,16 @@ class _VoiceBubbleState extends State<VoiceBubble> {
     try {
       if (_playing) {
         await player.pause();
+      } else if (_state == PlayerState.paused) {
+        // Resume mid-note — play(UrlSource) would restart from 0:00.
+        for (final other in List.of(_registry)) {
+          if (other != this) other._pauseForOther();
+        }
+        await player.resume();
       } else {
+        for (final other in List.of(_registry)) {
+          if (other != this) other._pauseForOther();
+        }
         if (_state == PlayerState.completed) {
           await player.seek(Duration.zero);
         }

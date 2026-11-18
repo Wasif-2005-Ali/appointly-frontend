@@ -37,6 +37,11 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
   late Animation<double> _fade;
   late Animation<Offset> _slide;
   int _selectedFilter = 0;
+  // IDs currently being accepted/declined (double-tap guard: the
+  // second tap used to fire a second API call and 409).
+  final Set<int> _busyIds = {};
+  bool _loading = true;
+  bool _loadFailed = false;
 
   /// Requests made TO me, derived from my appointments (I am the provider).
   /// Pending → pending, confirmed (accepted) → accepted, rejected → declined.
@@ -61,9 +66,10 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
             message: a.note.isEmpty ? 'No message.' : a.note,
             avatarColor: a.avatarColor,
             timeAgo: _timeAgo(created),
+            // "New Today" means created on this calendar day — the
+            // old check counted the last 24 hours.
             isNew: a.status == ApptStatus.pending &&
-                created.isAfter(
-                    DateTime.now().subtract(const Duration(hours: 24))),
+                _isCalendarToday(created),
             status: a.status == ApptStatus.confirmed
                 ? RequestStatus.accepted
                 : (a.status == ApptStatus.rejected
@@ -72,6 +78,11 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
           );
         })
         .toList();
+  }
+
+  static bool _isCalendarToday(DateTime t) {
+    final now = DateTime.now();
+    return t.year == now.year && t.month == now.month && t.day == now.day;
   }
 
   static String _timeAgo(DateTime t) {
@@ -83,16 +94,26 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
     return '${diff.inDays} days ago';
   }
 
-  List<IncomingRequest> get _filtered {
-    if (_selectedFilter == 0) return _requests;
-    if (_selectedFilter == 1) return _requests.where((r) => r.status == RequestStatus.pending).toList();
-    if (_selectedFilter == 2) return _requests.where((r) => r.status == RequestStatus.accepted).toList();
-    return _requests.where((r) => r.status == RequestStatus.declined).toList();
+  /// Filters a precomputed request list. The old getter rebuilt the
+  /// whole list from AppState on every access (hero stats + list +
+  /// per-row), making the build O(n²).
+  List<IncomingRequest> _filteredFrom(List<IncomingRequest> all) {
+    if (_selectedFilter == 0) return all;
+    if (_selectedFilter == 1) {
+      return all.where((r) => r.status == RequestStatus.pending).toList();
+    }
+    if (_selectedFilter == 2) {
+      return all.where((r) => r.status == RequestStatus.accepted).toList();
+    }
+    return all.where((r) => r.status == RequestStatus.declined).toList();
   }
 
   @override
   void initState() {
     super.initState();
+    // Post-frame: _refresh reads AppStateProvider, which cannot be
+    // depended on during initState.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _refresh());
     _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 700));
     _fade  = CurvedAnimation(parent: _ctrl, curve: Curves.easeOut);
     _slide = Tween<Offset>(begin: const Offset(0, 0.04), end: Offset.zero)
@@ -103,21 +124,60 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
   @override
   void dispose() { _ctrl.dispose(); super.dispose(); }
 
+  Future<void> _refresh() async {
+    final ok = await AppStateProvider.of(context).loadAppointments();
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _loadFailed = !ok;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     AppStateProvider.of(context);
+    // Compute the request list ONCE per build and pass it down — the
+    // old code rebuilt it in the hero (×3), the empty check, the
+    // list length, and once per row.
+    final requests = _requests;
+    final filtered = _filteredFrom(requests);
     return Scaffold(
       backgroundColor: dmBg,
       body: Column(children: [
-        _buildHero(),
+        _buildHero(requests),
         _buildFilterRow(),
         Expanded(child: SlideTransition(position: _slide, child: FadeTransition(opacity: _fade,
-          child: _filtered.isEmpty ? _emptyState() : _buildList()))),
+          child: _loading
+              ? _loadingState()
+              : _loadFailed && filtered.isEmpty
+                  ? _errorState()
+                  : filtered.isEmpty
+                      ? _emptyState()
+                      : _buildList(filtered)))),
       ]),
     );
   }
 
-  Widget _buildHero() => Container(
+  Widget _loadingState() => const Center(child: CircularProgressIndicator());
+
+  Widget _errorState() => Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+    Container(width: 80, height: 80, decoration: BoxDecoration(color: dmAccent.withOpacity(0.08), shape: BoxShape.circle),
+        child: Icon(Icons.cloud_off_rounded, color: dmAccent.withOpacity(0.4), size: 36)),
+    const SizedBox(height: 16),
+    Text('Couldn\'t load requests', style: GoogleFonts.dmSans(fontSize: 18, fontWeight: FontWeight.w800, color: dmTxtMain)),
+    const SizedBox(height: 6),
+    Text('Check your connection and try again.', style: GoogleFonts.dmSans(fontSize: 14, color: dmTxtSub, fontWeight: FontWeight.w500)),
+    const SizedBox(height: 16),
+    FilledButton(
+      onPressed: () {
+        setState(() => _loading = true);
+        _refresh();
+      },
+      child: const Text('Try again'),
+    ),
+  ]));
+
+  Widget _buildHero(List<IncomingRequest> requests) => Container(
     decoration: BoxDecoration(gradient: LinearGradient(
         begin: Alignment.topLeft, end: Alignment.bottomRight,
         colors: AppStateProvider.of(context).heroGradient)),
@@ -142,11 +202,11 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
           ]),
           const SizedBox(height: 20),
           Row(children: [
-            _hStat('${_requests.where((r)=>r.status==RequestStatus.pending).length}', 'Pending', AppColors.warning),
+            _hStat('${requests.where((r)=>r.status==RequestStatus.pending).length}', 'Pending', AppColors.warning),
             const SizedBox(width: 10),
-            _hStat('${_requests.where((r)=>r.isNew&&r.status==RequestStatus.pending).length}', 'New Today', AppColors.green),
+            _hStat('${requests.where((r)=>r.isNew&&r.status==RequestStatus.pending).length}', 'New Today', AppColors.green),
             const SizedBox(width: 10),
-            _hStat('${_requests.where((r)=>r.status==RequestStatus.accepted).length}', 'Accepted', dmAccent),
+            _hStat('${requests.where((r)=>r.status==RequestStatus.accepted).length}', 'Accepted', dmAccent),
           ]),
         ]),
       )),
@@ -246,13 +306,16 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
     );
   }
 
-  Widget _buildList() => ListView.separated(
-    cacheExtent: 200,
-    physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-    padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
-    itemCount: _filtered.length,
-    separatorBuilder: (_, __) => const SizedBox(height: 12),
-    itemBuilder: (_, i) => _requestCard(_filtered[i]),
+  Widget _buildList(List<IncomingRequest> filtered) => RefreshIndicator(
+    onRefresh: _refresh,
+    child: ListView.separated(
+      cacheExtent: 200,
+      physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
+      itemCount: filtered.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 12),
+      itemBuilder: (_, i) => _requestCard(filtered[i]),
+    ),
   );
 
   Widget _requestCard(IncomingRequest r) {
@@ -338,7 +401,8 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
               Expanded(child: GestureDetector(
                 onTap: () async {
                   final id = r.appointmentId;
-                  if (id == null) return;
+                  if (id == null || _busyIds.contains(id)) return;
+                  setState(() => _busyIds.add(id));
                   try {
                     await AppStateProvider.of(context).rejectAppointment(id);
                   } on ApiException catch (e) {
@@ -350,23 +414,29 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
                       behavior: SnackBarBehavior.floating,
                       shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(14))));
+                  } finally {
+                    if (mounted) setState(() => _busyIds.remove(id));
                   }
                 },
                 child: Container(padding: const EdgeInsets.symmetric(vertical: 11),
                   decoration: BoxDecoration(color: AppColors.danger.withOpacity(0.08),
                       borderRadius: BorderRadius.circular(12),
                       border: Border.all(color: AppColors.danger.withOpacity(0.25))),
-                  child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    Icon(Icons.close_rounded, color: AppColors.danger, size: 16),
-                    const SizedBox(width: 6),
-                    Text('Decline', style: GoogleFonts.dmSans(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.danger)),
-                  ])),
+                  child: _busyIds.contains(r.appointmentId)
+                      ? const Center(child: SizedBox(width: 16, height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.danger)))
+                      : Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                          Icon(Icons.close_rounded, color: AppColors.danger, size: 16),
+                          const SizedBox(width: 6),
+                          Text('Decline', style: GoogleFonts.dmSans(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.danger)),
+                        ])),
               )),
               const SizedBox(width: 10),
               Expanded(child: GestureDetector(
                 onTap: () async {
                   final id = r.appointmentId;
-                  if (id == null) return;
+                  if (id == null || _busyIds.contains(id)) return;
+                  setState(() => _busyIds.add(id));
                   try {
                     await AppStateProvider.of(context).acceptAppointment(id);
                   } on ApiException catch (e) {
@@ -379,6 +449,8 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
                       shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(14))));
                     return;
+                  } finally {
+                    if (mounted) setState(() => _busyIds.remove(id));
                   }
                   if (!context.mounted) return;
                   ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -390,11 +462,14 @@ class _IncomingRequestsScreenState extends State<IncomingRequestsScreen>
                   decoration: BoxDecoration(gradient: LinearGradient(colors: AppStateProvider.of(context).cardGradient(0)),
                       borderRadius: BorderRadius.circular(12),
                       boxShadow: [BoxShadow(color: dmTxtMain.withOpacity(0.4), blurRadius: 8, offset: const Offset(0,3))]),
-                  child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    const Icon(Icons.check_rounded, color: Colors.white, size: 16),
-                    const SizedBox(width: 6),
-                    Text('Accept', style: GoogleFonts.dmSans(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.white)),
-                  ])),
+                  child: _busyIds.contains(r.appointmentId)
+                      ? const Center(child: SizedBox(width: 16, height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)))
+                      : Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                          const Icon(Icons.check_rounded, color: Colors.white, size: 16),
+                          const SizedBox(width: 6),
+                          Text('Accept', style: GoogleFonts.dmSans(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.white)),
+                        ])),
               )),
             ]))
           else const SizedBox(height: 16),

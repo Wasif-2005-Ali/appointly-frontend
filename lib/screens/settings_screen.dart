@@ -8,14 +8,13 @@ import 'dart:typed_data';
 import 'package:file_saver/file_saver.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../app_state.dart';
 import '../database/bd_helper.dart';
 import '../services/auth_service.dart';
-import '../user_session.dart';
 import 'login_signup_screen.dart';
 import '../theme/app_theme.dart';
 import '../theme/theme_selector_screen.dart';
-import '../widgets/save_icon_button.dart';
 
 
 class SettingsScreen extends StatefulWidget {
@@ -30,20 +29,13 @@ class _SettingsScreenState extends State<SettingsScreen>
   late Animation<double> _fade;
   late Animation<Offset> _slide;
 
-  // ── Change signal: notifies SaveIconButton to reset tick → idle on any edit ─
-  final _cs = ValueNotifier<int>(0);
-
-  @override
-  void setState(VoidCallback fn) { super.setState(fn); _cs.value++; }
-
-  bool _notifAppointments = true;
-  bool _notifReminders    = true;
-  bool _notifMessages     = false;
-  bool _notifMarketing    = false;
-  bool _biometrics        = true;
-  bool _twoFactor         = false;
-  String _language = 'English';
-  String _timezone = 'PKT (UTC+5)';
+  // NOTE: the old notification toggles, biometric / 2FA toggles and
+  // Language / Timezone selectors were removed — all local-only,
+  // reset on reopen, and controlling nothing (no notification system,
+  // no local_auth, app is English-only). The fake "Subscription /
+  // Billing / Connected Apps / Booking Link / Delete Account" rows
+  // were removed for the same reason. Every remaining setting saves
+  // immediately through AppState, so there is no Save button.
 
   @override
   void initState() {
@@ -56,7 +48,7 @@ class _SettingsScreenState extends State<SettingsScreen>
   }
 
   @override
-  void dispose() { _ctrl.dispose(); _cs.dispose(); super.dispose(); }
+  void dispose() { _ctrl.dispose(); super.dispose(); }
 
   AppState get _appState => AppStateProvider.of(context);
   bool get _dark     => _appState.isDarkMode;
@@ -70,26 +62,14 @@ class _SettingsScreenState extends State<SettingsScreen>
   // ── JSON Export ───────────────────────────────────────────────────────────
   Future<void> _exportSettings() async {
     final settings = {
-      'appVersion': '9.0',
+      // The real app version (pubspec 1.0.0+1) — the old export
+      // claimed '9.0'.
+      'appVersion': '1.0.0',
       'exportedAt': DateTime.now().toIso8601String(),
       'theme': _appState.themeMode.name,
       'customAccent': _appState.customAccent.value.toRadixString(16).padLeft(8, '0').toUpperCase(),
       'compactView': _appState.compactView,
       'showAccessibilityButton': _appState.showAccessibilityButton,
-      'notifications': {
-        'appointments': _notifAppointments,
-        'reminders': _notifReminders,
-        'messages': _notifMessages,
-        'marketing': _notifMarketing,
-      },
-      'security': {
-        'biometrics': _biometrics,
-        'twoFactor': _twoFactor,
-      },
-      'preferences': {
-        'language': _language,
-        'timezone': _timezone,
-      },
     };
     final jsonStr = const JsonEncoder.withIndent('  ').convert(settings);
     if (!mounted) return;
@@ -277,27 +257,10 @@ class _SettingsScreenState extends State<SettingsScreen>
         _appState.setShowAccessibilityButton(data['showAccessibilityButton'] as bool);
       }
 
-      // Restore screen-local settings
-      final notif = data['notifications'] as Map<String, dynamic>?;
-      final sec   = data['security']     as Map<String, dynamic>?;
-      final pref  = data['preferences']  as Map<String, dynamic>?;
-
-      setState(() {
-        if (notif != null) {
-          _notifAppointments = notif['appointments'] as bool? ?? _notifAppointments;
-          _notifReminders    = notif['reminders']    as bool? ?? _notifReminders;
-          _notifMessages     = notif['messages']     as bool? ?? _notifMessages;
-          _notifMarketing    = notif['marketing']    as bool? ?? _notifMarketing;
-        }
-        if (sec != null) {
-          _biometrics = sec['biometrics'] as bool? ?? _biometrics;
-          _twoFactor  = sec['twoFactor']  as bool? ?? _twoFactor;
-        }
-        if (pref != null) {
-          _language = pref['language'] as String? ?? _language;
-          _timezone = pref['timezone'] as String? ?? _timezone;
-        }
-      });
+      // Older exports also carried notifications / security /
+      // preferences keys — those settings no longer exist, so they
+      // are ignored on import.
+      setState(() {});
 
       _snack('Settings restored successfully ✓');
     } catch (_) {
@@ -320,24 +283,8 @@ class _SettingsScreenState extends State<SettingsScreen>
               physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
               padding: const EdgeInsets.fromLTRB(16, 20, 16, 40),
               child: Column(children: [
-                _section('Notifications', Icons.notifications_outlined, _accent, [
-                  _tog('New Appointments', 'Get notified for bookings',       _notifAppointments, _accent, (v)=>setState(()=>_notifAppointments=v)),
-                  _div(),
-                  _tog('Reminders',        'Appointment reminders 1hr before', _notifReminders,    _accent, (v)=>setState(()=>_notifReminders=v)),
-                  _div(),
-                  _tog('Messages',         'Client messages & chat',           _notifMessages,     _accent, (v)=>setState(()=>_notifMessages=v)),
-                  _div(),
-                  _tog('Marketing',        'Tips, offers & product updates',   _notifMarketing,    _accent, (v)=>setState(()=>_notifMarketing=v)),
-                ]),
-                const SizedBox(height: 16),
-                _section('Privacy & Security', Icons.security_outlined, AppColors.green, [
-                  _tog('Biometric Login', 'Fingerprint or Face ID',     _biometrics, AppColors.green, (v)=>setState(()=>_biometrics=v)),
-                  _div(),
-                  _tog('Two-Factor Auth', 'Extra SMS verification step', _twoFactor,  AppColors.green, (v)=>setState(()=>_twoFactor=v)),
-                  _div(),
-                  _tap('Change Password', Icons.lock_outline_rounded,   'Update your password',   AppColors.green, ()=>_snack('Change Password')),
-                  _div(),
-                  _tap('Privacy Policy',  Icons.policy_outlined,        'View our data practices', AppColors.green, ()=>_snack('Privacy Policy')),
+                _section('Privacy', Icons.policy_outlined, AppColors.green, [
+                  _tap('Privacy Policy',  Icons.policy_outlined,        'View our data practices', AppColors.green, _openPrivacyPolicy),
                 ]),
                 const SizedBox(height: 16),
                 _section('Appearance', Icons.palette_outlined, _accent, [
@@ -407,24 +354,10 @@ class _SettingsScreenState extends State<SettingsScreen>
                   ),
                 ]),
                 const SizedBox(height: 16),
-                _section('Preferences', Icons.tune_rounded, AppColors.warning, [
-                  _drop('Language', _language, ['English','Urdu','Arabic'], (v)=>setState(()=>_language=v!)),
-                  _div(),
-                  _drop('Timezone',  _timezone, ['PKT (UTC+5)','GST (UTC+4)','UTC','EST (UTC-5)'], (v)=>setState(()=>_timezone=v!)),
-                  _div(),
-                  _tap('Booking Link', Icons.link_rounded, 'appointly.pk/${UserSession.instance.fullName.trim().toLowerCase().replaceAll(' ', '')}', AppColors.warning, () { Clipboard.setData(ClipboardData(text: 'https://appointly.pk/${UserSession.instance.fullName.trim().toLowerCase().replaceAll(" ", "")}')); _snack('Booking link copied ✓'); }),
-                ]),
-                const SizedBox(height: 16),
                 _section('Account', Icons.manage_accounts_outlined, _accent, [
-                  _tap('Subscription Plan',  Icons.workspace_premium_rounded, 'Pro Plan · Active',       _accent, ()=>_snack('Manage Subscription')),
-                  _div(),
-                  _tap('Billing & Payments', Icons.credit_card_rounded,       'Manage payment methods',  _accent, ()=>_snack('Billing')),
-                  _div(),
                   _tap('Export Settings',    Icons.download_rounded,          'Save your settings as JSON',  _accent, () => _exportSettings()),
                   _div(),
                   _tap('Restore Settings',   Icons.restore_rounded,           'Apply settings from JSON',    AppColors.green, () => _importSettings()),
-                  _div(),
-                  _tap('Connected Apps',     Icons.apps_rounded,              'Google Calendar, WhatsApp',_accent, ()=>_snack('Connected Apps')),
                 ]),
                 const SizedBox(height: 16),
                 _dangerSection(),
@@ -450,14 +383,9 @@ class _SettingsScreenState extends State<SettingsScreen>
         const SizedBox(width: 14),
         Expanded(child: Text('Settings', style: GoogleFonts.dmSans(
             fontSize: 18, fontWeight: FontWeight.w800, color: Colors.white, letterSpacing: -0.3))),
-        SaveIconButton(
-          changeSignal: _cs,
-          // FIX: white logo so it's visible on the dark gradient header
-          foregroundColor: Colors.white,
-          onSave: () async {
-            await Future.delayed(const Duration(milliseconds: 600));
-          },
-        ),
+        // No Save button: every setting here saves immediately
+        // through AppState. The old button delayed 600ms and saved
+        // nothing.
       ]),
     )),
   );
@@ -545,26 +473,6 @@ class _SettingsScreenState extends State<SettingsScreen>
         ),
       );
 
-  Widget _drop(String label, String val, List<String> items, ValueChanged<String?> cb) =>
-      Padding(padding: const EdgeInsets.symmetric(vertical: 6),
-        child: Row(children: [
-          Expanded(child: Text(label, style: GoogleFonts.dmSans(
-              fontSize: 14, fontWeight: FontWeight.w700, color: _txtMain))),
-          Container(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(color: _accent.withOpacity(0.08),
-                borderRadius: BorderRadius.circular(12), border: Border.all(color: _accent.withOpacity(0.2))),
-            child: DropdownButtonHideUnderline(child: DropdownButton<String>(
-              value: val, isDense: true,
-              icon: Icon(Icons.expand_more_rounded, color: _accent, size: 16),
-              style: GoogleFonts.dmSans(fontSize: 13, fontWeight: FontWeight.w600, color: _accent),
-              dropdownColor: _cardBg,
-              items: items.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
-              onChanged: cb,
-            )),
-          ),
-        ]),
-      );
-
   Widget _dangerSection() => Container(
     padding: const EdgeInsets.all(20),
     decoration: BoxDecoration(color: _cardBg, borderRadius: BorderRadius.circular(20),
@@ -581,9 +489,9 @@ class _SettingsScreenState extends State<SettingsScreen>
       ]),
       const SizedBox(height: 16),
       GestureDetector(onTap: _logoutDialog, child: _dangerRow('Log Out', Icons.logout_rounded, 'Sign out of Appointly')),
-      _div(),
-      GestureDetector(onTap: ()=>_snack('Contact support to delete account'),
-          child: _dangerRow('Delete Account', Icons.delete_forever_rounded, 'Permanently remove your data')),
+      // No "Delete Account" row: no delete endpoint exists, and the
+      // old row just showed a snackbar naming support it never
+      // identified. It returns if a real delete flow ships.
     ]),
   );
 
@@ -609,12 +517,23 @@ class _SettingsScreenState extends State<SettingsScreen>
   );
 
   void _snack(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-    content: Text(msg, style: GoogleFonts.dmSans(fontWeight: FontWeight.w600, color: _txtMain)),
-    backgroundColor: _cardBg,
+    content: Text(msg, style: GoogleFonts.dmSans(fontWeight: FontWeight.w600, color: Colors.white)),
+    backgroundColor: _accent,
     behavior: SnackBarBehavior.floating,
     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
     duration: const Duration(seconds: 2),
   ));
+
+  /// Opens the real privacy policy hosted by the backend.
+  Future<void> _openPrivacyPolicy() async {
+    final uri = Uri.parse('https://appointly-backend-dogk.onrender.com/privacy/');
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } else {
+      if (!mounted) return;
+      _snack('Could not open the privacy policy');
+    }
+  }
 
   void _logoutDialog() => showDialog(context: context, builder: (ctx) => AlertDialog(
     backgroundColor: _cardBg,
@@ -629,7 +548,6 @@ class _SettingsScreenState extends State<SettingsScreen>
           Navigator.pop(ctx);
           await AuthService.instance.logout();
           await DBHelper.instance.clearSession();
-          UserSession.instance.clear();
           if (!mounted) return;
           Navigator.pushAndRemoveUntil(
             context,

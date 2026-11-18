@@ -171,7 +171,10 @@ class _RequestDetailScreenState extends State<RequestDetailScreen> with DarkMode
           const Spacer(),
           Text('Request Details', style: GoogleFonts.dmSans(fontSize: 18, fontWeight: FontWeight.w800, color: Colors.white, letterSpacing: -0.3)),
           const Spacer(),
-          _glass(child: const Icon(Icons.more_horiz_rounded, color: Colors.white, size: 20)),
+          // No action button here: the old "more" icon had no
+          // GestureDetector and did nothing. The spacer keeps the
+          // title centred.
+          const SizedBox(width: 42),
         ]),
       )),
     ]),
@@ -227,6 +230,50 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
   @override
   void initState() { super.initState(); _appt = widget.appointment; }
 
+  /// Opens the reschedule screen directly (also used by the cancel
+  /// sheet's "Reschedule instead" action).
+  void _openReschedule(AppState appState) {
+    Navigator.push(
+      context,
+      PageRouteBuilder(
+        pageBuilder: (_, __, ___) => RescheduleScreen(
+          appointment: _appt,
+          onConfirm: (newDt, {String note = ''}) async {
+            // Reschedule only: a reschedule does not change the
+            // status on the server, so no status is passed here.
+            final updated = _appt.copyWith(
+                dateTime: newDt,
+                cancellationNote: note);
+            await appState.updateAppointment(updated);
+            if (!mounted) return;
+            // The server is authoritative for the status: a
+            // reschedule does NOT confirm a pending appointment,
+            // so re-read it from AppState instead of assuming
+            // the local copy's status.
+            final fresh = appState.appointments
+                .where((a) => a.id == _appt.id)
+                .firstOrNull;
+            if (fresh != null) {
+              setState(() => _appt =
+                  fresh.copyWith(cancellationNote: note));
+            }
+            final h  = newDt.hour == 0 ? 12 : (newDt.hour > 12 ? newDt.hour - 12 : newDt.hour);
+            final m  = newDt.minute.toString().padLeft(2, '0');
+            final ap = newDt.hour < 12 ? 'AM' : 'PM';
+            _showDoneSnackBar(
+                'Rescheduled to $h:$m $ap');
+          },
+        ),
+        transitionsBuilder: (_, a, __, child) => SlideTransition(
+          position: Tween(begin: const Offset(0, 1.0), end: Offset.zero)
+              .chain(CurveTween(curve: Curves.easeOutCubic)).animate(a),
+          child: child,
+        ),
+        transitionDuration: const Duration(milliseconds: 380),
+      ),
+    );
+  }
+
   /// Opens the emergency cancel/reschedule sheet — same UX as the appointments list.
   void _showEmergencySheet(AppState appState) {
     showModalBottomSheet(
@@ -259,113 +306,27 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
           await appState.updateAppointment(updated);
           if (!mounted) return false;
           setState(() => _appt = updated);
-          _showNotificationBanner(clientName: _appt.name, note: note);
+          _showDoneSnackBar('Appointment cancelled');
           return true;
         },
         onReschedule: () {
           Navigator.pop(context); // close reason sheet
-          Navigator.push(
-            context,
-            PageRouteBuilder(
-              pageBuilder: (_, __, ___) => RescheduleScreen(
-                appointment: _appt,
-                onConfirm: (newDt, {String note = ''}) async {
-                  // Reschedule only: a reschedule does not change the
-                  // status on the server, so no status is passed here.
-                  final updated = _appt.copyWith(
-                      dateTime: newDt,
-                      cancellationNote: note);
-                  await appState.updateAppointment(updated);
-                  if (!mounted) return;
-                  // The server is authoritative for the status: a
-                  // reschedule does NOT confirm a pending appointment,
-                  // so re-read it from AppState instead of assuming
-                  // the local copy's status.
-                  final fresh = appState.appointments
-                      .where((a) => a.id == _appt.id)
-                      .firstOrNull;
-                  if (fresh != null) {
-                    setState(() => _appt =
-                        fresh.copyWith(cancellationNote: note));
-                  }
-                  final h  = newDt.hour == 0 ? 12 : (newDt.hour > 12 ? newDt.hour - 12 : newDt.hour);
-                  final m  = newDt.minute.toString().padLeft(2, '0');
-                  final ap = newDt.hour < 12 ? 'AM' : 'PM';
-                  _showNotificationBanner(
-                      clientName: _appt.name,
-                      note: note,
-                      isReschedule: true,
-                      newTime: '$h:$m $ap');
-                },
-              ),
-              transitionsBuilder: (_, a, __, child) => SlideTransition(
-                position: Tween(begin: const Offset(0, 1.0), end: Offset.zero)
-                    .chain(CurveTween(curve: Curves.easeOutCubic)).animate(a),
-                child: child,
-              ),
-              transitionDuration: const Duration(milliseconds: 380),
-            ),
-          );
+          _openReschedule(appState);
         },
       ),
     );
   }
 
-  void _showNotificationBanner({
-    required String clientName,
-    String note = '',
-    bool isReschedule = false,
-    String? newTime,
-  }) {
-    final color   = isReschedule ? const Color(0xFFF4A24A) : const Color(0xFFE05C5C);
-    final icon    = isReschedule ? Icons.edit_calendar_rounded : Icons.cancel_outlined;
-    final mainMsg = isReschedule ? 'Appointment rescheduled' : 'Appointment cancelled';
-    final subMsg  = isReschedule
-        ? 'Reminder sent to $clientName with new time${newTime != null ? ': $newTime' : ''}.'
-        : 'Reminder sent to $clientName about the cancellation.';
-
+  /// Plain confirmation snackbar. The old "notification banner"
+  /// claimed "Reminder sent to <client>" — no push system exists and
+  /// nothing was ever sent.
+  void _showDoneSnackBar(String message) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      duration: const Duration(seconds: 5),
+      content: Text(message,
+          style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+      backgroundColor: const Color(0xFF2ECC96),
       behavior: SnackBarBehavior.floating,
-      margin: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-      padding: EdgeInsets.zero,
-      backgroundColor: Colors.transparent,
-      elevation: 0,
-      content: Container(
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          color: color.withOpacity(0.95),
-          borderRadius: BorderRadius.circular(16),
-          boxShadow: [BoxShadow(color: color.withOpacity(0.35),
-              blurRadius: 18, offset: const Offset(0, 6))],
-        ),
-        child: Row(children: [
-          Container(width: 38, height: 38,
-              decoration: BoxDecoration(color: Colors.white.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(11)),
-              child: Icon(icon, color: Colors.white, size: 20)),
-          const SizedBox(width: 12),
-          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min, children: [
-            Row(children: [
-              const Icon(Icons.notifications_active_rounded,
-                  color: Colors.white, size: 13),
-              const SizedBox(width: 5),
-              Text('Reminder sent', style: GoogleFonts.dmSans(
-                  fontSize: 10.5, fontWeight: FontWeight.w700,
-                  color: Colors.white.withOpacity(0.75))),
-            ]),
-            const SizedBox(height: 2),
-            Text(mainMsg, style: GoogleFonts.dmSans(
-                fontSize: 13.5, fontWeight: FontWeight.w800, color: Colors.white)),
-            const SizedBox(height: 2),
-            Text(subMsg, style: GoogleFonts.dmSans(
-                fontSize: 11.5, color: Colors.white.withOpacity(0.85),
-                fontWeight: FontWeight.w500),
-                maxLines: 2, overflow: TextOverflow.ellipsis),
-          ])),
-        ]),
-      ),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
     ));
   }
 
@@ -488,7 +449,16 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
                   'Cancel Appt.', Icons.cancel_outlined, AppColors.danger,
                   () => _showEmergencySheet(appState),
                 )),
-                if (isProvider) ...[
+                const SizedBox(width: 10),
+                // Direct Reschedule: it used to be reachable only
+                // through the Cancel sheet.
+                Expanded(child: _actionBtn(
+                  'Reschedule', Icons.edit_calendar_rounded, dmAccent,
+                  () => _openReschedule(appState),
+                )),
+                // Confirm is hidden once confirmed — tapping it used
+                // to call accept on a confirmed appointment and 409.
+                if (isProvider && _appt.status != ApptStatus.confirmed) ...[
                   const SizedBox(width: 10),
                   Expanded(child: _actionBtn(
                     'Confirm', Icons.check_circle_outline_rounded, AppColors.green,
@@ -509,7 +479,6 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
                       }
                       setState(() => _appt = _appt.copyWith(status: ApptStatus.confirmed));
                     },
-                    filled: _appt.status != ApptStatus.confirmed,
                   )),
                 ],
               ]),
@@ -709,8 +678,8 @@ class _CancelReasonSheet extends StatefulWidget {
 class _CancelReasonSheetState extends State<_CancelReasonSheet> with DarkMode {
   final _noteCtrl = TextEditingController();
   String? _selectedReason;
-  bool    _sendReminder = true;
   bool    _saving       = false;
+  bool    _notePreviewShown = false;
 
   static const _quickReasons = [
     '🚨 Medical emergency',
@@ -735,7 +704,6 @@ class _CancelReasonSheetState extends State<_CancelReasonSheet> with DarkMode {
     final a        = widget.appointment;
     final keyboardH = MediaQuery.of(context).viewInsets.bottom;
     const red      = Color(0xFFE05C5C);
-    const green    = Color(0xFF2ECC96);
 
     return AnimatedPadding(
       duration: const Duration(milliseconds: 200),
@@ -777,7 +745,7 @@ class _CancelReasonSheetState extends State<_CancelReasonSheet> with DarkMode {
                     Text('Cancel Appointment', style: GoogleFonts.dmSans(
                         fontSize: 16, fontWeight: FontWeight.w900, color: red)),
                     const SizedBox(height: 3),
-                    Text('You can add an optional reason for ${a.name}.',
+                    Text('You can add an optional note for your own record.',
                         style: GoogleFonts.dmSans(fontSize: 12,
                             color: red.withOpacity(0.7), fontWeight: FontWeight.w500)),
                   ])),
@@ -830,7 +798,10 @@ class _CancelReasonSheetState extends State<_CancelReasonSheet> with DarkMode {
               Wrap(spacing: 8, runSpacing: 8, children: _quickReasons.map((r) {
                 final sel = _selectedReason == r;
                 return GestureDetector(
-                  onTap: () => setState(() => _selectedReason = sel ? null : r),
+                  onTap: () => setState(() {
+                    _selectedReason = sel ? null : r;
+                    _notePreviewShown = _effectiveNote.isNotEmpty;
+                  }),
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 180),
                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -865,18 +836,26 @@ class _CancelReasonSheetState extends State<_CancelReasonSheet> with DarkMode {
                   controller: _noteCtrl,
                   maxLines: 3,
                   style: GoogleFonts.dmSans(fontSize: 13.5, color: dmTxtMain),
-                  onChanged: (_) => setState(() {}),
+                  // Only rebuild when the note-preview visibility
+                  // flips — the old onChanged rebuilt on every
+                  // keystroke.
+                  onChanged: (_) {
+                    final show = _effectiveNote.isNotEmpty;
+                    if (show != _notePreviewShown) {
+                      setState(() => _notePreviewShown = show);
+                    }
+                  },
                   decoration: InputDecoration(
                     border: InputBorder.none,
                     contentPadding: const EdgeInsets.all(14),
-                    hintText: 'Describe the reason to your client…',
+                    hintText: 'Add a note for your own record…',
                     hintStyle: GoogleFonts.dmSans(color: dmTxtSub, fontSize: 13),
                   ),
                 ),
               ),
 
               // Note preview
-              if (_effectiveNote.isNotEmpty) ...[
+              if (_notePreviewShown) ...[
                 const SizedBox(height: 8),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -898,82 +877,10 @@ class _CancelReasonSheetState extends State<_CancelReasonSheet> with DarkMode {
               ],
               const SizedBox(height: 16),
 
-              // ── Send reminder toggle ──────────────────────────────────────
-              GestureDetector(
-                onTap: () => setState(() => _sendReminder = !_sendReminder),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 200),
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
-                  decoration: BoxDecoration(
-                    color: _sendReminder
-                        ? green.withOpacity(0.09)
-                        : dmCard2,
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(
-                        color: _sendReminder
-                            ? green.withOpacity(0.40)
-                            : dmBorder,
-                        width: 1.4),
-                  ),
-                  child: Row(children: [
-                    Container(width: 36, height: 36,
-                        decoration: BoxDecoration(
-                          color: _sendReminder
-                              ? green.withOpacity(0.15)
-                              : dmCard2,
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(color: _sendReminder
-                              ? green.withOpacity(0.35) : dmBorder),
-                        ),
-                        child: Icon(Icons.notifications_active_rounded,
-                            size: 18,
-                            color: _sendReminder ? green : dmTxtSub)),
-                    const SizedBox(width: 12),
-                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text('Send reminder to client', style: GoogleFonts.dmSans(
-                          fontSize: 13, fontWeight: FontWeight.w800,
-                          color: _sendReminder ? green : dmTxtMain)),
-                      const SizedBox(height: 2),
-                      Text(
-                        _sendReminder
-                            ? '${a.name} will be notified immediately'
-                            : 'Client will not be notified',
-                        style: GoogleFonts.dmSans(fontSize: 11.5,
-                            fontWeight: FontWeight.w500,
-                            color: _sendReminder
-                                ? green.withOpacity(0.70)
-                                : dmTxtSub.withOpacity(0.55)),
-                      ),
-                    ])),
-                    const SizedBox(width: 10),
-                    // Toggle switch
-                    AnimatedContainer(
-                      duration: const Duration(milliseconds: 250),
-                      width: 46, height: 26,
-                      decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(13),
-                          color: _sendReminder ? green : dmBorder),
-                      child: AnimatedAlign(
-                        duration: const Duration(milliseconds: 220),
-                        curve: Curves.easeInOut,
-                        alignment: _sendReminder
-                            ? Alignment.centerRight
-                            : Alignment.centerLeft,
-                        child: Container(
-                          width: 20, height: 20,
-                          margin: const EdgeInsets.symmetric(horizontal: 3),
-                          decoration: const BoxDecoration(
-                            color: Colors.white, shape: BoxShape.circle,
-                            boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 4)],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ]),
-                ),
-              ),
-              const SizedBox(height: 20),
-
+              // NOTE: the old "Send reminder to client" toggle was
+              // removed — it was fake (its value was never read, the
+              // banner fired regardless) and no notification system
+              // exists. The cancellation note is saved locally only.
               // ── Action buttons ────────────────────────────────────────────
               Row(children: [
                 // Reschedule instead
@@ -1031,7 +938,7 @@ class _CancelReasonSheetState extends State<_CancelReasonSheet> with DarkMode {
                             Text('Cancel Appt', style: GoogleFonts.dmSans(
                                 fontSize: 13, fontWeight: FontWeight.w800, color: red)),
                             const SizedBox(height: 2),
-                            Text(_sendReminder ? 'Notify client now' : 'No notification',
+                            Text('This cannot be undone',
                                 style: GoogleFonts.dmSans(
                                     fontSize: 10.5, color: red.withOpacity(0.65),
                                     fontWeight: FontWeight.w500)),

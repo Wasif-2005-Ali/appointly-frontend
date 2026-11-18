@@ -60,6 +60,10 @@ class _UserPickerScreenState extends State<UserPickerScreen> {
       });
       return;
     }
+    // Rebuild so the Clear (X) suffix icon appears while typing — the
+    // old code only setState on the empty-query path, so the X never
+    // showed until a search completed.
+    setState(() {});
     _debounce = Timer(const Duration(milliseconds: 400), () => _search(q));
   }
 
@@ -91,54 +95,71 @@ class _UserPickerScreenState extends State<UserPickerScreen> {
 
   Future<void> _enterIdManually() async {
     final idCtrl = TextEditingController();
+    // Declared outside the builder: the builder re-runs on every
+    // setDialogState, which would reset an inner variable.
+    String? error;
     final id = await showDialog<int>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: _cardBg,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Text(
-          'Enter user ID',
-          style: GoogleFonts.dmSans(
-            fontWeight: FontWeight.w800,
-            color: _txtMain,
-          ),
-        ),
-        content: TextField(
-          controller: idCtrl,
-          autofocus: true,
-          keyboardType: TextInputType.number,
-          style: GoogleFonts.dmSans(color: _txtMain),
-          decoration: InputDecoration(
-            hintText: 'e.g. 3',
-            helperText: 'Ask the other person for their ID.',
-            border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: Text(
-              'Cancel',
+      builder: (ctx) => StatefulBuilder(
+        builder: (dialogCtx, setDialogState) {
+          return AlertDialog(
+            backgroundColor: _cardBg,
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+            title: Text(
+              'Enter user ID',
               style: GoogleFonts.dmSans(
-                color: _txtSub,
-                fontWeight: FontWeight.w600,
+                fontWeight: FontWeight.w800,
+                color: _txtMain,
               ),
             ),
-          ),
-          TextButton(
-            onPressed: () {
-              final n = int.tryParse(idCtrl.text.trim());
-              Navigator.pop(ctx, n);
-            },
-            child: Text(
-              'Use ID',
-              style: GoogleFonts.dmSans(
-                color: _accent,
-                fontWeight: FontWeight.w700,
+            content: TextField(
+              controller: idCtrl,
+              autofocus: true,
+              keyboardType: TextInputType.number,
+              style: GoogleFonts.dmSans(color: _txtMain),
+              decoration: InputDecoration(
+                hintText: 'e.g. 3',
+                helperText: 'Ask the other person for their ID.',
+                errorText: error,
+                border:
+                    OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
               ),
             ),
-          ),
-        ],
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogCtx),
+                child: Text(
+                  'Cancel',
+                  style: GoogleFonts.dmSans(
+                    color: _txtSub,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              TextButton(
+                onPressed: () {
+                  // Bad input used to pop with null and silently do
+                  // nothing — now it shows an inline error instead.
+                  final n = int.tryParse(idCtrl.text.trim());
+                  if (n == null || n <= 0) {
+                    setDialogState(
+                        () => error = 'Enter a valid user ID (a number above 0).');
+                    return;
+                  }
+                  Navigator.pop(dialogCtx, n);
+                },
+                child: Text(
+                  'Use ID',
+                  style: GoogleFonts.dmSans(
+                    color: _accent,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
     if (id == null || !mounted) return;
@@ -150,33 +171,61 @@ class _UserPickerScreenState extends State<UserPickerScreen> {
 
   @override
   Widget build(BuildContext context) {
-    AppStateProvider.of(context);
+    final appState = AppStateProvider.of(context);
     return Scaffold(
       backgroundColor: _bg,
-      appBar: AppBar(
-        backgroundColor: _bg,
-        elevation: 0,
-        leading: IconButton(
-          icon: Icon(
-            Icons.arrow_back_ios_new_rounded,
-            color: _txtMain,
-            size: 20,
-          ),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: Text(
-          widget.title,
-          style: GoogleFonts.dmSans(
-            fontSize: 19,
-            fontWeight: FontWeight.w800,
-            color: _txtMain,
-          ),
-        ),
-      ),
       body: Column(
         children: [
+          // Gradient hero header, matching the other screens (the old
+          // plain AppBar looked out of place).
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: appState.heroGradient,
+              ),
+            ),
+            child: SafeArea(
+              bottom: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(18, 16, 18, 20),
+                child: Row(children: [
+                  GestureDetector(
+                    onTap: () => Navigator.pop(context),
+                    child: Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.13),
+                        borderRadius: BorderRadius.circular(13),
+                        border: Border.all(
+                            color: Colors.white.withOpacity(0.22)),
+                      ),
+                      child: const Center(
+                        child: Icon(Icons.arrow_back_ios_new_rounded,
+                            color: Colors.white, size: 18),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Text(
+                      widget.title,
+                      style: GoogleFonts.dmSans(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w900,
+                        color: Colors.white,
+                        letterSpacing: -0.5,
+                      ),
+                    ),
+                  ),
+                ]),
+              ),
+            ),
+          ),
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
             child: TextField(
               controller: _searchCtrl,
               autofocus: true,

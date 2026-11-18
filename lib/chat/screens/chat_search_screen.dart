@@ -8,7 +8,15 @@ import '../models/chat_models.dart';
 // ─────────────────────────────────────────────────────────────────────────────
 class ChatSearchScreen extends StatefulWidget {
   final List<ChatMessage> messages;
-  const ChatSearchScreen({super.key, required this.messages});
+
+  /// Display name of the other person (shown instead of "Them").
+  final String peerName;
+
+  const ChatSearchScreen({
+    super.key,
+    required this.messages,
+    this.peerName = 'Them',
+  });
 
   @override
   State<ChatSearchScreen> createState() => _ChatSearchScreenState();
@@ -16,8 +24,39 @@ class ChatSearchScreen extends StatefulWidget {
 
 class _ChatSearchScreenState extends State<ChatSearchScreen> {
   final TextEditingController _ctrl = TextEditingController();
+  final ScrollController _scrollCtrl = ScrollController();
   String _query = '';
-  int _current  = 0;
+  int _current = 0;
+
+  // One key per result row so up/down navigation can scroll the
+  // active result into view.
+  final Map<String, GlobalKey> _rowKeys = {};
+
+  GlobalKey _keyFor(ChatMessage m) =>
+      _rowKeys.putIfAbsent(m.id, () => GlobalKey());
+
+  void _scrollToCurrent(List<ChatMessage> results) {
+    if (results.isEmpty || _current >= results.length) return;
+    final key = _rowKeys[results[_current].id];
+    final ctx = key?.currentContext;
+    if (ctx != null) {
+      Scrollable.ensureVisible(
+        ctx,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  void _move(int delta, List<ChatMessage> results) {
+    if (results.isEmpty) return;
+    setState(() {
+      _current = (_current + delta + results.length) % results.length;
+    });
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _scrollToCurrent(results),
+    );
+  }
 
   Color get _bg      => AppStateProvider.of(context).bg;
   Color get _cardBg  => AppStateProvider.of(context).cardBg;
@@ -27,18 +66,28 @@ class _ChatSearchScreenState extends State<ChatSearchScreen> {
   Color get _accent  => AppStateProvider.of(context).accent;
   List<Color> get _hero    => AppStateProvider.of(context).heroGradient;
 
+  /// Searchable text for a message. Media messages carry a raw
+  /// Cloudinary URL in `text` — searching or rendering that would
+  /// leak the URL, so search the preview instead (file name for
+  /// files, "Photo" for images). Voice notes are included with a
+  /// "Voice note" label instead of being excluded entirely.
+  static String searchableText(ChatMessage m) {
+    if (m.type == MessageType.voice) return 'Voice note';
+    return m.previewText;
+  }
+
   List<ChatMessage> get _results => _query.isEmpty
       ? []
       : widget.messages
           .where((m) =>
               !m.isDeleted &&
-              m.type != MessageType.voice &&
-              m.text.toLowerCase().contains(_query.toLowerCase()))
+              searchableText(m).toLowerCase().contains(_query.toLowerCase()))
           .toList();
 
   @override
   void dispose() {
     _ctrl.dispose();
+    _scrollCtrl.dispose();
     super.dispose();
   }
 
@@ -76,7 +125,7 @@ class _ChatSearchScreenState extends State<ChatSearchScreen> {
                   color: Colors.white, letterSpacing: -0.5))),
           if (results.isNotEmpty) ...[
             GestureDetector(
-              onTap: () => setState(() => _current = (_current - 1 + results.length) % results.length),
+              onTap: () => _move(-1, results),
               child: Container(width: 34, height: 34,
                   decoration: BoxDecoration(color: Colors.white.withOpacity(0.12),
                       borderRadius: BorderRadius.circular(10),
@@ -91,7 +140,7 @@ class _ChatSearchScreenState extends State<ChatSearchScreen> {
                     style: GoogleFonts.dmSans(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.white))),
             const SizedBox(width: 6),
             GestureDetector(
-              onTap: () => setState(() => _current = (_current + 1) % results.length),
+              onTap: () => _move(1, results),
               child: Container(width: 34, height: 34,
                   decoration: BoxDecoration(color: Colors.white.withOpacity(0.12),
                       borderRadius: BorderRadius.circular(10),
@@ -156,6 +205,7 @@ class _ChatSearchScreenState extends State<ChatSearchScreen> {
   }
 
   Widget _buildResults(List<ChatMessage> results) => ListView.builder(
+    controller: _scrollCtrl,
     padding: const EdgeInsets.fromLTRB(16, 16, 16, 40),
     physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
     itemCount: results.length,
@@ -163,8 +213,11 @@ class _ChatSearchScreenState extends State<ChatSearchScreen> {
       final msg = results[i];
       final isActive = i == _current;
       return GestureDetector(
-        onTap: () => setState(() => _current = i),
+        // Tap a result to jump to that message in the thread: pop
+        // with its id and let the thread scroll to it.
+        onTap: () => Navigator.pop(context, msg.id),
         child: AnimatedContainer(
+          key: _keyFor(msg),
           duration: const Duration(milliseconds: 200),
           margin: const EdgeInsets.only(bottom: 10),
           padding: const EdgeInsets.all(16),
@@ -185,7 +238,7 @@ class _ChatSearchScreenState extends State<ChatSearchScreen> {
                     borderRadius: BorderRadius.circular(10),
                     border: Border.all(color: msg.fromMe ? _accent.withOpacity(0.3) : _border),
                   ),
-                  child: Text(msg.fromMe ? 'You' : 'Them',
+                  child: Text(msg.fromMe ? 'You' : widget.peerName,
                       style: GoogleFonts.dmSans(fontSize: 11, fontWeight: FontWeight.w700,
                           color: msg.fromMe ? _accent : _txtSub))),
               const Spacer(),
@@ -194,7 +247,10 @@ class _ChatSearchScreenState extends State<ChatSearchScreen> {
               Text(msg.time, style: GoogleFonts.dmSans(fontSize: 11, color: _txtSub.withOpacity(0.7))),
             ]),
             const SizedBox(height: 10),
-            _highlightedText(msg.text, _query),
+            // Never render raw `text`: for media messages it is the
+            // Cloudinary URL. The preview is safe ("Photo", the
+            // file name, "Voice note").
+            _highlightedText(msg.previewText, _query),
           ]),
         ),
       );

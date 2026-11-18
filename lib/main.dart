@@ -14,7 +14,7 @@ import 'services/call_service.dart';
 import 'theme/app_theme.dart';
 
 /// Global navigator key, so the incoming-call handler in
-/// [_AppointlyRootState] can show the incoming-call dialog from
+/// [_AppointlyRootState] can show the incoming-call screen from
 /// anywhere in the app.
 final GlobalKey<NavigatorState> appNavigatorKey =
     GlobalKey<NavigatorState>();
@@ -57,7 +57,14 @@ class _AppointlyRootState extends State<AppointlyRoot> {
   final AppState _appState = AppState();
   StreamSubscription<IncomingCall>? _incomingSub;
   StreamSubscription<String>? _notifyErrorSub;
-  bool _incomingDialogOpen = false;
+  StreamSubscription<String>? _cancelledSub;
+  bool _incomingScreenOpen = false;
+  String? _incomingCallId;
+  // Call IDs the caller cancelled before the incoming screen opened
+  // (the cancel frame can beat the incoming frame): an incoming call
+  // whose ID is in here is never shown. Call IDs are random per call,
+  // so a stale entry can never match a later call.
+  final Set<String> _cancelledCallIds = {};
   // Last time the session-expiry callback ran: parallel requests can
   // each trigger it, so repeats within a few seconds are ignored to
   // avoid rebuilding the login screen under the user's fingers.
@@ -76,9 +83,14 @@ class _AppointlyRootState extends State<AppointlyRoot> {
     // NOTE: appointments are loaded by the splash screen's
     // loadUserData() — do not fetch them here too (duplicate request
     // on every launch).
-    // Show the incoming-call dialog whenever the server pushes one.
+    // Show the incoming-call screen whenever the server pushes one.
     _incomingSub = CallService.instance.incomingCalls.listen(
       _onIncomingCall,
+    );
+    // Dismiss the incoming-call screen at once when the caller
+    // cancels before the callee answers (call.cancelled).
+    _cancelledSub = CallService.instance.callCancelled.listen(
+      _onCallCancelled,
     );
     // Surface notify-socket failures (incoming calls paused) instead
     // of letting them fail silently.
@@ -156,13 +168,31 @@ class _AppointlyRootState extends State<AppointlyRoot> {
     );
   }
 
+  /// The caller cancelled a call before the callee answered. If its
+  /// incoming-call screen is open, dismiss it at once (the awaited
+  /// push completes with null, treated as "nothing to do" — the
+  /// caller already ended the session). If the screen has not opened
+  /// yet, remember the ID so [_onIncomingCall] never shows it.
+  void _onCallCancelled(String callId) {
+    _cancelledCallIds.add(callId);
+    if (!_incomingScreenOpen || _incomingCallId != callId) return;
+    // The incoming screen is the top route while open — nothing
+    // pushes above it — so this pops exactly that screen.
+    appNavigatorKey.currentState?.pop();
+  }
+
   /// An incoming call arrived on the notify socket. Shows the
-  /// accept/decline dialog, then acts on the answer. A second call
-  /// arriving while a dialog is open or a call is in progress is
-  /// auto-declined so its caller gets a busy signal.
+  /// full-screen accept/decline screen, then acts on the answer. A
+  /// second call arriving while a screen is open or a call is in
+  /// progress is auto-declined so its caller gets a busy signal.
   Future<void> _onIncomingCall(IncomingCall incoming) async {
-    if (_incomingDialogOpen) {
-      // A dialog is already open for another call: reject this one
+    if (_cancelledCallIds.contains(incoming.callId)) {
+      // The caller already hung up before this frame arrived.
+      _cancelledCallIds.remove(incoming.callId);
+      return;
+    }
+    if (_incomingScreenOpen) {
+      // A screen is already open for another call: reject this one
       // right away so its caller gets a busy signal instead of
       // ringing 30s into a no-answer.
       unawaited(CallService.instance.declineCall(incoming));
@@ -178,13 +208,17 @@ class _AppointlyRootState extends State<AppointlyRoot> {
     }
     final navigator = appNavigatorKey.currentState;
     if (navigator == null) return;
-    _incomingDialogOpen = true;
-    final accepted = await showDialog<bool>(
-      context: navigator.context,
-      barrierDismissible: false,
-      builder: (_) => IncomingCallDialog(incoming: incoming),
+    _incomingScreenOpen = true;
+    _incomingCallId = incoming.callId;
+    final accepted = await navigator.push<bool>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => IncomingCallScreen(incoming: incoming),
+      ),
     );
-    _incomingDialogOpen = false;
+    _incomingScreenOpen = false;
+    _incomingCallId = null;
+    _cancelledCallIds.remove(incoming.callId);
     if (accepted == true) {
       final result = await navigator.push<String?>(
         MaterialPageRoute(
@@ -199,9 +233,9 @@ class _AppointlyRootState extends State<AppointlyRoot> {
     } else if (accepted == false) {
       await CallService.instance.declineCall(incoming);
     }
-    // null = the dialog timed out (30s) or was dismissed: the
-    // caller's ring timeout ends the session server-side, so there
-    // is nothing to do here.
+    // null = the screen timed out (30s) or the caller cancelled:
+    // the caller's ring timeout ends the session server-side (or the
+    // caller already ended it), so there is nothing to do here.
   }
 
   @override
@@ -209,6 +243,7 @@ class _AppointlyRootState extends State<AppointlyRoot> {
     ApiClient.onSessionExpired = null;
     _incomingSub?.cancel();
     _notifyErrorSub?.cancel();
+    _cancelledSub?.cancel();
     _appState.dispose();
     super.dispose();
   }
