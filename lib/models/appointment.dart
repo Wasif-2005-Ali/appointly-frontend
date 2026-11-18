@@ -72,9 +72,11 @@ class Appointment {
 
   /// Maps a backend appointment object to the local model.
   ///
-  /// The API has no names, services or locations, so the display name is
-  /// the other party (`Provider #<id>` / `Requester #<id>`, picked with
-  /// [currentUserId]) and the service is a generic `Appointment`.
+  /// The display name is the other party, picked with [currentUserId]:
+  /// the backend's `provider_name` / `requester_name` full name when
+  /// present, falling back to `Provider #<id>` / `Requester #<id>`
+  /// when the payload has no name. The service is a generic
+  /// `Appointment` (the API has no services or locations).
   factory Appointment.fromApi(
     Map<String, dynamic> json, {
     String? currentUserId,
@@ -82,6 +84,8 @@ class Appointment {
     final id          = json['id'] as int;
     final requesterId = json['requester_id']?.toString() ?? '';
     final providerId  = json['provider_id']?.toString() ?? '';
+    final providerName  = (json['provider_name']  as String?)?.trim() ?? '';
+    final requesterName = (json['requester_name'] as String?)?.trim() ?? '';
     final startsAt    = DateTime.parse(json['starts_at'] as String).toLocal();
     final endsAt      = DateTime.parse(json['ends_at'] as String).toLocal();
     final createdRaw  = json['created_at'] as String?;
@@ -90,7 +94,9 @@ class Appointment {
     return Appointment(
       id: id,
       apptNumber: id,
-      name: isRequester ? 'Provider #$providerId' : 'Requester #$requesterId',
+      name: isRequester
+          ? (providerName.isNotEmpty ? providerName : 'Provider #$providerId')
+          : (requesterName.isNotEmpty ? requesterName : 'Requester #$requesterId'),
       service: 'Appointment',
       dateTime: startsAt,
       duration: durationLabel(endsAt.difference(startsAt).inMinutes),

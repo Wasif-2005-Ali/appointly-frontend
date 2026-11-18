@@ -13,7 +13,9 @@ import 'package:record/record.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../app_state.dart';
 import '../../models/appointment.dart';
+import '../../screens/appointment_detail_screen.dart';
 import '../../screens/call_screen.dart';
+import '../../screens/my_appointments_screen.dart';
 import '../../services/api_client.dart';
 import '../../services/chat_service.dart';
 import '../../user_session.dart';
@@ -68,6 +70,10 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   // True once the live connection has failed and is waiting for a
   // manual reconnect (see the banner in [build]).
   bool _connFailed = false;
+  // Pagination cursor from the last history page (`?before=`); null
+  // when there is no older history left to load.
+  String? _nextBefore;
+  bool _loadingOlder = false;
   // Real voice-note recorder (see [_startRecording]).
   final AudioRecorder _recorder = AudioRecorder();
   String? _recordingPath;
@@ -102,7 +108,64 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     super.initState();
     _sendCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 200));
     _recCtrl  = AnimationController(vsync: this, duration: const Duration(milliseconds: 1200))..repeat(reverse: true);
+    _scrollCtrl.addListener(_onScroll);
     _initMessages();
+  }
+
+  /// Scrolled to the top: page in older history (see [_loadOlder]).
+  void _onScroll() {
+    if (!_scrollCtrl.hasClients) return;
+    if (_scrollCtrl.position.pixels <=
+        _scrollCtrl.position.minScrollExtent + 60) {
+      _loadOlder();
+    }
+  }
+
+  /// Load the next older page of history via `?before=` and prepend
+  /// it, keeping the scroll position where the user was. No-op when
+  /// there is no older history or a page is already loading.
+  Future<void> _loadOlder() async {
+    final before = _nextBefore;
+    if (before == null || _loadingOlder || _loadingHistory) return;
+    setState(() => _loadingOlder = true);
+    try {
+      final page = await ChatService.instance.listMessages(
+        _convId,
+        before: before,
+      );
+      if (!mounted) return;
+      final myId = UserSession.instance.userId?.toString();
+      final older = page.messages
+          .map((m) => ChatMessage.fromApi(m, currentUserId: myId))
+          .where((m) => !_seenIds.contains(m.id))
+          .toList();
+      // Snapshot the scroll geometry before prepending so the view
+      // stays on the same message afterwards.
+      final oldExtent = _scrollCtrl.hasClients
+          ? _scrollCtrl.position.maxScrollExtent
+          : 0.0;
+      final oldOffset = _scrollCtrl.hasClients ? _scrollCtrl.offset : 0.0;
+      setState(() {
+        _msgs.insertAll(0, older);
+        _seenIds.addAll(older.map((m) => m.id));
+        _nextBefore = page.nextBefore;
+        _loadingOlder = false;
+      });
+      for (final m in older) {
+        ChatDB.save(_convId, m).catchError((_) {});
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!_scrollCtrl.hasClients) return;
+        final newExtent = _scrollCtrl.position.maxScrollExtent;
+        _scrollCtrl.jumpTo(
+          (newExtent - oldExtent + oldOffset).clamp(0.0, newExtent),
+        );
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _loadingOlder = false);
+      _toast(e.message);
+    }
   }
 
   Future<void> _initMessages() async {
@@ -118,6 +181,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       setState(() {
         _msgs.addAll(apiMsgs);
         _seenIds.addAll(apiMsgs.map((m) => m.id));
+        _nextBefore = page.nextBefore;
         _loadingHistory = false;
       });
       // Fill in the inbox tile preview from the latest message.
@@ -159,7 +223,13 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     try {
       _connection = await ChatService.instance.connectRoom(_convId);
     } on ApiException catch (e) {
-      if (mounted) _toast('${e.message} Live updates are off.');
+      // The connection never opened, so no state event will ever
+      // fire — set the failed state here or the reconnect banner
+      // never shows and the user has no way to retry.
+      if (mounted) {
+        setState(() => _connFailed = true);
+        _toast('${e.message} Live updates are off.');
+      }
       return;
     }
     _msgSub = _connection!.messages.listen(_onLiveMessage);
@@ -191,6 +261,20 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     await conn.reconnect();
   }
 
+  /// Start a real reconnect attempt from a send path: open a fresh
+  /// connection when there is none, otherwise reuse the live one.
+  /// (Calling `reconnect()` on a null connection is a no-op, so the
+  /// old `unawaited(_connection?.reconnect())` silently did nothing
+  /// after a failed initial connect.)
+  void _kickReconnect() {
+    final conn = _connection;
+    if (conn == null) {
+      unawaited(_connectLive());
+    } else {
+      unawaited(conn.reconnect());
+    }
+  }
+
   /// A message arrived over the WebSocket (from the other side, or the
   /// server echo of my own send).
   void _onLiveMessage(ChatApiMessage apiMsg) {
@@ -208,14 +292,19 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         if (idx >= 0) {
           final old = _msgs[idx];
           _pending.remove(old);
-          // Keep the local rendering (e.g. big emoji) of my message.
+          // Keep the local rendering (e.g. big emoji) of my message,
+          // and the local-only reply quote and forward flag — the
+          // backend has no replies, so the echo would drop them.
           _msgs[idx] = ChatMessage(
             id: msg.id,
             text: msg.text,
             fromMe: true,
             time: msg.time,
+            createdAt: msg.createdAt,
             type: old.type,
             status: MessageStatus.delivered,
+            replyTo: old.replyTo,
+            isForwarded: old.isForwarded,
           );
           toSave = _msgs[idx];
           return;
@@ -254,14 +343,15 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     if (text.isEmpty) return;
     if (_connection == null || !_wsLive) {
       // Kick off a reconnect instead of silently dropping the send.
-      unawaited(_connection?.reconnect());
+      _kickReconnect();
       _toast('Not connected — reconnecting. Please try again in a moment.');
       return;
     }
     _sendCtrl.forward().then((_) => _sendCtrl.reverse());
     final msg = ChatMessage(
       id: _mkId(), text: text, fromMe: true,
-      time: _fmt(DateTime.now()), type: MessageType.text,
+      time: _fmt(DateTime.now()), createdAt: DateTime.now(),
+      type: MessageType.text,
       replyTo: _replyTo, status: MessageStatus.sent,
     );
     setState(() { _msgs.add(msg); _pending.add(msg); _msgCtrl.clear(); _typing = false; _showEmoji = false; _replyTo = null; });
@@ -277,11 +367,11 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
 
   Future<void> _sendEmoji(String e) async {
     if (_connection == null || !_wsLive) {
-      unawaited(_connection?.reconnect());
+      _kickReconnect();
       _toast('Not connected — reconnecting. Please try again in a moment.');
       return;
     }
-    final msg = ChatMessage(id: _mkId(), text: e, fromMe: true, time: _fmt(DateTime.now()), type: MessageType.emoji);
+    final msg = ChatMessage(id: _mkId(), text: e, fromMe: true, time: _fmt(DateTime.now()), createdAt: DateTime.now(), type: MessageType.emoji);
     setState(() { _msgs.add(msg); _pending.add(msg); _showEmoji = false; });
     _scrollDown();
     try {
@@ -372,16 +462,20 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
 
   /// Share a real appointment: sends its details as a text message
   /// over the WebSocket, so the other side actually receives it.
+  /// The appointment id is embedded (`📅 Appointment [id]: …`) so
+  /// [ChatMessage.fromApi] can render it as a card whose "View
+  /// Appointment" button opens the real appointment.
   Future<void> _shareAppointment(Appointment appt) async {
     if (_connection == null || !_wsLive) {
-      unawaited(_connection?.reconnect());
+      _kickReconnect();
       _toast('Not connected — reconnecting. Please try again in a moment.');
       return;
     }
     final date = DateFormat('EEEE, MMM d').format(appt.dateTime);
     final time = DateFormat('h:mm a').format(appt.dateTime);
+    final idPart = appt.id != null ? ' [${appt.id}]' : '';
     final text =
-        '📅 Appointment: ${appt.name} — ${appt.service}\n'
+        '📅 Appointment$idPart: ${appt.name} — ${appt.service}\n'
         '$date at $time • ${appt.status.name}';
     try {
       await _connection!.sendText(text);
@@ -554,15 +648,42 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
             controller: _scrollCtrl,
             physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
             padding: const EdgeInsets.fromLTRB(12, 16, 12, 16),
+            // Keep a screenful of bubbles on either side built so
+            // scrolling through media-heavy history stays smooth.
+            cacheExtent: 500,
             itemCount: _msgs.length,
             itemBuilder: (_, i) {
               final msg = _msgs[i];
               return Column(children: [
-                if (i == 0) _dateSep('Today'),
+                if (_showDateSeparator(i)) _dateSep(_dateLabel(msg.createdAt!)),
                 SwipeableMessage(onReply: () => setState(() => _replyTo = msg), child: _bubble(msg, c, i)),
               ]);
             },
           ),
+          if (_loadingOlder)
+            Positioned(
+              top: 8,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: _cardBg,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: _border),
+                  ),
+                  child: SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.5,
+                      color: _accent,
+                    ),
+                  ),
+                ),
+              ),
+            ),
         ])),
         if (_replyTo != null) _replyBar(),
         if (_recording) _recordingOverlay(),
@@ -617,7 +738,16 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         ThreadPopupMenu(accent: _accent, cardBg: _cardBg, border: _border, txtMain: _txtMain, onSelect: (v) {
           switch (v) {
             case 'search':    _openSearch(); break;
-            case 'mute':      setState(() => c.isMuted = !c.isMuted); _toast(c.isMuted ? 'Muted' : 'Unmuted'); break;
+            case 'mute':
+              setState(() => c.isMuted = !c.isMuted);
+              ChatDB.saveConversationFlags(
+                c.id,
+                pinned: c.isPinned,
+                muted: c.isMuted,
+                archived: c.isArchived,
+              ).catchError((_) {});
+              _toast(c.isMuted ? 'Muted' : 'Unmuted');
+              break;
             case 'starred':   _showStarred(); break;
             case 'clear':     _clearChat(); break;
           }
@@ -688,6 +818,31 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   }
 
   // ── Date separator ─────────────────────────────────────────────────────────
+  /// A separator goes above the first message and above the first
+  /// message of each new day. Messages without a known date (old
+  /// cached rows that predate the column) get none.
+  bool _showDateSeparator(int i) {
+    final createdAt = _msgs[i].createdAt;
+    if (createdAt == null) return false;
+    if (i == 0) return true;
+    final prev = _msgs[i - 1].createdAt;
+    if (prev == null) return true;
+    final a = createdAt.toLocal();
+    final b = prev.toLocal();
+    return a.year != b.year || a.month != b.month || a.day != b.day;
+  }
+
+  /// "Today" / "Yesterday" / "Nov 18, 2026" for a separator.
+  String _dateLabel(DateTime dt) {
+    final local = dt.toLocal();
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final day = DateTime(local.year, local.month, local.day);
+    if (day == today) return 'Today';
+    if (day == today.subtract(const Duration(days: 1))) return 'Yesterday';
+    return DateFormat('MMM d, yyyy').format(local);
+  }
+
   Widget _dateSep(String label) => Padding(
     padding: const EdgeInsets.symmetric(vertical: 12),
     child: Row(children: [
@@ -837,7 +992,16 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       Padding(
         padding: EdgeInsets.fromLTRB(isVoice ? 12 : 14, 10, isVoice ? 12 : 14, 10),
         child: isVoice
-            ? VoiceBubble(duration: msg.voiceDuration ?? '0:00', isMe: isMe, accent: _accent, btnGrad: _btnGrad)
+            ? VoiceBubble(
+                duration: msg.voiceDuration ?? '0:00',
+                isMe: isMe,
+                accent: _accent,
+                btnGrad: _btnGrad,
+                // API voice notes carry the audio URL in `text`;
+                // legacy on-device notes have no URL and render
+                // statically (see VoiceBubble).
+                audioUrl: msg.text.startsWith('http') ? msg.text : null,
+              )
             : Text(msg.text, style: GoogleFonts.dmSans(fontSize: 13.5, fontWeight: FontWeight.w500,
                 color: isMe ? Colors.white : _txtMain, height: 1.45)),
       ),
@@ -890,18 +1054,48 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
               color: isMe ? Colors.white.withOpacity(0.9) : _txtMain)),
         ]),
         const SizedBox(height: 10),
-        Container(width: double.infinity, padding: const EdgeInsets.symmetric(vertical: 8),
-            decoration: BoxDecoration(
-              color: isMe ? Colors.white.withOpacity(0.15) : _accent.withOpacity(0.08),
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: isMe ? Colors.white.withOpacity(0.2) : _accent.withOpacity(0.2)),
-            ),
-            child: Center(child: Text('View Appointment',
-                style: GoogleFonts.dmSans(fontSize: 12, fontWeight: FontWeight.w700,
-                    color: isMe ? Colors.white : _accent)))),
+        GestureDetector(
+          onTap: () => _openAppointment(msg),
+          child: Container(width: double.infinity, padding: const EdgeInsets.symmetric(vertical: 8),
+              decoration: BoxDecoration(
+                color: isMe ? Colors.white.withOpacity(0.15) : _accent.withOpacity(0.08),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: isMe ? Colors.white.withOpacity(0.2) : _accent.withOpacity(0.2)),
+              ),
+              child: Center(child: Text('View Appointment',
+                  style: GoogleFonts.dmSans(fontSize: 12, fontWeight: FontWeight.w700,
+                      color: isMe ? Colors.white : _accent)))),
+        ),
       ]),
     ),
   );
+
+  /// Open the appointment behind a shared card. The id is embedded
+  /// in the share text; when it can't be resolved (old share, or the
+  /// appointment is gone) fall back to My Appointments.
+  void _openAppointment(ChatMessage msg) {
+    final id = msg.appointmentId;
+    Appointment? appt;
+    if (id != null) {
+      final matches = AppStateProvider.of(
+        context,
+      ).appointments.where((a) => a.id == id);
+      if (matches.isNotEmpty) appt = matches.first;
+    }
+    if (appt != null) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => AppointmentDetailScreen(appointment: appt!),
+        ),
+      );
+    } else {
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => const MyAppointmentsScreen()),
+      );
+    }
+  }
 
   /// Photo message: the image with rounded corners; tap opens it
   /// full-screen. `msg.text` holds the media URL.
@@ -1340,7 +1534,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
                 decoration: BoxDecoration(color: _txtSub.withOpacity(0.3), borderRadius: BorderRadius.circular(4))),
             Container(margin: const EdgeInsets.fromLTRB(20, 0, 20, 12), padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(color: _bg, borderRadius: BorderRadius.circular(14), border: Border.all(color: _border)),
-                child: Text(msg.type == MessageType.voice ? '🎤 Voice message (${msg.voiceDuration})' : msg.previewText,
+                child: Text(msg.type == MessageType.voice ? '🎤 Voice message' : msg.previewText,
                     maxLines: 2, overflow: TextOverflow.ellipsis,
                     style: GoogleFonts.dmSans(fontSize: 13, color: _txtSub))),
             // Quick reactions
@@ -1489,7 +1683,10 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       case MessageType.emoji:
         return original.text;
       case MessageType.appointment:
-        return '📅 Appointment: ${original.appointmentTitle ?? 'Consultation'}'
+        final idPart = original.appointmentId != null
+            ? ' [${original.appointmentId}]'
+            : '';
+        return '📅 Appointment$idPart: ${original.appointmentTitle ?? 'Consultation'}'
             ' — ${original.appointmentDate ?? ''} at ${original.appointmentTime ?? ''}';
       case MessageType.image:
       case MessageType.file:
@@ -1575,13 +1772,14 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       return;
     }
     if (_connection == null || !_wsLive) {
-      unawaited(_connection?.reconnect());
+      _kickReconnect();
       _toast('Not connected — reconnecting. Please try again in a moment.');
       return;
     }
     final fwd = ChatMessage(
       id: _mkId(), text: text, fromMe: true,
-      time: _fmt(DateTime.now()), type: MessageType.text,
+      time: _fmt(DateTime.now()), createdAt: DateTime.now(),
+      type: MessageType.text,
       isForwarded: true, status: MessageStatus.sent,
     );
     setState(() {

@@ -7,6 +7,7 @@ import '../../services/chat_service.dart';
 import '../../services/user_service.dart';
 import '../../user_session.dart';
 import '../../screens/user_picker_screen.dart';
+import '../data/chat_db.dart';
 import '../models/chat_models.dart';
 import '../widgets/chat_popup_menus.dart';
 import 'chat_thread_screen.dart';
@@ -48,6 +49,10 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
     try {
       final rooms = await ChatService.instance.listRooms();
       if (!mounted) return;
+      // Saved pin/mute/archive flags (SQLite) — the fallback for
+      // rooms with no in-memory state (e.g. after an app restart).
+      final savedFlags = await ChatDB.loadAllConversationFlags();
+      if (!mounted) return;
       // Keep local-only flags (pin/mute/archive) across reloads.
       final old = {for (final c in _convos) c.id: c};
       final convos = rooms.map((r) {
@@ -62,6 +67,13 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
           if (prev.lastMsg != 'No messages yet') {
             convo.lastMsg = prev.lastMsg;
             convo.time = prev.time;
+          }
+        } else {
+          final flags = savedFlags[r.roomId];
+          if (flags != null) {
+            convo.isPinned = flags.pinned;
+            convo.isMuted = flags.muted;
+            convo.isArchived = flags.archived;
           }
         }
         return convo;
@@ -96,6 +108,17 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
         _loadError = e.message;
       });
     }
+  }
+
+  /// Persist a room's pin/mute/archive flags so they survive an
+  /// app restart. Best-effort — the in-memory flag is already set.
+  void _persistFlags(ChatConversation c) {
+    ChatDB.saveConversationFlags(
+      c.id,
+      pinned: c.isPinned,
+      muted: c.isMuted,
+      archived: c.isArchived,
+    ).catchError((_) {});
   }
 
   Future<void> _leaveRoom(ChatConversation c) async {
@@ -395,6 +418,7 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
     confirmDismiss: (dir) async {
       if (dir == DismissDirection.startToEnd) {
         setState(() => c.isArchived = true);
+        _persistFlags(c);
         _toast('Chat archived');
         return false;
       }
@@ -514,10 +538,10 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
             _menuItem(Icons.mark_chat_read_rounded, 'Mark as Read',
                 () => _markAsRead(c)),
           _menuItem(c.isPinned ? Icons.push_pin_outlined : Icons.push_pin_rounded,
-              c.isPinned ? 'Unpin' : 'Pin Chat', () => setState(() => c.isPinned = !c.isPinned)),
+              c.isPinned ? 'Unpin' : 'Pin Chat', () { setState(() => c.isPinned = !c.isPinned); _persistFlags(c); }),
           _menuItem(c.isMuted ? Icons.volume_up_rounded : Icons.volume_off_rounded,
-              c.isMuted ? 'Unmute' : 'Mute', () => setState(() => c.isMuted = !c.isMuted)),
-          _menuItem(Icons.archive_rounded, 'Archive', () { setState(() => c.isArchived = true); _toast('Archived'); }),
+              c.isMuted ? 'Unmute' : 'Mute', () { setState(() => c.isMuted = !c.isMuted); _persistFlags(c); }),
+          _menuItem(Icons.archive_rounded, 'Archive', () { setState(() => c.isArchived = true); _persistFlags(c); _toast('Archived'); }),
           _menuItem(Icons.block_rounded, 'Block', () => _toast('${c.name} blocked')),
         ]),
       ),
@@ -544,13 +568,13 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
     await ChatService.instance.markRoomRead(c.id);
   }
 
-  void _openThread(ChatConversation c) {
+  Future<void> _openThread(ChatConversation c) async {
     // Stamp the room read locally; the thread screen marks it read
     // server-side (POST …/read/) when it loads, so the unread badge
     // stays cleared across devices and app restarts.
     ChatService.instance.markRoomReadLocally(c.id);
     setState(() => c.unread = 0);
-    Navigator.push(context, PageRouteBuilder(
+    await Navigator.push(context, PageRouteBuilder(
       pageBuilder: (_, __, ___) => ChatThreadScreen(conversation: c, allConversations: _convos),
       transitionsBuilder: (_, a, __, child) => SlideTransition(
         position: Tween(begin: const Offset(1.0, 0.0), end: Offset.zero)
@@ -559,13 +583,18 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
       ),
       transitionDuration: const Duration(milliseconds: 320),
     ));
+    // Back from the thread: refresh every room's preview. The opened
+    // room's tile is updated in place by the thread, but other rooms
+    // may have received messages while we were away.
+    if (!mounted) return;
+    _loadRooms(silent: true);
   }
 
   void _openArchived() {
     final archived = _convos.where((c) => c.isArchived).toList();
     Navigator.push(context, MaterialPageRoute(builder: (_) => ArchivedChatsScreen(
       archivedConvos: archived,
-      onUnarchive: (c) => setState(() => c.isArchived = false),
+      onUnarchive: (c) { setState(() => c.isArchived = false); _persistFlags(c); },
       onTap: (c) { setState(() => c.unread = 0); _openThread(c); },
     )));
   }

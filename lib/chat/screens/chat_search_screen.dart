@@ -25,8 +25,6 @@ class _ChatSearchScreenState extends State<ChatSearchScreen> {
   Color get _txtMain => AppStateProvider.of(context).txtMain;
   Color get _txtSub  => AppStateProvider.of(context).txtSub;
   Color get _accent  => AppStateProvider.of(context).accent;
-  List<Color> get _btnGrad => AppStateProvider.of(context).btnGradient;
-  Color get _btnShadow     => AppStateProvider.of(context).btnShadow;
   List<Color> get _hero    => AppStateProvider.of(context).heroGradient;
 
   List<ChatMessage> get _results => _query.isEmpty

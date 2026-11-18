@@ -65,40 +65,6 @@ Widget _heroHeader(BuildContext ctx, String title, Color accentColor,
   );
 }
 
-/// Smooth toggle pill — no tick inside.
-Widget _beautyToggle(bool val, Color active, ValueChanged<bool> cb,
-    {bool dark = false}) {
-  return GestureDetector(
-    onTap: () => cb(!val),
-    child: AnimatedContainer(
-      duration: const Duration(milliseconds: 260),
-      curve: Curves.easeInOut,
-      width: 52, height: 28,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(14),
-        gradient: val ? LinearGradient(colors: [active, active.withOpacity(0.7)]) : null,
-        color: val ? null : (dark ? const Color(0xFF30363D) : const Color(0xFFDDE5EF)),
-        boxShadow: val
-            ? [BoxShadow(color: active.withOpacity(0.35), blurRadius: 8,
-            offset: const Offset(0, 2))]
-            : [],
-      ),
-      child: Stack(alignment: Alignment.center, children: [
-        AnimatedPositioned(
-          duration: const Duration(milliseconds: 260),
-          curve: Curves.easeInOut,
-          left: val ? 26 : 2,
-          child: Container(width: 24, height: 24,
-              decoration: BoxDecoration(shape: BoxShape.circle,
-                  color: Colors.white,
-                  boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.15),
-                      blurRadius: 5, offset: const Offset(0, 2))])),
-        ),
-      ]),
-    ),
-  );
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  1. NEW APPOINTMENT
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,80 +105,6 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
     {'label': 'Online',    'icon': Icons.videocam_rounded,     'color': const Color(0xFF9333EA)},
     {'label': 'Other',     'icon': Icons.location_on_rounded,  'color': const Color(0xFFF4A24A)},
   ];
-
-  Future<void> _pickDate() async {
-    final appState = AppStateProvider.of(context);
-    final accent = appState.accent;
-    final cardC  = appState.cardBg;
-    final bright = appState.themeMode.isDark ? Brightness.dark : Brightness.light;
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: _selectedDate,
-      firstDate: DateTime.now(),
-      lastDate: DateTime.now().add(const Duration(days: 365)),
-      builder: (context, child) => Theme(
-        data: ThemeData(brightness: bright).copyWith(
-          colorScheme: ColorScheme(
-            brightness: bright,
-            primary: accent,
-            onPrimary: Colors.white,
-            secondary: accent,
-            onSecondary: Colors.white,
-            error: Colors.red,
-            onError: Colors.white,
-            surface: cardC,
-            onSurface: appState.txtMain,
-          ),
-          dialogBackgroundColor: cardC,
-        ),
-        child: child!,
-      ),
-    );
-    if (!mounted) return;
-    if (picked != null) setState(() { _selectedDate = picked; _dateSelected = true; });
-  }
-
-  Future<void> _pickTime() async {
-    final appState = AppStateProvider.of(context);
-    final accent = appState.accent;
-    final cardC  = appState.cardBg;
-    final card2  = dmCard2;
-    final bright = appState.themeMode.isDark ? Brightness.dark : Brightness.light;
-    final picked = await showTimePicker(
-      context: context,
-      initialTime: _selectedTime,
-      builder: (context, child) => Theme(
-        data: ThemeData(brightness: bright).copyWith(
-          colorScheme: ColorScheme(
-            brightness: bright,
-            primary: accent,
-            onPrimary: Colors.white,
-            secondary: accent,
-            onSecondary: Colors.white,
-            error: Colors.red,
-            onError: Colors.white,
-            surface: cardC,
-            onSurface: appState.txtMain,
-          ),
-          dialogBackgroundColor: cardC,
-          timePickerTheme: TimePickerThemeData(
-            backgroundColor: cardC,
-            hourMinuteColor: card2,
-            hourMinuteTextColor: appState.txtMain,
-            dayPeriodTextColor: appState.txtMain,
-            dayPeriodColor: card2,
-            dialBackgroundColor: card2,
-            dialHandColor: accent,
-            dialTextColor: appState.txtMain,
-            entryModeIconColor: accent,
-          ),
-        ),
-        child: child!,
-      ),
-    );
-    if (!mounted) return;
-    if (picked != null) setState(() { _selectedTime = picked; _timeSelected = true; });
-  }
 
   String _formatDate(DateTime d) {
     const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -483,6 +375,13 @@ class _NewAppointmentState extends State<NewAppointmentScreen> with DarkMode {
 
   // ── Book the appointment through the backend via AppState ─────────────────
   Future<void> _saveToDb() async {
+    // A date AND a time must be picked first — the defaults (today,
+    // 09:00) are not a booking, and without this check tapping "Book
+    // Appointment" would fail with a raw backend 400 or silently
+    // book today at 09:00.
+    if (!_dateSelected || !_timeSelected) {
+      throw const ApiException('Please choose a date and time first.');
+    }
     final dateTime = DateTime(
       _selectedDate.year, _selectedDate.month, _selectedDate.day,
       _selectedTime.hour, _selectedTime.minute,
@@ -791,12 +690,6 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
     return TimeOfDay(hour: h, minute: m);
   }
 
-  String _fmtTime(TimeOfDay t) {
-    final h = t.hourOfPeriod == 0 ? 12 : t.hourOfPeriod;
-    final m = t.minute.toString().padLeft(2, '0');
-    return '$h:$m ${t.period == DayPeriod.am ? "AM" : "PM"}';
-  }
-
   bool _hasAvailability(DateTime d, AppState appState) {
     final key = _weekdayKey(d.weekday);
     return (appState.availabilityDays[key] ?? false) &&
@@ -840,6 +733,12 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
 
     final allBlocked = [...bookedRanges, ...taskBlocks];
 
+    // Past slots on today are not bookable — the backend slots
+    // endpoint filters them too, so the local fallback must as well.
+    final now     = DateTime.now();
+    final isToday = d.year == now.year && d.month == now.month && d.day == now.day;
+    final nowMins = now.hour * 60 + now.minute;
+
     final result = <TimeOfDay>[];
     for (final r in ranges) {
       if (r.length < 2) continue;
@@ -850,7 +749,8 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
       while (cur + durationM <= endMin) {
         final slotEnd  = cur + durationM;
         final overlaps = allBlocked.any((br) => cur < br[1] && slotEnd > br[0]);
-        if (!overlaps) result.add(TimeOfDay(hour: cur ~/ 60, minute: cur % 60));
+        final inPast   = isToday && cur <= nowMins;
+        if (!overlaps && !inPast) result.add(TimeOfDay(hour: cur ~/ 60, minute: cur % 60));
         cur += durationM;
       }
     }
@@ -1287,154 +1187,6 @@ class _CalendarPickerDialogState extends State<_CalendarPickerDialog> with DarkM
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-class AddClientScreen extends StatefulWidget {
-  const AddClientScreen({super.key});
-  @override
-  State<AddClientScreen> createState() => _AddClientState();
-}
-class _AddClientState extends State<AddClientScreen> with DarkMode {
-  final _cs = ValueNotifier<int>(0);
-
-  @override
-  void setState(VoidCallback fn) { super.setState(fn); _cs.value++; }
-
-  final _name = TextEditingController();
-  final _email = TextEditingController();
-  final _phone = TextEditingController();
-  final _notes = TextEditingController();
-  String _gender = 'Not specified';
-  int _avatarColor = 0;
-  // _colors built lazily in build() to access dmAccent from context
-  List<Color> get _colors => [dmAccent, AppColors.green, AppColors.warning,
-    AppColors.purple, AppColors.danger, const Color(0xFF0D9E6A)];
-
-  @override
-  Widget build(BuildContext context) {
-    AppStateProvider.of(context);
-    return Scaffold(
-      backgroundColor: dmBg,
-      body: Column(children: [
-        _heroHeader(context, 'Add New Client', AppColors.green,
-          changeSignal: _cs,
-          onSave: () async {
-            await Future.delayed(const Duration(milliseconds: 600));
-            if (mounted) Navigator.pop(context);
-          },
-        ),
-        Expanded(child: SingleChildScrollView(
-          physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-          padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
-          child: Column(children: [
-            _c(child: Column(children: [
-              _ct('Profile Picture', Icons.face_rounded, dmAccent),
-              const SizedBox(height: 20),
-              Center(child: Stack(alignment: Alignment.bottomRight, children: [
-                Container(width: 90, height: 90,
-                    decoration: BoxDecoration(shape: BoxShape.circle,
-                        color: _colors[_avatarColor].withOpacity(0.15),
-                        border: Border.all(color: _colors[_avatarColor].withOpacity(0.4), width: 3),
-                        boxShadow: [BoxShadow(color: _colors[_avatarColor].withOpacity(0.25),
-                            blurRadius: 16, offset: const Offset(0, 6))]),
-                    child: Icon(Icons.person_rounded, color: _colors[_avatarColor], size: 44)),
-                Container(width: 28, height: 28,
-                    decoration: BoxDecoration(color: AppColors.green, shape: BoxShape.circle,
-                        border: Border.all(color: Colors.white, width: 2.5)),
-                    child: const Icon(Icons.camera_alt_rounded, color: Colors.white, size: 13)),
-              ])),
-              const SizedBox(height: 16),
-              Row(mainAxisAlignment: MainAxisAlignment.center,
-                  children: List.generate(_colors.length, (i) => GestureDetector(
-                      onTap: () => setState(() => _avatarColor = i),
-                      child: AnimatedContainer(duration: const Duration(milliseconds: 200),
-                          width: _avatarColor == i ? 32 : 26, height: _avatarColor == i ? 32 : 26,
-                          margin: const EdgeInsets.symmetric(horizontal: 4),
-                          decoration: BoxDecoration(shape: BoxShape.circle, color: _colors[i],
-                              border: Border.all(
-                                  color: _avatarColor == i ? Colors.white : Colors.transparent,
-                                  width: 2.5)))))),
-            ])),
-            const SizedBox(height: 14),
-            _c(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              _ct('Personal Info', Icons.badge_outlined, dmTxtMain),
-              const SizedBox(height: 16),
-              _l('Full Name'), _f(_name, 'Enter full name', Icons.person_outline_rounded),
-              const SizedBox(height: 12),
-              _l('Email Address'), _f(_email, 'email@example.com', Icons.email_outlined),
-              const SizedBox(height: 12),
-              _l('Phone Number'), _f(_phone, '+92 300 0000000', Icons.phone_outlined),
-              const SizedBox(height: 12),
-              _l('Gender'),
-              _fb(DropdownButtonHideUnderline(child: DropdownButton<String>(
-                value: _gender, isExpanded: true, dropdownColor: dmCard,
-                icon: Icon(Icons.expand_more_rounded, color: dmTxtSub),
-                style: GoogleFonts.dmSans(fontSize: 14, color: dmTxtMain,
-                    fontWeight: FontWeight.w600),
-                items: ['Not specified','Male','Female','Other']
-                    .map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
-                onChanged: (v) => setState(() => _gender = v!),
-              ))),
-            ])),
-            const SizedBox(height: 14),
-            _c(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              _ct('Notes', Icons.notes_rounded, AppColors.warning),
-              const SizedBox(height: 14),
-              Container(padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(color: dmCard2, borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: dmBorder)),
-                  child: TextField(controller: _notes, maxLines: 3,
-                      style: GoogleFonts.dmSans(fontSize: 13.5, color: dmTxtMain),
-                      decoration: InputDecoration.collapsed(hintText: 'Any notes about this client...',
-                          hintStyle: GoogleFonts.dmSans(color: dmTxtSub, fontSize: 13)))),
-            ])),
-            const SizedBox(height: 24),
-            _actionBtn('Save Client', Icons.person_add_rounded,
-                dmBtnGradient[0], dmBtnGradient[1], () async {
-                  await Future.delayed(const Duration(milliseconds: 600));
-                  if (!mounted) return;
-                  Navigator.pop(context);
-                }),
-          ]),
-        )),
-      ]),
-    );
-  }
-
-  Widget _c({required Widget child}) => Container(
-    width: double.infinity, padding: const EdgeInsets.all(20),
-    decoration: BoxDecoration(color: dmCard, borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: dmBorder, width: 1.5)),
-    child: child,
-  );
-  Widget _ct(String t, IconData icon, Color c) => Row(children: [
-    Container(width: 36, height: 36,
-        decoration: BoxDecoration(
-            gradient: LinearGradient(colors: [c.withOpacity(0.18), c.withOpacity(0.06)]),
-            borderRadius: BorderRadius.circular(10), border: Border.all(color: c.withOpacity(0.2))),
-        child: Icon(icon, color: c, size: 18)),
-    const SizedBox(width: 12),
-    Text(t, style: GoogleFonts.dmSans(fontSize: 16, fontWeight: FontWeight.w800,
-        color: dmTxtMain, letterSpacing: -0.3)),
-  ]);
-  Widget _l(String l) => Padding(padding: const EdgeInsets.only(bottom: 6),
-      child: Text(l, style: GoogleFonts.dmSans(fontSize: 11,
-          fontWeight: FontWeight.w700, color: dmTxtSub, letterSpacing: 0.5)));
-  Widget _fb(Widget child) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
-    decoration: BoxDecoration(color: dmCard2, borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: dmBorder)), child: child,
-  );
-  Widget _f(TextEditingController ctrl, String hint, IconData icon) =>
-      _fb(Row(children: [
-        Icon(icon, color: dmAccent, size: 18), const SizedBox(width: 10),
-        Expanded(child: TextField(controller: ctrl,
-            style: GoogleFonts.dmSans(fontSize: 14, color: dmTxtMain,
-                fontWeight: FontWeight.w600),
-            decoration: InputDecoration(border: InputBorder.none, hintText: hint,
-                hintStyle: GoogleFonts.dmSans(color: dmTxtSub, fontSize: 13)))),
-      ]));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  5. MY REVIEWS  ← fully dark-aware rebuild
 // ─────────────────────────────────────────────────────────────────────────────
 class MyReviewsScreen extends StatefulWidget {
@@ -1443,159 +1195,40 @@ class MyReviewsScreen extends StatefulWidget {
   State<MyReviewsScreen> createState() => _MyReviewsState();
 }
 class _MyReviewsState extends State<MyReviewsScreen> with DarkMode {
-  final _reviews = [
-    {'n':'Aisha Khan',    'txt':'Amazing experience! Very professional and caring service.','r':5,'d':'Mar 15','ac':const Color(0xFF4A90D9)},
-    {'n':'Omar Farooq',   'txt':'Highly recommend. Excellent service every single time!',  'r':5,'d':'Mar 12','ac':const Color(0xFF2ECC96)},
-    {'n':'Zara Malik',    'txt':'Great attention to detail. Definitely will come back!',   'r':4,'d':'Mar 10','ac':const Color(0xFFF4A24A)},
-    {'n':'Bilal Chaudhry','txt':'Professional and thorough. 10/10 — would recommend.',     'r':5,'d':'Mar 8', 'ac':const Color(0xFF7C3AED)},
-    {'n':'Hina Raza',     'txt':'Good service overall, appreciate a little more speed.',   'r':4,'d':'Mar 5', 'ac':const Color(0xFFE05C5C)},
-  ];
-
+  // No review data exists — honest empty state instead of hardcoded
+  // fake reviews and fake stats (matches the profile reviews card).
   @override
   Widget build(BuildContext context) {
     AppStateProvider.of(context);
     return Scaffold(
       backgroundColor: dmBg,
       body: Column(children: [
-        // ── Hero with stats ──
-        Container(decoration: BoxDecoration(gradient: LinearGradient(
-            begin: Alignment.topLeft, end: Alignment.bottomRight,
-            colors: AppStateProvider.of(context).heroGradient)),
-          child: Stack(children: [
-            Positioned(right: -50, top: -50, child: Container(width: 200, height: 200,
-                decoration: BoxDecoration(shape: BoxShape.circle,
-                    gradient: RadialGradient(colors: [AppColors.warning.withOpacity(0.15), Colors.transparent])))),
-            SafeArea(bottom: false, child: Column(children: [
-              Padding(padding: const EdgeInsets.fromLTRB(18, 16, 18, 0), child: Row(children: [
-                GestureDetector(onTap: () => Navigator.pop(context),
-                    child: _glassBtn(child: const Icon(Icons.arrow_back_ios_new_rounded, color: Colors.white, size: 18))),
-                const SizedBox(width: 14),
-                Expanded(child: Text('My Reviews', style: GoogleFonts.dmSans(
-                    fontSize: 20, fontWeight: FontWeight.w900, color: Colors.white, letterSpacing: -0.5))),
-
-              ])),
-              const SizedBox(height: 20),
-              // Overall rating big display
-              Padding(padding: const EdgeInsets.fromLTRB(18, 0, 18, 6), child: Container(
-                padding: const EdgeInsets.all(18),
-                decoration: BoxDecoration(color: Colors.white.withOpacity(0.08),
-                    borderRadius: BorderRadius.circular(18),
-                    border: Border.all(color: Colors.white.withOpacity(0.12))),
-                child: Row(children: [
-                  Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                      Text('4.9', style: GoogleFonts.dmSans(fontSize: 48,
-                          fontWeight: FontWeight.w900, color: Colors.white, height: 1.0, letterSpacing: -2)),
-                      Padding(padding: const EdgeInsets.only(bottom: 8, left: 4),
-                          child: Text('/5', style: GoogleFonts.dmSans(fontSize: 18,
-                              color: Colors.white.withOpacity(0.4), fontWeight: FontWeight.w600))),
-                    ]),
-                    Row(children: List.generate(5, (i) => Icon(Icons.star_rounded,
-                        size: 18, color: i < 5 ? AppColors.warning : Colors.white.withOpacity(0.3)))),
-                    const SizedBox(height: 4),
-                    Text('Based on ${_reviews.length} reviews', style: GoogleFonts.dmSans(
-                        fontSize: 12, color: Colors.white.withOpacity(0.5), fontWeight: FontWeight.w500)),
-                  ]),
-                  const Spacer(),
-                  Column(children: [
-                    _ratingBar(5, 0.80),
-                    _ratingBar(4, 0.40),
-                    _ratingBar(3, 0.10),
-                    _ratingBar(2, 0.05),
-                    _ratingBar(1, 0.00),
-                  ]),
-                ]),
-              )),
-              // Stat pills row
-              Padding(padding: const EdgeInsets.fromLTRB(18, 10, 18, 22), child: Row(children: [
-                _rStat('${_reviews.length}', 'Reviews', dmAccent),
-                const SizedBox(width: 10),
-                _rStat('98%', 'Positive', AppColors.green),
-                const SizedBox(width: 10),
-                _rStat('4.9★', 'Avg Rating', AppColors.warning),
-              ])),
-            ])),
+        _heroHeader(context, 'My Reviews', AppColors.warning),
+        Expanded(child: Center(child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              width: 80, height: 80,
+              decoration: BoxDecoration(
+                  color: AppColors.warning.withOpacity(0.08),
+                  shape: BoxShape.circle),
+              child: Icon(Icons.star_outline_rounded,
+                  color: AppColors.warning.withOpacity(0.5), size: 36),
+            ),
+            const SizedBox(height: 16),
+            Text('No reviews yet.', style: GoogleFonts.dmSans(
+                fontSize: 18, fontWeight: FontWeight.w800, color: dmTxtMain)),
+            const SizedBox(height: 6),
+            Text('Reviews from your clients will appear here once they leave feedback.',
+                textAlign: TextAlign.center,
+                style: GoogleFonts.dmSans(fontSize: 13.5, color: dmTxtSub,
+                    fontWeight: FontWeight.w500)),
           ]),
-        ),
-        // ── Review cards ──
-        Expanded(child: ListView.separated(
-          physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-          padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
-          itemCount: _reviews.length,
-          separatorBuilder: (_, __) => const SizedBox(height: 12),
-          itemBuilder: (_, i) {
-            final r = _reviews[i];
-            final ini = (r['n'] as String).split(' ').map((w) => w[0]).join();
-            return Container(padding: const EdgeInsets.all(18),
-                decoration: BoxDecoration(color: dmCard, borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: dmBorder, width: 1.5),
-                    boxShadow: [BoxShadow(color: dmAccent.withOpacity(0.05),
-                        blurRadius: 14, offset: const Offset(0, 4))]),
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Row(children: [
-                    Container(decoration: BoxDecoration(shape: BoxShape.circle,
-                        boxShadow: [BoxShadow(color: (r['ac'] as Color).withOpacity(0.2), blurRadius: 8)]),
-                        child: CircleAvatar(radius: 24, backgroundColor: (r['ac'] as Color).withOpacity(dark ? 0.2 : 0.15),
-                            child: Text(ini, style: GoogleFonts.dmSans(fontSize: 14,
-                                fontWeight: FontWeight.w800, color: r['ac'] as Color)))),
-                    const SizedBox(width: 12),
-                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text(r['n'] as String, style: GoogleFonts.dmSans(fontSize: 15,
-                          fontWeight: FontWeight.w800, color: dmTxtMain, letterSpacing: -0.2)),
-                      const SizedBox(height: 5),
-                      Row(children: List.generate(5, (j) => Icon(Icons.star_rounded, size: 15,
-                          color: j < (r['r'] as int) ? AppColors.warning : dmBorder))),
-                    ])),
-                    Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                        decoration: BoxDecoration(
-                            color: AppColors.warning.withOpacity(dark ? 0.2 : 0.1),
-                            borderRadius: BorderRadius.circular(20),
-                            border: Border.all(color: AppColors.warning.withOpacity(0.3))),
-                        child: Text(r['d'] as String, style: GoogleFonts.dmSans(
-                            fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.warning))),
-                  ]),
-                  const SizedBox(height: 14),
-                  Container(padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(color: dmCard2, borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: dmBorder2)),
-                      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Icon(Icons.format_quote_rounded, color: dmAccent.withOpacity(0.5), size: 18),
-                        const SizedBox(width: 8),
-                        Expanded(child: Text(r['txt'] as String, style: GoogleFonts.dmSans(
-                            fontSize: 13.5, color: dmTxtBody, fontWeight: FontWeight.w500, height: 1.6))),
-                      ])),
-                ]));
-          },
-        )),
+        ))),
       ]),
     );
   }
-
-  Widget _ratingBar(int stars, double fill) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 2),
-    child: Row(children: [
-      Text('$stars', style: GoogleFonts.dmSans(fontSize: 10, color: Colors.white.withOpacity(0.5), fontWeight: FontWeight.w600)),
-      const SizedBox(width: 6),
-      SizedBox(width: 80, height: 6, child: ClipRRect(borderRadius: BorderRadius.circular(3),
-          child: LinearProgressIndicator(value: fill, backgroundColor: Colors.white.withOpacity(0.12),
-              valueColor: AlwaysStoppedAnimation<Color>(AppColors.warning)))),
-    ]),
-  );
-
-  Widget _rStat(String v, String l, Color c) => Expanded(child: Container(
-    padding: const EdgeInsets.symmetric(vertical: 12),
-    decoration: BoxDecoration(color: Colors.white.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: Colors.white.withOpacity(0.15))),
-    child: Column(children: [
-      Text(v, style: GoogleFonts.dmSans(fontSize: 18, fontWeight: FontWeight.w900,
-          color: Colors.white, letterSpacing: -0.5)),
-      const SizedBox(height: 2),
-      Text(l, style: GoogleFonts.dmSans(fontSize: 10, fontWeight: FontWeight.w600, color: c)),
-    ]),
-  ));
 }
-
 
 // ─── Shared bottom action button ─────────────────────────────────────────────
 Widget _actionBtn(String label, IconData icon, Color g1, Color g2, VoidCallback onTap) =>

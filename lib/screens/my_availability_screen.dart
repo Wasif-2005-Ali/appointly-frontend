@@ -717,15 +717,6 @@ class _MyAvailabilityScreenState extends State<MyAvailabilityScreen> with DarkMo
     );
   }
 
-  Widget _glassBtn(IconData icon) => Container(
-    width: 40, height: 40,
-    decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.12),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withOpacity(0.2))),
-    child: Icon(icon, color: Colors.white, size: 20),
-  );
-
   Widget _orb(double size, Color color, double opacity) => Container(
     width: size, height: size,
     decoration: BoxDecoration(shape: BoxShape.circle,

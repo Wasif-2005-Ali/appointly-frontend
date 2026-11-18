@@ -5,6 +5,7 @@ import '../theme/app_theme.dart';
 import '../theme/dark_theme.dart';
 import '../models/appointment.dart';
 import '../services/api_client.dart';
+import '../user_session.dart';
 import 'incoming_requests_screen.dart';
 import 'my_appointments_screen.dart' show RescheduleScreen;
 
@@ -269,9 +270,10 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
               pageBuilder: (_, __, ___) => RescheduleScreen(
                 appointment: _appt,
                 onConfirm: (newDt, {String note = ''}) async {
+                  // Reschedule only: a reschedule does not change the
+                  // status on the server, so no status is passed here.
                   final updated = _appt.copyWith(
                       dateTime: newDt,
-                      status: ApptStatus.confirmed,
                       cancellationNote: note);
                   await appState.updateAppointment(updated);
                   if (!mounted) return;
@@ -405,6 +407,12 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
   @override
   Widget build(BuildContext context) {
     final appState = AppStateProvider.of(context);
+    // Confirm / Mark as done are provider-only on the server — a
+    // requester tapping them always gets a 403, so they are only
+    // rendered for the provider. A null providerId (legacy local
+    // rows) keeps the old behaviour.
+    final isProvider = _appt.providerId == null ||
+        UserSession.instance.userId?.toString() == _appt.providerId;
     return Scaffold(
       backgroundColor: dmBg,
       body: Column(children: [
@@ -470,43 +478,43 @@ class _AppointmentDetailScreenState extends State<AppointmentDetailScreen> with 
             ],
             const SizedBox(height: 14),
             // ── Action buttons ───────────────────────────────────────────
+            // Cancel is available to either participant. Confirm and
+            // Mark as done are provider-only (see isProvider above).
             if (_appt.status != ApptStatus.cancelled &&
                 _appt.status != ApptStatus.completed &&
-                _appt.status != ApptStatus.rejected) ...[ 
+                _appt.status != ApptStatus.rejected) ...[
               Row(children: [
                 Expanded(child: _actionBtn(
                   'Cancel Appt.', Icons.cancel_outlined, AppColors.danger,
                   () => _showEmergencySheet(appState),
                 )),
-                const SizedBox(width: 10),
-                Expanded(child: _actionBtn(
-                  'Confirm', Icons.check_circle_outline_rounded, AppColors.green,
-                  () async {
-                    try {
-                      await appState.updateAppointmentStatus(
-                          _appt.id!, ApptStatus.confirmed);
-                    } on ApiException catch (e) {
-                      // Accept is provider-only — a requester tapping
-                      // Confirm gets a 403, which we surface here.
-                      if (!context.mounted) return;
-                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                        content: Text(e.message,
-                            style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
-                        backgroundColor: AppColors.danger,
-                        behavior: SnackBarBehavior.floating,
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14))));
-                      return;
-                    }
-                    setState(() => _appt = _appt.copyWith(status: ApptStatus.confirmed));
-                  },
-                  filled: _appt.status != ApptStatus.confirmed,
-                )),
+                if (isProvider) ...[
+                  const SizedBox(width: 10),
+                  Expanded(child: _actionBtn(
+                    'Confirm', Icons.check_circle_outline_rounded, AppColors.green,
+                    () async {
+                      try {
+                        await appState.updateAppointmentStatus(
+                            _appt.id!, ApptStatus.confirmed);
+                      } on ApiException catch (e) {
+                        if (!context.mounted) return;
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                          content: Text(e.message,
+                              style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                          backgroundColor: AppColors.danger,
+                          behavior: SnackBarBehavior.floating,
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14))));
+                        return;
+                      }
+                      setState(() => _appt = _appt.copyWith(status: ApptStatus.confirmed));
+                    },
+                    filled: _appt.status != ApptStatus.confirmed,
+                  )),
+                ],
               ]),
-              // Mark a confirmed appointment done (provider only on the
-              // server; a requester tapping it gets the 403 surfaced
-              // below, same as Confirm).
-              if (_appt.status == ApptStatus.confirmed) ...[
+              // Mark a confirmed appointment done (provider only).
+              if (isProvider && _appt.status == ApptStatus.confirmed) ...[
                 const SizedBox(height: 10),
                 SizedBox(
                   width: double.infinity,

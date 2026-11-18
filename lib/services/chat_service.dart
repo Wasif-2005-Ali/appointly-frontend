@@ -91,8 +91,17 @@ class ChatApiMessage {
     switch (messageType) {
       case 'image':
         return 'Photo';
+      case 'voice':
+        return 'Voice message';
       case 'file':
-        return fileName != null && fileName!.isNotEmpty ? fileName! : 'File';
+        final name = fileName ?? '';
+        // Voice notes arrive as file messages — never show the raw
+        // `voice_note_<ts>.m4a` file name in the preview.
+        final lower = name.toLowerCase();
+        if (lower.startsWith('voice_note_') || lower.endsWith('.m4a')) {
+          return 'Voice message';
+        }
+        return name.isNotEmpty ? name : 'File';
       default:
         return content;
     }
@@ -521,7 +530,14 @@ class ChatService {
 /// when the socket drops unexpectedly; after the budget is spent it
 /// enters [ChatConnectionState.failed] and waits for a manual
 /// [ChatRoomConnection.reconnect]. On a 4001 close it refreshes the
-/// access token through a REST call first. The connection is only
+/// access token through a REST call first. The backend may also
+/// reject the handshake outright (HTTP 403) before any close code is
+/// delivered — that looks like a socket that closed before it ever
+/// connected, so the first retry after such a failure refreshes the
+/// token too, instead of burning all 7 attempts on a dead token.
+/// Manual [ChatRoomConnection.reconnect] always refreshes the token
+/// first, so "Live connection lost" → Reconnect works for a token
+/// that expired mid-thread. The connection is only
 /// reported as connected once the WebSocket handshake is confirmed
 /// (via the channel's `ready` future or the first inbound frame) —
 /// never optimistically — so sends during the handshake window are
@@ -617,7 +633,10 @@ class ChatRoomConnection {
     _emit(ChatConnectionState.connected);
   }
 
-  /// Reconnect now, resetting the retry budget. Safe to call while
+  /// Reconnect now, resetting the retry budget. The access token is
+  /// refreshed through a REST call first: a manual reconnect usually
+  /// follows a token that expired mid-thread, and reconnecting with
+  /// the same dead token just fails again. Safe to call while
   /// connecting/reconnecting or after [ChatConnectionState.failed];
   /// a no-op when already connected or closed.
   Future<void> reconnect() async {
@@ -634,7 +653,23 @@ class ChatRoomConnection {
     }
     _channel = null;
     _connected = false;
+    await _refreshToken();
+    if (_closed) return;
     await _connect();
+  }
+
+  /// Force a token refresh through the REST client, which refreshes
+  /// on 401, then read the fresh token for the next handshake. A
+  /// failed refresh is swallowed — the reconnect proceeds with the
+  /// old token and the server rejects it again if it is dead.
+  Future<void> _refreshToken() async {
+    try {
+      await ChatService.instance.getRoom(roomId);
+      final fresh = await TokenStorage.instance.accessToken;
+      if (fresh != null && fresh.isNotEmpty) _token = fresh;
+    } catch (_) {
+      // Refresh failed — reconnect with the old token.
+    }
   }
 
   void _onData(dynamic data) {
@@ -674,8 +709,10 @@ class ChatRoomConnection {
   }
 
   void _onSocketClosed() {
-    // Capture the close code before dropping the channel reference.
+    // Capture the close code and the connected flag before dropping
+    // the channel reference.
     final code = _lastCloseCode;
+    final wasConnected = _connected;
     _connected = false;
     _subscription?.cancel();
     _subscription = null;
@@ -694,7 +731,17 @@ class ChatRoomConnection {
       _emit(ChatConnectionState.failed);
       return;
     }
-    _scheduleReconnect(refreshTokenFirst: code == 4001);
+    // Handshake failure: the backend closes pre-accept, so the
+    // client gets an HTTP 403 and no close code is ever delivered —
+    // the socket closed before it was ever connected. The most
+    // likely cause is a dead token, so refresh it before the first
+    // retry instead of burning the whole budget on the same token.
+    // (A drop after a successful connect is a network problem, not
+    // auth, so it does not refresh.)
+    final handshakeFailed = !wasConnected && code == null && _attempts == 0;
+    _scheduleReconnect(
+      refreshTokenFirst: code == 4001 || handshakeFailed,
+    );
   }
 
   int? get _lastCloseCode {
@@ -720,19 +767,7 @@ class ChatRoomConnection {
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(delay, () async {
       if (_closed) return;
-      if (refreshTokenFirst) {
-        // Force a token refresh through the REST client, which
-        // refreshes on 401, then read the fresh token.
-        try {
-          await ChatService.instance.getRoom(roomId);
-          final fresh = await TokenStorage.instance.accessToken;
-          if (fresh != null && fresh.isNotEmpty) _token = fresh;
-        } catch (_) {
-          // Refresh failed — reconnect with the old token; the
-          // server will close with 4001 again and we give up after
-          // the remaining attempts.
-        }
-      }
+      if (refreshTokenFirst) await _refreshToken();
       if (!_closed) await _connect();
     });
   }

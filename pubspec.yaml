@@ -20,6 +20,7 @@ dependencies:
   image_picker: ^1.1.2
   cached_network_image: ^3.4.1
   record: ^5.1.0
+  audioplayers: ^6.4.0
   path_drawing: ^1.0.1
   image: ^4.2.0
   crypto: ^3.0.3
@@ -42,17 +43,54 @@ flutter:
   uses-material-design: true
   assets:
     - assets/
-  # DM Sans is bundled so the app never has to download fonts at
-  # runtime (google_fonts picks up the bundled family automatically).
-  # Keep the family name "DM Sans" — it must match GoogleFonts.dmSans.
+  # Fonts are bundled so the app never downloads them at runtime
+  # (GoogleFonts.config.allowRuntimeFetching is false — see main.dart).
+  # google_fonts finds a bundled file ONLY when the asset path
+  # (minus extension) case-sensitively ends with the Google Fonts API
+  # filename, i.e. "<Family>-<WeightName>" — e.g. "DM Sans-Regular",
+  # "DM Sans-ExtraBold", "Space Grotesk-Bold". Do NOT rename these
+  # files to anything else, or the font silently falls back.
+  # Weights bundled here cover every GoogleFonts.* use in the app:
+  # DM Sans 400-900 + italics (400/500), Poppins 400-700,
+  # Space Grotesk 400-700 (its w800 uses closest-match to Bold).
   fonts:
     - family: DM Sans
       fonts:
-        - asset: assets/fonts/dm-sans-v17-latin-regular.ttf
+        - asset: assets/fonts/DM Sans-Regular.ttf
           weight: 400
-        - asset: assets/fonts/dm-sans-v17-latin-500.ttf
+        - asset: assets/fonts/DM Sans-Medium.ttf
           weight: 500
-        - asset: assets/fonts/dm-sans-v17-latin-600.ttf
+        - asset: assets/fonts/DM Sans-SemiBold.ttf
           weight: 600
-        - asset: assets/fonts/dm-sans-v17-latin-700.ttf
+        - asset: assets/fonts/DM Sans-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/DM Sans-ExtraBold.ttf
+          weight: 800
+        - asset: assets/fonts/DM Sans-Black.ttf
+          weight: 900
+        - asset: assets/fonts/DM Sans-Italic.ttf
+          weight: 400
+          style: italic
+        - asset: assets/fonts/DM Sans-MediumItalic.ttf
+          weight: 500
+          style: italic
+    - family: Poppins
+      fonts:
+        - asset: assets/fonts/Poppins-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Poppins-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Poppins-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Poppins-Bold.ttf
+          weight: 700
+    - family: Space Grotesk
+      fonts:
+        - asset: assets/fonts/Space Grotesk-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Space Grotesk-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Space Grotesk-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Space Grotesk-Bold.ttf
           weight: 700

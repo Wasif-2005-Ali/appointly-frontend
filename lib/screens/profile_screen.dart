@@ -344,9 +344,12 @@ class _ProfileScreenState extends State<ProfileScreen>
         const SizedBox(height: 16),
         Text(_nameCtrl.text, style: GoogleFonts.dmSans(
             fontSize: 22, fontWeight: FontWeight.w900, color: dmTxtMain, letterSpacing: -0.5)),
-        const SizedBox(height: 4),
-        Text('Admin · Appointly', style: GoogleFonts.dmSans(
-            fontSize: 13, color: dmTxtSub, fontWeight: FontWeight.w500)),
+        // The user's real profession — no hardcoded subtitle.
+        if (UserSession.instance.profession.trim().isNotEmpty) ...[
+          const SizedBox(height: 4),
+          Text(UserSession.instance.profession.trim(), style: GoogleFonts.dmSans(
+              fontSize: 13, color: dmTxtSub, fontWeight: FontWeight.w500)),
+        ],
         const SizedBox(height: 12),
 
         // Privacy badge
@@ -478,14 +481,6 @@ class _ProfileScreenState extends State<ProfileScreen>
           ),
         );
       }),
-      if (_privacyMode == 'Protected') ...[
-        const SizedBox(height: 4),
-        Container(height: 1, color: dmBorder),
-        const SizedBox(height: 12),
-        Text('No allowed contacts yet — contact selection isn\'t available yet.',
-            style: GoogleFonts.dmSans(fontSize: 12, color: dmTxtSub, fontWeight: FontWeight.w500)),
-      
-      ],
     ]));
   }
 

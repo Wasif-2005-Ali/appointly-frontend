@@ -21,9 +21,8 @@ class ApiConfig {
   /// APIs & Services → Credentials → OAuth 2.0 Client IDs, type "Web
   /// application"). The backend verifies ID tokens against the same
   /// client ID (GOOGLE_CLIENT_ID on Render). GCP project "Appointly"
-  /// (appointly-514920); the consent screen is in Testing mode, so
-  /// only the listed test users can sign in with Google until the app
-  /// is published.
+  /// (appointly-514920); the consent screen was published on 17 Nov
+  /// 2026, so any Google account can sign in.
   static const String googleServerClientId =
       '1079927760935-c1qptn5omdikssrl58cu7ehkdkki4643.apps.googleusercontent.com';
 }

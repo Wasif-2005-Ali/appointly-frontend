@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../theme/app_theme.dart';
 import '../app_state.dart';
+import '../database/bd_helper.dart';
 import '../screens/profile_screen.dart';
 import '../screens/settings_screen.dart';
 import '../screens/incoming_requests_screen.dart';
@@ -167,21 +168,53 @@ class DrawerWidget extends StatelessWidget {
     padding: EdgeInsets.fromLTRB(12, 8, 12, MediaQuery.of(ctx).padding.bottom + 12),
     decoration: BoxDecoration(border: Border(top: BorderSide(color: appState.drawerDividerColor))),
     child: ListTile(
-      onTap: () async {
-        await AuthService.instance.logout();
-        if (!ctx.mounted) return;
-        Navigator.pushAndRemoveUntil(
-          ctx,
-          MaterialPageRoute(builder: (_) => const WelcomeScreen()),
-          (route) => false,
-        );
-      },
+      onTap: () => _logoutDialog(ctx, appState),
       dense: true,
       visualDensity: const VisualDensity(vertical: -1),
       contentPadding: const EdgeInsets.symmetric(horizontal: 12),
       leading: const Icon(Icons.logout_rounded, color: Colors.redAccent, size: 20),
       title: Text('Log Out', style: GoogleFonts.dmSans(
           fontSize: 13.5, fontWeight: FontWeight.w700, color: Colors.redAccent)),
+    ),
+  );
+
+  /// Same confirmation as the Settings logout, so a stray tap on the
+  /// drawer item cannot sign the user out by accident.
+  void _logoutDialog(BuildContext ctx, AppState appState) => showDialog(
+    context: ctx,
+    builder: (dialogCtx) => AlertDialog(
+      backgroundColor: appState.cardBg,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      title: Text('Log Out', style: GoogleFonts.dmSans(
+          fontWeight: FontWeight.w800, color: appState.txtMain)),
+      content: Text('Are you sure you want to log out?',
+          style: GoogleFonts.dmSans(color: appState.txtSub)),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogCtx),
+          child: Text('Cancel', style: GoogleFonts.dmSans(
+              fontWeight: FontWeight.w700, color: appState.txtSub)),
+        ),
+        ElevatedButton(
+          onPressed: () async {
+            Navigator.pop(dialogCtx);
+            await AuthService.instance.logout();
+            await DBHelper.instance.clearSession();
+            if (!ctx.mounted) return;
+            Navigator.pushAndRemoveUntil(
+              ctx,
+              MaterialPageRoute(builder: (_) => const WelcomeScreen()),
+              (route) => false,
+            );
+          },
+          style: ElevatedButton.styleFrom(
+            backgroundColor: AppColors.danger,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          ),
+          child: Text('Log Out', style: GoogleFonts.dmSans(
+              fontWeight: FontWeight.w700, color: Colors.white)),
+        ),
+      ],
     ),
   );
 }

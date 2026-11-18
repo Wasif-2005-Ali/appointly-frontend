@@ -6,6 +6,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../services/api_client.dart';
 import '../services/call_service.dart';
 import '../services/user_service.dart';
+import 'call_history_screen.dart';
 import 'user_picker_screen.dart';
 
 /// Full-screen voice/video call.
@@ -242,29 +243,32 @@ class _CallScreenState extends State<CallScreen> {
                 )
               : _buildWaitingPlaceholder(),
         ),
-        // Peer name + status.
-        Positioned(
-          top: 16,
-          left: 0,
-          right: 0,
-          child: Column(
-            children: [
-              Text(
-                _peerName,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 20,
-                  fontWeight: FontWeight.w600,
+        // Peer name + status. Only shown once remote video arrives —
+        // until then the waiting placeholder below already shows the
+        // name (showing both would render it twice while ringing).
+        if (remoteReady)
+          Positioned(
+            top: 16,
+            left: 0,
+            right: 0,
+            child: Column(
+              children: [
+                Text(
+                  _peerName,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 4),
-              const Text(
-                'Video call',
-                style: TextStyle(color: Colors.white38, fontSize: 13),
-              ),
-            ],
+                const SizedBox(height: 4),
+                const Text(
+                  'Video call',
+                  style: TextStyle(color: Colors.white38, fontSize: 13),
+                ),
+              ],
+            ),
           ),
-        ),
         // Local preview, top-right corner.
         Positioned(
           top: 76,
@@ -532,7 +536,23 @@ class _StartCallScreenState extends State<StartCallScreen> {
   Widget build(BuildContext context) {
     final selected = _selectedUser;
     return Scaffold(
-      appBar: AppBar(title: const Text('New Call')),
+      appBar: AppBar(
+        title: const Text('New Call'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.history_rounded),
+            tooltip: 'Call history',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => const CallHistoryScreen(),
+                ),
+              );
+            },
+          ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(20),
         child: Column(

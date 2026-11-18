@@ -23,7 +23,7 @@ class DBHelper {
     final path = join(await getDatabasesPath(), 'appointly.db');
     return openDatabase(
       path,
-      version: 7,
+      version: 8,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -73,6 +73,39 @@ class DBHelper {
     if (oldV < 7) {
       // Add cancellation_note for emergency cancel/reschedule reason
       try { await db.execute("ALTER TABLE appointments ADD COLUMN cancellation_note TEXT NOT NULL DEFAULT ''"); } catch (_) {}
+    }
+    if (oldV < 8) {
+      // Remove the fake demo appointments seeded by old builds
+      // (_seedAppointmentsForUser, now deleted). The server is the
+      // source of truth for appointments; match on name + service so
+      // a real local appointment that happens to share a name survives.
+      const seeds = [
+        ('Sara Nadeem', 'Facial'),
+        ('Shahid Rauf', 'Physiotherapy'),
+        ('Iqra Butt', 'Hair Coloring'),
+        ('Asim Nawaz', 'Consultation'),
+        ('Imran Shah', 'Consultation'),
+        ('Lubna Aslam', 'Skin Analysis'),
+        ('Faisal Mir', 'Deep Tissue'),
+        ('Anam Riaz', 'Facial'),
+        ('Aisha Khan', 'Strategy Discussion'),
+        ('Omar Farooq', 'Initial Consultation'),
+        ('Zara Malik', 'Hair Coloring & Cut'),
+        ('Bilal Chaudhry', 'Physiotherapy'),
+        ('Hina Raza', 'Skin Care Session'),
+        ('Tariq Ahmed', 'Sports Massage'),
+        ('Sana Qureshi', 'Nail Art Session'),
+        ('Nadia Hussain', 'Career Coaching'),
+        ('Kamran Iqbal', 'Legal Consultation'),
+        ('Ali Rehman', 'Dental Checkup'),
+        ('Sara Baig', 'Nutrition Planning'),
+        ('Fatima Siddiqui', 'Eye Examination'),
+        ('Usman Tariq', 'Strategy Discussion'),
+        ('Rabia Noor', 'Coaching Session'),
+      ];
+      final where = List.filled(seeds.length, '(name = ? AND service = ?)').join(' OR ');
+      final args = seeds.expand((s) => [s.$1, s.$2]).toList();
+      try { await db.delete('appointments', where: where, whereArgs: args); } catch (_) {}
     }
   }
 
@@ -131,15 +164,13 @@ class DBHelper {
   }) async {
     final db = await database;
     try {
-      final id = await db.insert('users', {
+      await db.insert('users', {
         'full_name': fullName.trim(),
         'email': email.trim().toLowerCase(),
         'password_hash': _hash(password),
         'profession': profession.trim(),
         'created_at': DateTime.now().toIso8601String(),
       });
-      // Seed sample appointments for this new user
-      await _seedAppointmentsForUser(db, id);
       return RegisterResult.success;
     } on DatabaseException catch (e) {
       if (e.isUniqueConstraintError()) return RegisterResult.emailAlreadyExists;
@@ -160,15 +191,6 @@ class DBHelper {
       if (rows.isEmpty) return (result: LoginResult.emailNotFound, userRow: null);
       if (rows.first['password_hash'] != _hash(password))
         return (result: LoginResult.wrongPassword, userRow: null);
-
-      // Seed appointments if this user has none (e.g. accounts created before v3)
-      final userId = rows.first['id'] as int;
-      final apptCount = Sqflite.firstIntValue(
-        await db.rawQuery('SELECT COUNT(*) FROM appointments WHERE user_id = ?', [userId]),
-      ) ?? 0;
-      if (apptCount == 0) {
-        await _seedAppointmentsForUser(db, userId);
-      }
 
       return (result: LoginResult.success, userRow: Map<String, dynamic>.from(rows.first));
     } catch (_) { return (result: LoginResult.error, userRow: null); }
@@ -349,48 +371,4 @@ class DBHelper {
     return {'days': dRows.first['value'] as String,
       'slots': sRows.first['value'] as String};
   }
-
-  // ── Seed (per user) ────────────────────────────────────────────────────────
-  Future<void> _seedAppointmentsForUser(Database db, int userId) async {
-    final now    = DateTime.now();
-    final sunday = now.subtract(Duration(days: now.weekday % 7));
-    DateTime dt(int d, int h, int m) {
-      final day = sunday.add(Duration(days: d));
-      return DateTime(day.year, day.month, day.day, h, m);
-    }
-    final seeds = [
-      _s(userId, 1, 'Sara Nadeem',     'Facial',              dt(0,11, 0),'45 min','Style House, Gulberg',      '',                         ApptStatus.confirmed,0xFF4A90D9),
-      _s(userId, 2, 'Shahid Rauf',     'Physiotherapy',       dt(1,10, 0),'60 min','PhysioPlus Clinic',         '',                         ApptStatus.confirmed,0xFF0B2447),
-      _s(userId, 3, 'Iqra Butt',       'Hair Coloring',       dt(1,13, 0),'90 min','Style Studio, Gulberg',     '',                         ApptStatus.pending,  0xFF4A90D9),
-      _s(userId, 4, 'Asim Nawaz',      'Consultation',        dt(1,16, 0),'30 min','Video Call · Zoom',         '',                         ApptStatus.confirmed,0xFF2A6AB5),
-      _s(userId, 5, 'Imran Shah',      'Consultation',        dt(2, 8,30),'30 min','Office Block B, F-6',       '',                         ApptStatus.confirmed,0xFF0B2447),
-      _s(userId, 6, 'Lubna Aslam',     'Skin Analysis',       dt(2,12, 0),'45 min','Glow Wellness Center',      '',                         ApptStatus.pending,  0xFF4A90D9),
-      _s(userId, 7, 'Faisal Mir',      'Deep Tissue',         dt(2,14, 0),'60 min','ActiveBody Spa',            '',                         ApptStatus.confirmed,0xFF1A5EA8),
-      _s(userId, 8, 'Anam Riaz',       'Facial',              dt(2,16,30),'45 min','Beauty Lounge, DHA',        '',                         ApptStatus.confirmed,0xFF2A6AB5),
-      _s(userId, 9, 'Aisha Khan',      'Strategy Discussion', dt(3, 9, 0),'45 min','Room 3A, City Office',      'Bring Q3 report',          ApptStatus.confirmed,0xFF4A90D9),
-      _s(userId,10, 'Omar Farooq',     'Initial Consultation',dt(3,10, 0),'30 min','Video Call · Zoom',         'Send Zoom link first',     ApptStatus.confirmed,0xFF2ECC96),
-      _s(userId,11, 'Zara Malik',      'Hair Coloring & Cut', dt(3,11,30),'90 min','Style Studio, Gulberg',     '',                         ApptStatus.pending,  0xFFF4A24A),
-      _s(userId,12, 'Bilal Chaudhry',  'Physiotherapy',       dt(3,13, 0),'60 min','PhysioPlus Clinic',         'Follow-up from last week', ApptStatus.confirmed,0xFF7C3AED),
-      _s(userId,13, 'Hina Raza',       'Skin Care Session',   dt(3,14,30),'60 min','Glow Wellness Center',      '',                         ApptStatus.pending,  0xFFE05C5C),
-      _s(userId,14, 'Tariq Ahmed',     'Sports Massage',      dt(3,16, 0),'45 min','ActiveBody Spa',            'Deep tissue requested',    ApptStatus.confirmed,0xFF0D9E6A),
-      _s(userId,15, 'Sana Qureshi',    'Nail Art Session',    dt(3,17, 0),'30 min','Beauty Lounge, DHA',        'Client cancelled AM',      ApptStatus.cancelled,0xFF8AA0BC),
-      _s(userId,16, 'Nadia Hussain',   'Career Coaching',     dt(4,10, 0),'60 min','Video Call · Google Meet',  'Resume review',            ApptStatus.confirmed,0xFF4A90D9),
-      _s(userId,17, 'Kamran Iqbal',    'Legal Consultation',  dt(4,14, 0),'45 min','Office Block B, F-6',       '',                         ApptStatus.confirmed,0xFF7C3AED),
-      _s(userId,18, 'Ali Rehman',      'Dental Checkup',      dt(5, 9,30),'45 min','SmileCare Clinic',          '',                         ApptStatus.confirmed,0xFFF4A24A),
-      _s(userId,19, 'Sara Baig',       'Nutrition Planning',  dt(5,11, 0),'30 min','Wellness Hub, Bahria',      'First appointment',        ApptStatus.pending,  0xFF2ECC96),
-      _s(userId,20, 'Fatima Siddiqui', 'Eye Examination',     dt(6,15, 0),'30 min','VisionPlus Eye Center',     '',                         ApptStatus.confirmed,0xFFE05C5C),
-      _s(userId,21, 'Usman Tariq',     'Strategy Discussion', now.subtract(const Duration(days:4)),'60 min','Head Office','Completed',     ApptStatus.confirmed,0xFF0D9E6A),
-      _s(userId,22, 'Rabia Noor',      'Coaching Session',    now.subtract(const Duration(days:7)),'45 min','Video Call','Great session',  ApptStatus.confirmed,0xFF4A90D9),
-    ];
-    final batch = db.batch();
-    for (final s in seeds) batch.insert('appointments', s);
-    await batch.commit(noResult: true);
-  }
-
-  static Map<String, dynamic> _s(int userId, int num, String nm, String svc, DateTime dt,
-      String dur, String loc, String note, ApptStatus st, int clr) => {
-    'user_id':userId,'appt_number':num,'name':nm,'service':svc,
-    'date_time':dt.toIso8601String(),
-    'duration':dur,'location':loc,'note':note,'status':st.name,'color_value':clr,
-  };
 }
