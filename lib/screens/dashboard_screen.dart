@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 import 'call_screen.dart';
 import 'package:flutter/material.dart';
@@ -17,12 +19,32 @@ import '../screens/personal_tasks_screen.dart';
 import 'appointment_detail_screen.dart';
 import '../chat/chat.dart';
 import 'my_availability_screen.dart';
+import 'my_appointments_screen.dart';
 
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+/// Header + home-tab stats, computed in one pass (see
+/// `_DashboardScreenState._computeStats`).
+class _DashboardStats {
+  final int today;
+  final int clients;
+  final int pending;
+  final int doneWeek;
+  final int completedWeek;
+  final int cancelledWeek;
+  const _DashboardStats({
+    required this.today,
+    required this.clients,
+    required this.pending,
+    required this.doneWeek,
+    required this.completedWeek,
+    required this.cancelledWeek,
+  });
 }
 
 class _DashboardScreenState extends State<DashboardScreen>
@@ -44,8 +66,34 @@ class _DashboardScreenState extends State<DashboardScreen>
   double _fabBottom = 80.0;
   // ValueNotifier lets only the Positioned child rebuild during drag (not the whole screen)
   late final ValueNotifier<Offset> _fabPosNotifier;
-  String _userStatus = 'Available';
-  String _userPrivacy = 'Public';
+  // Status/privacy live in UserSession and are persisted in the
+  // users table by DBHelper.updateUserProfile — the SAME source the
+  // profile screen edits. The old dashboard kept a second in-memory
+  // copy that reset on restart and drifted from the profile.
+  String get _userStatus => UserSession.instance.profileStatus.isNotEmpty
+      ? UserSession.instance.profileStatus
+      : 'Available';
+  String get _userPrivacy => UserSession.instance.privacyMode.isNotEmpty
+      ? UserSession.instance.privacyMode
+      : 'Public';
+
+  Future<void> _setStatus(String value) async {
+    final uid = UserSession.instance.userId;
+    UserSession.instance.profileStatus = value;
+    if (uid != null) {
+      await DBHelper.instance.updateUserProfile(uid, profileStatus: value);
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _setPrivacy(String value) async {
+    final uid = UserSession.instance.userId;
+    UserSession.instance.privacyMode = value;
+    if (uid != null) {
+      await DBHelper.instance.updateUserProfile(uid, privacyMode: value);
+    }
+    if (mounted) setState(() {});
+  }
 
   late TabController _tabController;
   late AnimationController _heroCtrl;
@@ -61,10 +109,6 @@ class _DashboardScreenState extends State<DashboardScreen>
   // Real total unread chat messages (header badge). Loaded in
   // initState and refreshed when returning from the inbox.
   int _unreadChats = 0;
-
-  // ── Chart filters ──────────────────────────────────────────────────────────
-  String _chartPeriod = 'This Week';
-  String _chartMetric = 'All';
 
   // ── Header search (filters the appointments list) ───────────────────────
   final _searchCtrl = TextEditingController();
@@ -225,13 +269,91 @@ class _DashboardScreenState extends State<DashboardScreen>
       AppStateProvider.of(context).appointmentsForDate(_weekDays[_selectedDayIndex])
         ..sort((a, b) => a.dateTime.compareTo(b.dateTime));
 
-  // Tracks which notification keys the user has marked read
+  // Tracks which notification keys the user has marked read.
+  // Persisted in user_settings ('read_notifs') — the old in-memory
+  // set forgot everything on restart.
   final Set<String> _readNotifs = {};
 
-  int get _unreadCount => _liveNotifications.where((n) => !(n['read'] as bool)).length;
+  Future<void> _loadReadNotifs() async {
+    final uid = UserSession.instance.userId;
+    if (uid == null) return;
+    final raw = await DBHelper.instance.getUserSetting(uid, 'read_notifs');
+    if (raw == null || raw.isEmpty || !mounted) return;
+    try {
+      final list = (jsonDecode(raw) as List).cast<String>();
+      // Cap the stored set — keys are per-appointment and old ones
+      // stop matching anything once the appointment is gone.
+      _readNotifs.addAll(list.length > 500 ? list.sublist(list.length - 500) : list);
+    } catch (_) {
+      // Corrupt value: start fresh rather than crashing.
+    }
+    if (mounted) setState(() {});
+  }
 
-  List<Map<String, dynamic>> get _liveNotifications {
-    final all = AppStateProvider.of(context).appointments;
+  Future<void> _persistReadNotifs() async {
+    final uid = UserSession.instance.userId;
+    if (uid == null) return;
+    await DBHelper.instance.setUserSetting(
+        uid, 'read_notifs', jsonEncode(_readNotifs.toList()));
+  }
+
+  void _markNotifRead(String key) {
+    if (!_readNotifs.add(key)) return;
+    setState(() {});
+    unawaited(_persistReadNotifs());
+  }
+
+  void _markAllNotifsRead(Iterable<Map<String, dynamic>> notifs) {
+    var changed = false;
+    for (final n in notifs) {
+      changed = _readNotifs.add(n['key'] as String) || changed;
+    }
+    if (changed) unawaited(_persistReadNotifs());
+    setState(() => _showNotifications = false);
+  }
+
+  /// Dashboard header stats, computed in ONE pass over the
+  /// appointments list. Computed once per build() and passed down —
+  /// the old code recomputed them (4 passes + a Set build) on every
+  /// scroll frame inside the header's ValueListenableBuilder.
+  _DashboardStats _computeStats(List<Appointment> all) {
+    final now = DateTime.now();
+    final weekStart = DateTime(now.year, now.month, now.day)
+        .subtract(Duration(days: now.weekday - 1));
+    final weekEnd = weekStart.add(const Duration(days: 7));
+    var today = 0, pending = 0, doneWeek = 0, completedWeek = 0, cancelledWeek = 0;
+    final clientNames = <String>{};
+    for (final a in all) {
+      if (a.isToday) today++;
+      final key = a.name.trim().toLowerCase();
+      if (key.isNotEmpty) clientNames.add(key);
+      if (a.status == ApptStatus.pending) pending++;
+      final inWeek = !a.dateTime.isBefore(weekStart) && a.dateTime.isBefore(weekEnd);
+      if (inWeek) {
+        if (a.status == ApptStatus.completed ||
+            (a.status == ApptStatus.confirmed && a.isExpired)) {
+          doneWeek++;
+        }
+        if (a.status == ApptStatus.completed) completedWeek++;
+        if (a.status == ApptStatus.cancelled) cancelledWeek++;
+      }
+    }
+    return _DashboardStats(
+      today: today,
+      clients: clientNames.length,
+      pending: pending,
+      doneWeek: doneWeek,
+      completedWeek: completedWeek,
+      cancelledWeek: cancelledWeek,
+    );
+  }
+
+  /// Notifications derived from appointments. Computed ONCE per
+  /// build() and passed down — the old `_liveNotifications` getter
+  /// re-ran the whole scan (and sort) on every access: the unread
+  /// badge, the isEmpty check, the length, and every row index.
+  /// Each entry carries its appointment ('appt') so a tap can open it.
+  List<Map<String, dynamic>> _computeNotifications(List<Appointment> all) {
     final now = DateTime.now();
     final result = <Map<String, dynamic>>[];
 
@@ -258,7 +380,7 @@ class _DashboardScreenState extends State<DashboardScreen>
         result.add({'key': key, 'icon': Icons.notifications_active_rounded,
           'title': 'Upcoming appointment', 'sub': '${a.name} — ${a.time}',
           'time': ahead(a.dateTime), 'read': _readNotifs.contains(key),
-          'color': const Color(0xFFF4A24A)});
+          'color': const Color(0xFFF4A24A), 'appt': a});
       }
       // Completed today
       if (a.status == ApptStatus.completed && a.isToday) {
@@ -266,7 +388,7 @@ class _DashboardScreenState extends State<DashboardScreen>
         result.add({'key': key, 'icon': Icons.task_alt_rounded,
           'title': 'Session completed', 'sub': '${a.name} — ${a.time}',
           'time': relTime(a.dateTime), 'read': _readNotifs.contains(key),
-          'color': const Color(0xFF2E7D32)});
+          'color': const Color(0xFF2E7D32), 'appt': a});
       }
       // Cancelled today or recently confirmed
       if (a.status == ApptStatus.cancelled && a.isToday) {
@@ -274,7 +396,7 @@ class _DashboardScreenState extends State<DashboardScreen>
         result.add({'key': key, 'icon': Icons.cancel_rounded,
           'title': 'Booking cancelled', 'sub': '${a.name} — ${a.time}',
           'time': relTime(a.dateTime), 'read': _readNotifs.contains(key),
-          'color': const Color(0xFFE05C5C)});
+          'color': const Color(0xFFE05C5C), 'appt': a});
       }
       // Pending today (awaiting confirmation)
       if (a.status == ApptStatus.pending && a.isToday) {
@@ -282,7 +404,7 @@ class _DashboardScreenState extends State<DashboardScreen>
         result.add({'key': key, 'icon': Icons.hourglass_top_rounded,
           'title': 'Awaiting confirmation', 'sub': '${a.name} — ${a.time}',
           'time': relTime(a.dateTime), 'read': _readNotifs.contains(key),
-          'color': const Color(0xFF4A90D9)});
+          'color': const Color(0xFF4A90D9), 'appt': a});
       }
       // Confirmed (non-expired, today)
       if (a.status == ApptStatus.confirmed && a.isToday && !a.isExpired) {
@@ -290,7 +412,7 @@ class _DashboardScreenState extends State<DashboardScreen>
         result.add({'key': key, 'icon': Icons.check_circle_rounded,
           'title': 'Appointment confirmed', 'sub': '${a.name} — ${a.time}',
           'time': relTime(a.dateTime), 'read': _readNotifs.contains(key),
-          'color': const Color(0xFF0B3D91)});
+          'color': const Color(0xFF0B3D91), 'appt': a});
       }
     }
 
@@ -348,7 +470,9 @@ class _DashboardScreenState extends State<DashboardScreen>
         .animate(CurvedAnimation(parent: _heroCtrl, curve: Curves.easeOut));
     _cardsFade = CurvedAnimation(parent: _cardsCtrl, curve: Curves.easeOut);
     _heroCtrl.forward();
-    Future.delayed(const Duration(milliseconds: 300), () => _cardsCtrl.forward());
+    Future.delayed(const Duration(milliseconds: 300), () {
+      if (mounted) _cardsCtrl.forward();
+    });
 
     // Set today as the default selected day
     _selectedDayIndex = _todayWeekIdx();
@@ -356,8 +480,19 @@ class _DashboardScreenState extends State<DashboardScreen>
     // Initialize FAB position notifier; async _loadFabPosition will update it
     _fabPosNotifier = ValueNotifier(Offset(_fabRight, _fabBottom));
 
+    // System UI overlay: set ONCE here, not in build() (the old
+    // code called it on every build). No other screen changes the
+    // overlay style, so this stays correct for the session.
+    SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.light.copyWith(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.light,
+    ));
+
     // Load persisted FAB position
     _loadFabPosition();
+
+    // Load persisted read-notification state
+    _loadReadNotifs();
 
     // Real unread-chat total for the header badge.
     _loadUnreadChats();
@@ -455,95 +590,121 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   @override
   Widget build(BuildContext context) {
-    AppStateProvider.of(context);
-    SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.light.copyWith(
-      statusBarColor: Colors.transparent,
-      statusBarIconBrightness: Brightness.light,
-    ));
+    final appState = AppStateProvider.of(context);
+    // Compute stats + notifications ONCE per build and pass them
+    // down. The old code recomputed both inside the scroll-driven
+    // header builder on every scroll frame.
+    final stats = _computeStats(appState.appointments);
+    final notifications = _computeNotifications(appState.appointments);
+    final unreadCount =
+        notifications.where((n) => !(n['read'] as bool)).length;
     return Scaffold(
       key: _scaffoldKey,
       backgroundColor: _bg,
       drawer: DrawerWidget(userName: _userName, userInitials: _userInitials),
       body: Stack(children: [
         Column(children: [
-          ValueListenableBuilder<double>(
-            valueListenable: _headerProgress,
-            builder: (_, rawProgress, __) {
-              final progress = _isPinned ? 0.0 : rawProgress;
-              // ── Physical "screen going up" feel ───────────────────────
-              // Use LINEAR progress (no easing) so the header moves at
-              // exactly the same pace as the user's finger — 1:1 physical.
-              // Content slides UPWARD inside the ClipRect faster than the
-              // clip shrinks, so it feels like a page peeling off the top.
-              final contentOpacity = (1.0 - progress / 0.65).clamp(0.0, 1.0);
-              // Linear height shrink — physical, not eased
-              final heightFactor   = (1.0 - progress).clamp(0.0, 1.0);
-              // Content translate: slides up at 1.4× the height reduction
-              // — this is the core "screen going up" effect
-              final slideUp        = progress * 55.0;
-              final heroColors     = AppStateProvider.of(context).heroGradient;
-
-              return SlideTransition(
-                position: _heroSlide,
-                child: FadeTransition(
-                  opacity: _heroFade,
-                  child: Container(
-                    decoration: BoxDecoration(gradient: LinearGradient(
-                      begin: Alignment.topLeft, end: Alignment.bottomRight,
-                      colors: heroColors,
-                      stops: const [0.0, 0.35, 0.7, 1.0],
-                    )),
-                    child: Stack(children: [
-                      // Decorative orbs — fade with content
+          SlideTransition(
+            position: _heroSlide,
+            child: FadeTransition(
+              opacity: _heroFade,
+              child: Container(
+            decoration: BoxDecoration(gradient: LinearGradient(
+              begin: Alignment.topLeft, end: Alignment.bottomRight,
+              colors: appState.heroGradient,
+              stops: const [0.0, 0.35, 0.7, 1.0],
+            )),
+            child: Stack(children: [
+              // Decorative orbs — their own small builder so only the
+              // orb colours recompute per scroll frame, and the alpha
+              // is baked into the colour instead of an Opacity widget
+              // (Opacity forces a saveLayer per orb, per frame).
+              Positioned.fill(
+                child: ValueListenableBuilder<double>(
+                  valueListenable: _headerProgress,
+                  builder: (_, rawProgress, __) {
+                    final progress = _isPinned ? 0.0 : rawProgress;
+                    final contentOpacity =
+                        (1.0 - progress / 0.65).clamp(0.0, 1.0);
+                    return Stack(children: [
                       Positioned(right: -50, top: -50,
-                          child: Opacity(opacity: contentOpacity, child: _orb(220, _accent, 0.14))),
+                          child: _orb(220, _accent, 0.14 * contentOpacity)),
                       Positioned(left: -40, bottom: 20,
-                          child: Opacity(opacity: contentOpacity, child: _orb(160, Colors.white, 0.05))),
+                          child: _orb(160, Colors.white, 0.05 * contentOpacity)),
                       Positioned(right: 80, bottom: -15,
-                          child: Opacity(opacity: contentOpacity, child: _orb(90, _accent, 0.18))),
-                      SafeArea(bottom: false, child: Column(children: [
-                        // Top row — slides up and clips away (physical scroll)
-                        ClipRect(
-                          child: Align(
-                            alignment: Alignment.topCenter,
-                            heightFactor: heightFactor,
-                            child: Transform.translate(
-                              offset: Offset(0, -slideUp * 1.1),
-                              child: Opacity(opacity: contentOpacity, child: _buildTopRow()),
-                            ),
-                          ),
-                        ),
-                        // Greeting + stat pills — slide up slightly slower
-                        // (parallax layering so they all move together)
-                        ClipRect(
-                          child: Align(
-                            alignment: Alignment.topCenter,
-                            heightFactor: heightFactor,
-                            child: Transform.translate(
-                              offset: Offset(0, -slideUp * 0.65),
-                              child: Opacity(
-                                opacity: contentOpacity,
-                                child: Column(children: [
-                                  _buildGreeting(),
-                                  _buildStatPills(),
-                                ]),
+                          child: _orb(90, _accent, 0.18 * contentOpacity)),
+                    ]);
+                  },
+                ),
+              ),
+              SafeArea(bottom: false, child: Column(children: [
+                // Collapsible header content (top row + greeting +
+                // stat pills). Stats/notifications are computed once
+                // in build() and passed in — this builder only does
+                // layout math per scroll frame.
+                ValueListenableBuilder<double>(
+                  valueListenable: _headerProgress,
+                  builder: (_, rawProgress, __) {
+                    final progress = _isPinned ? 0.0 : rawProgress;
+                    // ── Physical "screen going up" feel ─────────────
+                    // Use LINEAR progress (no easing) so the header moves at
+                    // exactly the same pace as the user's finger — 1:1 physical.
+                    // Content slides UPWARD inside the ClipRect faster than the
+                    // clip shrinks, so it feels like a page peeling off the top.
+                    final contentOpacity = (1.0 - progress / 0.65).clamp(0.0, 1.0);
+                    // Linear height shrink — physical, not eased
+                    final heightFactor   = (1.0 - progress).clamp(0.0, 1.0);
+                    // Content translate: slides up at 1.4× the height reduction
+                    // — this is the core "screen going up" effect
+                    final slideUp        = progress * 55.0;
+
+                    return Column(children: [
+                          // Top row — slides up and clips away (physical scroll)
+                          ClipRect(
+                            child: Align(
+                              alignment: Alignment.topCenter,
+                              heightFactor: heightFactor,
+                              child: Transform.translate(
+                                offset: Offset(0, -slideUp * 1.1),
+                                child: Opacity(opacity: contentOpacity, child: _buildTopRow(unreadCount)),
                               ),
                             ),
                           ),
-                        ),
-                        // Search bar — always visible, anchors the header bottom
-                        _buildSearchBar(),
-                      ])),
-                    ]),
-                  ),
+                          // Greeting + stat pills — slide up slightly slower
+                          // (parallax layering so they all move together)
+                          ClipRect(
+                            child: Align(
+                              alignment: Alignment.topCenter,
+                              heightFactor: heightFactor,
+                              child: Transform.translate(
+                                offset: Offset(0, -slideUp * 0.65),
+                                child: Opacity(
+                                  opacity: contentOpacity,
+                                  child: Column(children: [
+                                    _buildGreeting(stats.today),
+                                    _buildStatPills(stats),
+                                  ]),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ]);
+                  },
                 ),
-              );
-            },
+                // Search bar — always visible, anchors the header
+                // bottom. It sits OUTSIDE the scroll-driven builders:
+                // it never changes with scroll, so rebuilding it per
+                // frame was pure waste.
+                _buildSearchBar(),
+              ])),
+            ]),
+              ),
+            ),
           ),
           Expanded(child: _searchQuery.isNotEmpty
               ? _buildSearchResults()
               : TabBarView(controller: _tabController, children: [
-            _buildHomeTab(), _buildScheduleTab(), _buildActionsTab(), _buildClientsTab(),
+            _buildHomeTab(stats), _buildScheduleTab(), _buildActionsTab(), _buildClientsTab(),
           ])),
         ]),
         // ── Notification overlay with smooth fade ────────────────────────────
@@ -563,7 +724,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                   child: Container(color: Colors.black.withOpacity(0.4)),
                 ),
               ),
-              _buildNotificationPanel(),
+              _buildNotificationPanel(notifications, unreadCount),
             ],
           )
               : const SizedBox.shrink(key: ValueKey('notif-closed')),
@@ -744,19 +905,21 @@ class _DashboardScreenState extends State<DashboardScreen>
           }),
           const SizedBox(height: 6),
           _fabBtn(_statusIcon, 'Status: $_userStatus', _statusColor, () {
-            setState(() {
-              final statuses = ['Available','Busy','Leave'];
-              _userStatus = statuses[(statuses.indexOf(_userStatus)+1) % statuses.length];
-              _showAccessFAB = false;
-            });
+            final statuses = ['Available','Busy','Leave'];
+            final next = statuses[(statuses.indexOf(_userStatus)+1) % statuses.length];
+            setState(() => _showAccessFAB = false);
+            // Persisted to the users table — the same value the
+            // profile screen shows and edits.
+            unawaited(_setStatus(next));
           }),
           const SizedBox(height: 6),
           _fabBtn(_privacyIcon, 'Privacy: $_userPrivacy', _privacyColor, () {
-            setState(() {
-              final modes = ['Public','Contacts Only','Protected','Private'];
-              _userPrivacy = modes[(modes.indexOf(_userPrivacy)+1) % modes.length];
-              _showAccessFAB = false;
-            });
+            final modes = ['Public','Contacts Only','Protected','Private'];
+            final next = modes[(modes.indexOf(_userPrivacy)+1) % modes.length];
+            setState(() => _showAccessFAB = false);
+            // Persisted to the users table — the same value the
+            // profile screen shows and edits.
+            unawaited(_setPrivacy(next));
           }),
           const SizedBox(height: 6),
           _fabBtn(Icons.notifications_rounded, 'Notifications', const Color(0xFFF4A24A), () {
@@ -922,7 +1085,7 @@ class _DashboardScreenState extends State<DashboardScreen>
     );
   }
 
-  Widget _buildTopRow() {
+  Widget _buildTopRow(int unreadCount) {
     final unreadChats = _unreadChats;
     return Padding(
       padding: const EdgeInsets.fromLTRB(18, 14, 18, 0),
@@ -979,7 +1142,7 @@ class _DashboardScreenState extends State<DashboardScreen>
           child: Stack(children: [
             _glassBox(child: const Icon(Icons.notifications_outlined,
                 color: Colors.white, size: 21)),
-            if (_unreadCount > 0)
+            if (unreadCount > 0)
               Positioned(top: 8, right: 8, child: Container(
                 width: 9, height: 9,
                 decoration: BoxDecoration(
@@ -1008,6 +1171,9 @@ class _DashboardScreenState extends State<DashboardScreen>
             ),
             child: ClipOval(child: UserSession.instance.profileImageBytes != null
                 ? Image.memory(UserSession.instance.profileImageBytes!,
+                // Decode at 2× display size — the old code decoded
+                // the full-resolution image for a 42px avatar.
+                cacheWidth: 84,
                 fit: BoxFit.cover, width: 42, height: 42)
                 : Center(child: Text(_userInitials, style: GoogleFonts.dmSans(
                 fontSize: 13, fontWeight: FontWeight.w900,
@@ -1026,7 +1192,13 @@ class _DashboardScreenState extends State<DashboardScreen>
     return '${weekdays[now.weekday - 1]}, ${months[now.month - 1]} ${now.day}, ${now.year}';
   }
 
-  Widget _buildGreeting() {
+  Widget _buildGreeting(int todayCount) {
+    final hour = DateTime.now().hour;
+    final greeting = hour < 12
+        ? 'Good morning'
+        : hour < 17
+            ? 'Good afternoon'
+            : 'Good evening';
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
       child: Column(crossAxisAlignment: CrossAxisAlignment.center, children: [
@@ -1036,12 +1208,12 @@ class _DashboardScreenState extends State<DashboardScreen>
                 color: Colors.white.withOpacity(0.6),
                 fontWeight: FontWeight.w600, letterSpacing: 0.5)),
         const SizedBox(height: 6),
-        Text('Good morning, $_firstName!',
+        Text('$greeting, $_firstName!',
             textAlign: TextAlign.center,
             style: GoogleFonts.dmSans(fontSize: 25,
                 fontWeight: FontWeight.w900, color: Colors.white, letterSpacing: -0.8)),
         const SizedBox(height: 4),
-        Text('You have ${AppStateProvider.of(context).appointments.where((a) => a.isToday).length} appointments today',
+        Text('You have $todayCount appointment${todayCount == 1 ? '' : 's'} today',
             textAlign: TextAlign.center,
             style: GoogleFonts.dmSans(fontSize: 13,
                 color: Colors.white.withOpacity(0.55), fontWeight: FontWeight.w500)),
@@ -1049,34 +1221,29 @@ class _DashboardScreenState extends State<DashboardScreen>
     );
   }
 
-  Widget _buildStatPills() {
+  Widget _buildStatPills(_DashboardStats stats) {
     final appState = AppStateProvider.of(context);
     final accentC  = appState.accent;
-    final all      = appState.appointments;
 
-    final todayCount = all.where((a) => a.isToday).length;
-
-    // Unique client names
-    final clientCount = all.map((a) => a.name.trim().toLowerCase()).toSet().length;
-
-    final pendingCount = all.where((a) => a.status == ApptStatus.pending).length;
-
-    // Completed this week
-    final now       = DateTime.now();
-    final weekStart = DateTime(now.year, now.month, now.day)
-        .subtract(Duration(days: now.weekday - 1));
-    final weekEnd   = weekStart.add(const Duration(days: 7));
-    final completedThisWeek = all.where((a) =>
-    (a.status == ApptStatus.completed ||
-        (a.status == ApptStatus.confirmed && a.isExpired)) &&
-        !a.dateTime.isBefore(weekStart) &&
-        a.dateTime.isBefore(weekEnd)).length;
+    // Pills navigate to the relevant filtered list — they used to be
+    // dead (not tappable at all).
+    void goToTab(int tab, [int? dayIndex]) {
+      if (dayIndex != null) {
+        setState(() => _selectedDayIndex = dayIndex);
+      }
+      _tabController.animateTo(tab);
+    }
 
     final pills = [
-      {'label': 'TODAY',     'value': '$todayCount',         'trend': 'Appointments'},
-      {'label': 'CLIENTS',   'value': '$clientCount',        'trend': 'Unique'},
-      {'label': 'PENDING',   'value': '$pendingCount',       'trend': 'Unconfirmed'},
-      {'label': 'DONE',      'value': '$completedThisWeek',  'trend': 'This week'},
+      {'label': 'TODAY',   'value': '${stats.today}',   'trend': 'Appointments',
+       'onTap': () => goToTab(1, _todayWeekIdx())},
+      {'label': 'CLIENTS', 'value': '${stats.clients}', 'trend': 'Unique',
+       'onTap': () => goToTab(3)},
+      {'label': 'PENDING', 'value': '${stats.pending}', 'trend': 'Unconfirmed',
+       'onTap': () => Navigator.push(context, _route(const IncomingRequestsScreen()))},
+      {'label': 'DONE',    'value': '${stats.doneWeek}', 'trend': 'This week',
+       'onTap': () => Navigator.push(context,
+           _route(const MyAppointmentsScreen(initialFilter: 3)))},
     ];
 
     return SizedBox(
@@ -1090,7 +1257,9 @@ class _DashboardScreenState extends State<DashboardScreen>
         separatorBuilder: (_, __) => const SizedBox(width: 10),
         itemBuilder: (_, i) => SizedBox(
           width: 106,
-          child: Container(
+          child: GestureDetector(
+            onTap: pills[i]['onTap'] as VoidCallback,
+            child: Container(
             padding: const EdgeInsets.fromLTRB(11, 9, 11, 9),
             decoration: BoxDecoration(
               color: Colors.white.withOpacity(0.07),
@@ -1099,10 +1268,10 @@ class _DashboardScreenState extends State<DashboardScreen>
             ),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                  Text(pills[i]['label']!, style: GoogleFonts.dmSans(fontSize: 8,
+                  Text(pills[i]['label'] as String, style: GoogleFonts.dmSans(fontSize: 8,
                       fontWeight: FontWeight.w700,
                       color: Colors.white.withOpacity(0.45), letterSpacing: 0.8)),
-                  Text(pills[i]['value']!, style: GoogleFonts.dmSans(fontSize: 19,
+                  Text(pills[i]['value'] as String, style: GoogleFonts.dmSans(fontSize: 19,
                       fontWeight: FontWeight.w900, color: Colors.white,
                       height: 1.0, letterSpacing: -0.5)),
                   Container(
@@ -1111,12 +1280,13 @@ class _DashboardScreenState extends State<DashboardScreen>
                       color: accentC.withOpacity(0.22),
                       borderRadius: BorderRadius.circular(20),
                     ),
-                    child: Text(pills[i]['trend']!, style: GoogleFonts.dmSans(
+                    child: Text(pills[i]['trend'] as String, style: GoogleFonts.dmSans(
                         fontSize: 8.5, fontWeight: FontWeight.w700,
                         color: Colors.white.withOpacity(0.85)),
                         overflow: TextOverflow.ellipsis, maxLines: 1),
                   ),
                 ]),
+            ),
           ),
         ),
       ),
@@ -1140,7 +1310,13 @@ class _DashboardScreenState extends State<DashboardScreen>
             const SizedBox(width: 10),
             Expanded(child: TextField(
               controller: _searchCtrl,
-              onChanged: (v) => setState(() => _searchQuery = v.trim()),
+              onChanged: (v) {
+                final q = v.trim();
+                // Only rebuild when the query actually changes —
+                // the old code rebuilt the whole dashboard on every
+                // keystroke, including trailing spaces.
+                if (q != _searchQuery) setState(() => _searchQuery = q);
+              },
               style: GoogleFonts.dmSans(
                   color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
               decoration: InputDecoration.collapsed(
@@ -1247,7 +1423,8 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   // ── NOTIFICATION PANEL ─────────────────────────────────────────────────────
-  Widget _buildNotificationPanel() {
+  Widget _buildNotificationPanel(
+      List<Map<String, dynamic>> notifications, int unreadCount) {
     return Positioned(
       top: 0, right: 0, left: 0,
       child: SafeArea(child: Padding(
@@ -1275,7 +1452,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                 Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Text('Notifications', style: GoogleFonts.dmSans(
                       fontSize: 16, fontWeight: FontWeight.w800, color: _txtMain)),
-                  Text('$_unreadCount unread', style: GoogleFonts.dmSans(
+                  Text('$unreadCount unread', style: GoogleFonts.dmSans(
                       fontSize: 11, color: _txtSub, fontWeight: FontWeight.w500)),
                 ])),
                 GestureDetector(
@@ -1287,7 +1464,7 @@ class _DashboardScreenState extends State<DashboardScreen>
               ]),
             ),
             Divider(color: _border, height: 1, thickness: 1),
-            if (_liveNotifications.isEmpty)
+            if (notifications.isEmpty)
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 28),
                 child: Column(children: [
@@ -1297,11 +1474,18 @@ class _DashboardScreenState extends State<DashboardScreen>
                       fontSize: 13, color: _txtSub, fontWeight: FontWeight.w500)),
                 ]),
               ),
-            ...List.generate(_liveNotifications.length, (i) {
-              final n = _liveNotifications[i];
+            ...List.generate(notifications.length, (i) {
+              final n = notifications[i];
               final read = n['read'] as bool;
               return GestureDetector(
-                  onTap: () => setState(() => _readNotifs.add(n['key'] as String)),
+                  // Tapping opens the appointment (and marks the
+                  // notification read, persisted). The old tap only
+                  // marked it read — a dead end.
+                  onTap: () {
+                    _markNotifRead(n['key'] as String);
+                    setState(() => _showNotifications = false);
+                    _showAppointmentSheet(n['appt'] as Appointment);
+                  },
                   child: Container(
                     margin: const EdgeInsets.fromLTRB(10, 5, 10, 0),
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
@@ -1342,10 +1526,7 @@ class _DashboardScreenState extends State<DashboardScreen>
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
               child: GestureDetector(
-                onTap: () => setState(() {
-                  for (final n in _liveNotifications) { _readNotifs.add(n['key'] as String); }
-                  _showNotifications = false;
-                }),
+                onTap: () => _markAllNotifsRead(notifications),
                 child: Container(
                   width: double.infinity,
                   padding: const EdgeInsets.symmetric(vertical: 11),
@@ -1367,7 +1548,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   // ── HOME TAB ────────────────────────────────────────────────────────────────
-  Widget _buildHomeTab() {
+  Widget _buildHomeTab(_DashboardStats stats) {
     return LayoutBuilder(
       builder: (context, constraints) {
         return RefreshIndicator(
@@ -1393,13 +1574,13 @@ class _DashboardScreenState extends State<DashboardScreen>
                       fontSize: 13.5, color: _txtSub,
                       fontWeight: FontWeight.w500)),
                   const SizedBox(height: 20),
-                  _buildStatCards(),
+                  _buildStatCards(stats),
                   const SizedBox(height: 14),
-                  _buildIncomingBanner(),
+                  _buildIncomingBanner(stats.pending),
                   const SizedBox(height: 18),
                   _buildUpcomingSection(),
                   const SizedBox(height: 18),
-                  RepaintBoundary(child: _buildWeeklyChart()),
+                  RepaintBoundary(child: const _WeeklyChartCard()),
                   const SizedBox(height: 18),
                   RepaintBoundary(child: _buildAnalyticsDonut()),
                 ]),
@@ -1411,55 +1592,47 @@ class _DashboardScreenState extends State<DashboardScreen>
     );
   }
 
-  Widget _buildStatCards() {
+  Widget _buildStatCards(_DashboardStats stats) {
     final appState = AppStateProvider.of(context);
     final accentC = appState.accent;
     final g = (int i) => appState.cardGradient(i);
 
-    final now       = DateTime.now();
-    final weekStart = DateTime(now.year, now.month, now.day)
-        .subtract(Duration(days: now.weekday - 1));
-    final weekEnd   = weekStart.add(const Duration(days: 7));
-    final allAppts  = appState.appointments;
-
-    final completedWeek = allAppts.where((a) =>
-        a.status == ApptStatus.completed &&
-        !a.dateTime.isBefore(weekStart) && a.dateTime.isBefore(weekEnd)).length;
-
-    final pendingAll    = allAppts.where((a) =>
-        a.status == ApptStatus.pending).length;
-
-    final cancelledWeek = allAppts.where((a) =>
-        a.status == ApptStatus.cancelled &&
-        !a.dateTime.isBefore(weekStart) && a.dateTime.isBefore(weekEnd)).length;
-
+    // Cards navigate to the relevant filtered list — they used to
+    // be dead (not tappable at all).
     return Column(children: [
       Row(children: [
         _quickStatTile(
           icon: Icons.event_available_rounded,
           label: 'This Week',
-          value: '$completedWeek',
+          value: '${stats.completedWeek}',
           sub: 'Completed',
           gradColors: g(0),
           accentC: accentC,
+          onTap: () => Navigator.push(context, _route(
+              const MyAppointmentsScreen(
+                  initialStatusFilter: ApptStatus.completed))),
         ),
         const SizedBox(width: 10),
         _quickStatTile(
           icon: Icons.pending_actions_rounded,
           label: 'Awaiting',
-          value: '$pendingAll',
+          value: '${stats.pending}',
           sub: 'Unconfirmed',
           gradColors: g(1),
           accentC: accentC,
+          onTap: () => Navigator.push(
+              context, _route(const IncomingRequestsScreen())),
         ),
         const SizedBox(width: 10),
         _quickStatTile(
           icon: Icons.cancel_rounded,
           label: 'Cancelled',
-          value: '$cancelledWeek',
+          value: '${stats.cancelledWeek}',
           sub: 'This week',
           gradColors: g(2),
           accentC: accentC,
+          onTap: () => Navigator.push(context, _route(
+              const MyAppointmentsScreen(initialFilter: 4))),
         ),
       ]),
 
@@ -1473,8 +1646,11 @@ class _DashboardScreenState extends State<DashboardScreen>
     required String sub,
     required List<Color> gradColors,
     required Color accentC,
+    VoidCallback? onTap,
   }) {
-    return Expanded(child: Container(
+    return Expanded(child: GestureDetector(
+      onTap: onTap,
+      child: Container(
       padding: const EdgeInsets.all(13),
       decoration: BoxDecoration(
         gradient: LinearGradient(
@@ -1511,14 +1687,10 @@ class _DashboardScreenState extends State<DashboardScreen>
               fontSize: 8.5, fontWeight: FontWeight.w700, color: Colors.white.withOpacity(0.9))),
         ),
       ]),
-    ));
+    )));
   }
 
-  Widget _buildIncomingBanner() {
-    final pendingCount = AppStateProvider.of(context)
-        .appointments
-        .where((a) => a.status == ApptStatus.pending)
-        .length;
+  Widget _buildIncomingBanner(int pendingCount) {
     return GestureDetector(
       onTap: () => Navigator.push(context, _route(const IncomingRequestsScreen())),
       child: Container(
@@ -1541,7 +1713,9 @@ class _DashboardScreenState extends State<DashboardScreen>
               border: Border.all(color: Colors.white.withOpacity(0.2)),
             ),
             child: const Center(
-              child: AnimatedAppointlyHandIcon(size: 28, color: Colors.white),
+              // Static icon: the animated version spins on a 7s
+              // loop forever, even when the banner is off-screen.
+              child: AppointlyHandIcon(size: 28, color: Colors.white),
             ),
           ),
           const SizedBox(width: 14),
@@ -1571,251 +1745,6 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   // ── CHART DATA SETS ────────────────────────────────────────────────────────
   // ── CHART: compute live from AppState ─────────────────────────────────────
-  Map<String, dynamic> get _activeChartData {
-    final all = AppStateProvider.of(context).appointments;
-    final now = DateTime.now();
-
-    bool matchMetric(Appointment a) {
-      switch (_chartMetric) {
-        case 'Confirmed': return a.status == ApptStatus.confirmed || a.status == ApptStatus.completed;
-        case 'Cancelled': return a.status == ApptStatus.cancelled;
-        case 'Pending':   return a.status == ApptStatus.pending;
-        default:          return true; // All
-      }
-    }
-
-    int countIn(DateTime start, DateTime end) =>
-        all.where((a) => matchMetric(a) &&
-            !a.dateTime.isBefore(start) && a.dateTime.isBefore(end)).length;
-
-    switch (_chartPeriod) {
-      case 'This Week': {
-        final monday = DateTime(now.year, now.month, now.day)
-            .subtract(Duration(days: now.weekday - 1));
-        const labels = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-        final data = List.generate(7, (i) {
-          final d = monday.add(Duration(days: i));
-          return countIn(d, d.add(const Duration(days: 1)));
-        });
-        return {'data': data, 'labels': labels, 'todayIdx': now.weekday - 1};
-      }
-      case 'Last Week': {
-        final monday = DateTime(now.year, now.month, now.day)
-            .subtract(Duration(days: now.weekday - 1 + 7));
-        const labels = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-        final data = List.generate(7, (i) {
-          final d = monday.add(Duration(days: i));
-          return countIn(d, d.add(const Duration(days: 1)));
-        });
-        return {'data': data, 'labels': labels, 'todayIdx': -1};
-      }
-      case 'This Month': {
-        final mStart = DateTime(now.year, now.month, 1);
-        final labels = ['Wk 1','Wk 2','Wk 3','Wk 4'];
-        final data = List.generate(4, (i) {
-          final s = mStart.add(Duration(days: i * 7));
-          final e = s.add(const Duration(days: 7));
-          return countIn(s, e);
-        });
-        final todayIdx = ((now.day - 1) ~/ 7).clamp(0, 3);
-        return {'data': data, 'labels': labels, 'todayIdx': todayIdx};
-      }
-      case 'Last 3 Months':
-      default: {
-        final months = List.generate(3, (i) =>
-            DateTime(now.year, now.month - 2 + i, 1));
-        final labels = months.map((m) {
-          const mo = ['Jan','Feb','Mar','Apr','May','Jun',
-            'Jul','Aug','Sep','Oct','Nov','Dec'];
-          return mo[m.month - 1];
-        }).toList();
-        final data = List.generate(3, (i) {
-          final s = months[i];
-          final e = DateTime(s.year, s.month + 1, 1);
-          return countIn(s, e);
-        });
-        return {'data': data, 'labels': labels, 'todayIdx': 2};
-      }
-    }
-  }
-
-  String get _chartSubtitle {
-    switch (_chartPeriod) {
-      case 'This Week':     return 'Day-by-day appointments this week';
-      case 'Last Week':     return 'Day-by-day appointments last week';
-      case 'This Month':    return 'Weekly breakdown this month';
-      case 'Last 3 Months': return 'Monthly trend over last 3 months';
-      default:              return 'Appointment performance';
-    }
-  }
-
-  // ── WEEKLY LINE CHART ──────────────────────────────────────────────────────
-  Widget _buildWeeklyChart() {
-    final chartData = _activeChartData;
-    final data     = (chartData['data']    as List).cast<int>();
-    final labels   = (chartData['labels']  as List).cast<String>();
-    final todayIdx = chartData['todayIdx'] as int;
-
-    const periods = ['This Week', 'Last Week', 'This Month', 'Last 3 Months'];
-    const metrics = ['All', 'Confirmed', 'Cancelled', 'Pending'];
-
-    return Container(
-      padding: const EdgeInsets.all(18),
-      decoration: _card(),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-
-        // ── Title row ────────────────────────────────────────────────────────
-        Row(children: [
-          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('Performance', style: GoogleFonts.dmSans(
-                fontSize: 16, fontWeight: FontWeight.w800, color: _txtMain)),
-            const SizedBox(height: 2),
-            Text(_chartSubtitle, style: GoogleFonts.dmSans(
-                fontSize: 11.5, color: _txtSub, fontWeight: FontWeight.w500)),
-          ])),
-          // Live total badge
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
-            decoration: BoxDecoration(
-              color: _accent.withOpacity(0.10),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: _accent.withOpacity(0.25)),
-            ),
-            child: Text(
-              '${data.reduce((a, b) => a + b)} total',
-              style: GoogleFonts.dmSans(fontSize: 11, fontWeight: FontWeight.w800, color: _accent),
-            ),
-          ),
-        ]),
-
-        const SizedBox(height: 14),
-
-        // ── Period filter chips ───────────────────────────────────────────────
-        SizedBox(
-          height: 32,
-          child: ListView(
-            scrollDirection: Axis.horizontal,
-            children: periods.map((p) {
-              final sel = _chartPeriod == p;
-              return GestureDetector(
-                onTap: () => setState(() => _chartPeriod = p),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 180),
-                  margin: const EdgeInsets.only(right: 8),
-                  padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
-                  decoration: BoxDecoration(
-                    gradient: sel ? LinearGradient(colors: _btnGradient) : null,
-                    color: sel ? null : _cardBg,
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(
-                      color: sel ? _accent.withOpacity(0.5) : _border,
-                      width: 1.3,
-                    ),
-                    boxShadow: sel ? [BoxShadow(
-                        color: _btnShadow.withOpacity(0.28),
-                        blurRadius: 8, offset: const Offset(0, 3))] : [],
-                  ),
-                  child: Text(p, style: GoogleFonts.dmSans(
-                      fontSize: 11.5, fontWeight: FontWeight.w700,
-                      color: sel ? Colors.white : _txtSub)),
-                ),
-              );
-            }).toList(),
-          ),
-        ),
-
-        const SizedBox(height: 10),
-
-        // ── Metric filter chips ───────────────────────────────────────────────
-        SizedBox(
-          height: 28,
-          child: ListView(
-            scrollDirection: Axis.horizontal,
-            children: metrics.map((m) {
-              final sel = _chartMetric == m;
-              final metricColor = m == 'Confirmed' ? const Color(0xFF2ECC96)
-                  : m == 'Cancelled' ? const Color(0xFFE05C5C)
-                  : m == 'Pending'   ? const Color(0xFFF4A24A)
-                  : _accent;
-              return GestureDetector(
-                onTap: () => setState(() => _chartMetric = m),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 180),
-                  margin: const EdgeInsets.only(right: 8),
-                  padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: sel ? metricColor.withOpacity(0.14) : Colors.transparent,
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(
-                      color: sel ? metricColor.withOpacity(0.55) : _border.withOpacity(0.6),
-                      width: 1.2,
-                    ),
-                  ),
-                  child: Row(mainAxisSize: MainAxisSize.min, children: [
-                    Container(
-                      width: 6, height: 6,
-                      decoration: BoxDecoration(
-                        color: sel ? metricColor : _txtSub.withOpacity(0.5),
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                    const SizedBox(width: 5),
-                    Text(m, style: GoogleFonts.dmSans(
-                        fontSize: 11, fontWeight: FontWeight.w700,
-                        color: sel ? metricColor : _txtSub)),
-                  ]),
-                ),
-              );
-            }).toList(),
-          ),
-        ),
-
-        const SizedBox(height: 20),
-
-        // ── Chart ─────────────────────────────────────────────────────────────
-        SizedBox(height: 150, child: CustomPaint(
-          painter: _LineChartPainter(
-            data:           data,
-            labels:         labels,
-            todayIdx:       todayIdx,
-            lineColor:      _chartMetric == 'Confirmed' ? const Color(0xFF2ECC96)
-                : _chartMetric == 'Cancelled' ? const Color(0xFFE05C5C)
-                : _chartMetric == 'Pending'   ? const Color(0xFFF4A24A)
-                : _accent,
-            todayDotColor:  _btnShadow,
-            gridColor:      _border,
-            labelColor:     _txtSub,
-            todayLabelColor: _btnShadow,
-            bgDark:         _dark,
-          ),
-          size: const Size(double.infinity, 150),
-        )),
-
-        const SizedBox(height: 14),
-        Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          if (todayIdx >= 0) ...[
-            _legendDot(_btnShadow, 'Today'),
-            const SizedBox(width: 20),
-          ],
-          _legendDot(
-            _chartMetric == 'Confirmed' ? const Color(0xFF2ECC96)
-                : _chartMetric == 'Cancelled' ? const Color(0xFFE05C5C)
-                : _chartMetric == 'Pending'   ? const Color(0xFFF4A24A)
-                : _accent,
-            _chartMetric == 'All' ? 'Appointments' : _chartMetric,
-          ),
-        ]),
-      ]),
-    );
-  }
-
-  Widget _legendDot(Color c, String label) => Row(children: [
-    Container(width: 9, height: 9, decoration: BoxDecoration(color: c, shape: BoxShape.circle)),
-    const SizedBox(width: 6),
-    Text(label, style: GoogleFonts.dmSans(
-        fontSize: 11.5, color: _txtSub, fontWeight: FontWeight.w600)),
-  ]);
-
   // ── DONUT CHART CARD ───────────────────────────────────────────────────────
   Widget _buildAnalyticsDonut() {
     final appState = AppStateProvider.of(context);
@@ -2011,7 +1940,7 @@ class _DashboardScreenState extends State<DashboardScreen>
         ),
       ]),
 
-      // Floating Add Task Button — bottom-left to avoid the accessibility FAB
+      // Floating New Appointment button — bottom-left to avoid the accessibility FAB
       Positioned(
         bottom: 24, left: 16,
         child: GestureDetector(
@@ -2041,7 +1970,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                   child: const Icon(Icons.add_rounded,
                       color: Colors.white, size: 20)),
               const SizedBox(width: 10),
-              Text('Add Task', style: GoogleFonts.dmSans(
+              Text('New Appointment', style: GoogleFonts.dmSans(
                   fontSize: 14, fontWeight: FontWeight.w800,
                   color: Colors.white, letterSpacing: -0.2)),
             ]),
@@ -2111,7 +2040,7 @@ class _DashboardScreenState extends State<DashboardScreen>
         Text('No appointments', style: GoogleFonts.dmSans(
             fontSize: 16, fontWeight: FontWeight.w800, color: _txtMain)),
         const SizedBox(height: 6),
-        Text('Tap Add Task to book a new appointment', style: GoogleFonts.dmSans(
+        Text('Tap New Appointment to book a new appointment', style: GoogleFonts.dmSans(
             fontSize: 13, color: _txtSub, fontWeight: FontWeight.w500)),
       ]),
     );
@@ -2235,7 +2164,6 @@ class _DashboardScreenState extends State<DashboardScreen>
     final actions = [
       {'label': 'New Appointment', 'desc': 'Book a new slot',     'icon': Icons.add_circle_rounded,     's': const NewAppointmentScreen()},
 
-      // YAHAN YEH NAYI LINE ADD KI HAI (Video Call ke liye)
       {'label': 'Video Call', 'desc': 'Call another user',   'icon': Icons.video_camera_front_rounded, 's': const StartCallScreen()},
 
       {'label': 'My Availability', 'desc': 'Set your open slots', 'icon': Icons.event_available_rounded, 's': const MyAvailabilityScreen()},
@@ -2306,118 +2234,129 @@ class _DashboardScreenState extends State<DashboardScreen>
         if (byCount != 0) return byCount;
         return x.value.first.name.compareTo(y.value.first.name);
       });
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        return RefreshIndicator(
-          onRefresh: () => AppStateProvider.of(context).loadAppointments(),
-          child: SingleChildScrollView(
-            controller: _clientsScrollCtrl,
-                        physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-            padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
-            child: ConstrainedBox(
-              // Ensure content is always taller than the viewport so scroll
-              // events fire and the header collapse/expand animation works
-              // even when there is limited content on this tab.
-              constraints: BoxConstraints(minHeight: constraints.maxHeight + _collapseRange),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                _sectionLabel('Recent Clients'),
-                const SizedBox(height: 6),
-                Text(
-                    clients.isEmpty
-                        ? 'People you have appointments with'
-                        : '${clients.length} client${clients.length == 1 ? '' : 's'}',
-                    style: GoogleFonts.dmSans(
-                        fontSize: 13.5, color: _txtSub, fontWeight: FontWeight.w500)),
-                const SizedBox(height: 16),
-                if (clients.isEmpty)
-                  Container(
-                    decoration: _card(),
-                    padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 20),
-                    child: Center(
-                      child: Column(mainAxisSize: MainAxisSize.min, children: [
-                        Icon(Icons.people_alt_outlined, size: 40,
-                            color: _txtSub.withOpacity(0.5)),
-                        const SizedBox(height: 12),
-                        Text('No clients yet', style: GoogleFonts.dmSans(
-                            fontSize: 15, fontWeight: FontWeight.w800, color: _txtMain)),
-                        const SizedBox(height: 4),
-                        Text('Clients appear here after appointments.',
-                            textAlign: TextAlign.center,
-                            style: GoogleFonts.dmSans(
-                                fontSize: 12.5, color: _txtSub, fontWeight: FontWeight.w500)),
-                      ]),
-                    ),
-                  )
-                else
-                  Container(
-                    decoration: _card(),
-                    padding: const EdgeInsets.all(8),
-                    child: Column(children: clients.map((e) {
-                      final appts = e.value;
-                      final first = appts.first;
-                      final latest = appts
-                          .map((a) => a.dateTime)
-                          .reduce((x, y) => x.isAfter(y) ? x : y);
-                      final now = DateTime.now();
-                      final today = DateTime(now.year, now.month, now.day);
-                      final latestDay = DateTime(latest.year, latest.month, latest.day);
-                      final latestLabel = latestDay == today
-                          ? 'Today'
-                          : latestDay == today.add(const Duration(days: 1))
-                              ? 'Tomorrow'
-                              : '${latest.day}/${latest.month}/${latest.year}';
-                      return Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 10),
-                        child: Row(children: [
-                          CircleAvatar(
-                            radius: 20,
-                            backgroundColor:
-                                first.avatarColor.withOpacity(_dark ? 0.2 : 0.15),
-                            child: Text(first.initials,
-                                style: GoogleFonts.dmSans(
-                                    fontSize: 11, fontWeight: FontWeight.w900,
-                                    color: first.avatarColor)),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(first.name,
-                                    style: GoogleFonts.dmSans(
-                                        fontSize: 13.5,
-                                        fontWeight: FontWeight.w700,
-                                        color: _txtMain, letterSpacing: -0.1)),
-                                const SizedBox(height: 2),
-                                Text('Latest: $latestLabel',
-                                    style: GoogleFonts.dmSans(
-                                        fontSize: 11.5, color: _txtSub,
-                                        fontWeight: FontWeight.w500)),
-                              ])),
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 10, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: _accent.withOpacity(0.1),
-                              borderRadius: BorderRadius.circular(20),
-                              border: Border.all(
-                                  color: _accent.withOpacity(0.25)),
-                            ),
-                            child: Text(
-                                '${appts.length} appt${appts.length == 1 ? '' : 's'}',
-                                style: GoogleFonts.dmSans(
-                                    fontSize: 11, fontWeight: FontWeight.w800,
-                                    color: _accent)),
-                          ),
+    // Header + one row per client + a bottom spacer that leaves
+    // scroll room for the collapsing header.
+    final itemCount = clients.isEmpty ? 2 : clients.length + 2;
+    return RefreshIndicator(
+      onRefresh: () => AppStateProvider.of(context).loadAppointments(),
+      // ListView.builder: rows are built lazily. The old code built
+      // EVERY client row eagerly in a Column inside a
+      // SingleChildScrollView.
+      child: ListView.builder(
+        controller: _clientsScrollCtrl,
+        physics: const BouncingScrollPhysics(
+            parent: AlwaysScrollableScrollPhysics()),
+        padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
+        itemCount: itemCount,
+        itemBuilder: (_, i) {
+          if (i == 0) {
+            return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _sectionLabel('Recent Clients'),
+                  const SizedBox(height: 6),
+                  Text(
+                      clients.isEmpty
+                          ? 'People you have appointments with'
+                          : '${clients.length} client${clients.length == 1 ? '' : 's'}',
+                      style: GoogleFonts.dmSans(
+                          fontSize: 13.5,
+                          color: _txtSub,
+                          fontWeight: FontWeight.w500)),
+                  const SizedBox(height: 16),
+                  if (clients.isEmpty)
+                    Container(
+                      decoration: _card(),
+                      padding: const EdgeInsets.symmetric(
+                          vertical: 32, horizontal: 20),
+                      child: Center(
+                        child: Column(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.people_alt_outlined, size: 40,
+                              color: _txtSub.withOpacity(0.5)),
+                          const SizedBox(height: 12),
+                          Text('No clients yet', style: GoogleFonts.dmSans(
+                              fontSize: 15, fontWeight: FontWeight.w800, color: _txtMain)),
+                          const SizedBox(height: 4),
+                          Text('Clients appear here after appointments.',
+                              textAlign: TextAlign.center,
+                              style: GoogleFonts.dmSans(
+                                  fontSize: 12.5, color: _txtSub, fontWeight: FontWeight.w500)),
                         ]),
-                      );
-                    }).toList()),
+                      ),
+                    ),
+                ]);
+          }
+          if (i == itemCount - 1) {
+            return const SizedBox(height: _collapseRange);
+          }
+          final e = clients[i - 1];
+          final appts = e.value;
+          final first = appts.first;
+          final latest = appts
+              .map((a) => a.dateTime)
+              .reduce((x, y) => x.isAfter(y) ? x : y);
+          final now = DateTime.now();
+          final today = DateTime(now.year, now.month, now.day);
+          final latestDay = DateTime(latest.year, latest.month, latest.day);
+          final latestLabel = latestDay == today
+              ? 'Today'
+              : latestDay == today.add(const Duration(days: 1))
+                  ? 'Tomorrow'
+                  : '${latest.day}/${latest.month}/${latest.year}';
+          // Tapping opens that client's appointments, pre-searched.
+          // The old rows were not tappable at all — a dead end.
+          return GestureDetector(
+            onTap: () => Navigator.push(context, _route(
+                MyAppointmentsScreen(initialSearchQuery: first.name))),
+            child: Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              decoration: _card(),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+              child: Row(children: [
+                CircleAvatar(
+                  radius: 20,
+                  backgroundColor:
+                      first.avatarColor.withOpacity(_dark ? 0.2 : 0.15),
+                  child: Text(first.initials,
+                      style: GoogleFonts.dmSans(
+                          fontSize: 11, fontWeight: FontWeight.w900,
+                          color: first.avatarColor)),
+                ),
+                const SizedBox(width: 12),
+                Expanded(child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(first.name,
+                          style: GoogleFonts.dmSans(
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.w700,
+                              color: _txtMain, letterSpacing: -0.1)),
+                      const SizedBox(height: 2),
+                      Text('Latest: $latestLabel',
+                          style: GoogleFonts.dmSans(
+                              fontSize: 11.5, color: _txtSub,
+                              fontWeight: FontWeight.w500)),
+                    ])),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _accent.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                        color: _accent.withOpacity(0.25)),
                   ),
+                  child: Text(
+                      '${appts.length} appt${appts.length == 1 ? '' : 's'}',
+                      style: GoogleFonts.dmSans(
+                          fontSize: 11, fontWeight: FontWeight.w800,
+                          color: _accent)),
+                ),
               ]),
             ),
-          ),
-        );
-      },
+          );
+        },
+      ),
     );
   }
 
@@ -2552,6 +2491,296 @@ extension AppState_ext on AppState {
   static bool of(BuildContext context) => AppStateProvider.of(context).isDarkMode;
 }
 
+// ── WEEKLY LINE CHART (own widget) ──────────────────────────────────────────
+// Extracted from _DashboardScreenState so the period/metric filter
+// chips only rebuild this card — the old code kept _chartPeriod /
+// _chartMetric in the dashboard state, so every chip tap rebuilt
+// the entire dashboard (all four tabs).
+class _WeeklyChartCard extends StatefulWidget {
+  const _WeeklyChartCard();
+  @override
+  State<_WeeklyChartCard> createState() => _WeeklyChartCardState();
+}
+
+class _WeeklyChartCardState extends State<_WeeklyChartCard> {
+  String _chartPeriod = 'This Week';
+  String _chartMetric = 'All';
+
+  bool get _dark => AppState_ext.of(context);
+  Color get _cardBg  => AppStateProvider.of(context).cardBg;
+  Color get _border  => AppStateProvider.of(context).border;
+  Color get _txtMain => AppStateProvider.of(context).txtMain;
+  Color get _txtSub  => AppStateProvider.of(context).txtSub;
+  Color get _accent  => AppStateProvider.of(context).accent;
+  List<Color> get _btnGradient => AppStateProvider.of(context).btnGradient;
+  Color get _btnShadow => AppStateProvider.of(context).btnShadow;
+
+  BoxDecoration _card({double r = 20}) => BoxDecoration(
+    color: _cardBg,
+    borderRadius: BorderRadius.circular(r),
+    border: Border.all(color: _border, width: 1.5),
+    boxShadow: [BoxShadow(color: _btnShadow.withOpacity(0.07),
+        blurRadius: 18, offset: const Offset(0, 5))],
+  );
+
+  Map<String, dynamic> get _activeChartData {
+    final all = AppStateProvider.of(context).appointments;
+    final now = DateTime.now();
+
+    bool matchMetric(Appointment a) {
+      switch (_chartMetric) {
+        case 'Confirmed': return a.status == ApptStatus.confirmed || a.status == ApptStatus.completed;
+        case 'Cancelled': return a.status == ApptStatus.cancelled;
+        case 'Pending':   return a.status == ApptStatus.pending;
+        default:          return true; // All
+      }
+    }
+
+    int countIn(DateTime start, DateTime end) =>
+        all.where((a) => matchMetric(a) &&
+            !a.dateTime.isBefore(start) && a.dateTime.isBefore(end)).length;
+
+    switch (_chartPeriod) {
+      case 'This Week': {
+        final monday = DateTime(now.year, now.month, now.day)
+            .subtract(Duration(days: now.weekday - 1));
+        const labels = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+        final data = List.generate(7, (i) {
+          final d = monday.add(Duration(days: i));
+          return countIn(d, d.add(const Duration(days: 1)));
+        });
+        return {'data': data, 'labels': labels, 'todayIdx': now.weekday - 1};
+      }
+      case 'Last Week': {
+        final monday = DateTime(now.year, now.month, now.day)
+            .subtract(Duration(days: now.weekday - 1 + 7));
+        const labels = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+        final data = List.generate(7, (i) {
+          final d = monday.add(Duration(days: i));
+          return countIn(d, d.add(const Duration(days: 1)));
+        });
+        return {'data': data, 'labels': labels, 'todayIdx': -1};
+      }
+      case 'This Month': {
+        final mStart = DateTime(now.year, now.month, 1);
+        final labels = ['Wk 1','Wk 2','Wk 3','Wk 4'];
+        final data = List.generate(4, (i) {
+          final s = mStart.add(Duration(days: i * 7));
+          final e = s.add(const Duration(days: 7));
+          return countIn(s, e);
+        });
+        final todayIdx = ((now.day - 1) ~/ 7).clamp(0, 3);
+        return {'data': data, 'labels': labels, 'todayIdx': todayIdx};
+      }
+      case 'Last 3 Months':
+      default: {
+        final months = List.generate(3, (i) =>
+            DateTime(now.year, now.month - 2 + i, 1));
+        final labels = months.map((m) {
+          const mo = ['Jan','Feb','Mar','Apr','May','Jun',
+            'Jul','Aug','Sep','Oct','Nov','Dec'];
+          return mo[m.month - 1];
+        }).toList();
+        final data = List.generate(3, (i) {
+          final s = months[i];
+          final e = DateTime(s.year, s.month + 1, 1);
+          return countIn(s, e);
+        });
+        return {'data': data, 'labels': labels, 'todayIdx': 2};
+      }
+    }
+  }
+
+  String get _chartSubtitle {
+    switch (_chartPeriod) {
+      case 'This Week':     return 'Day-by-day appointments this week';
+      case 'Last Week':     return 'Day-by-day appointments last week';
+      case 'This Month':    return 'Weekly breakdown this month';
+      case 'Last 3 Months': return 'Monthly trend over last 3 months';
+      default:              return 'Appointment performance';
+    }
+  }
+
+  // ── WEEKLY LINE CHART ──────────────────────────────────────────────────────
+  @override
+  Widget build(BuildContext context) {
+    final chartData = _activeChartData;
+    final data     = (chartData['data']    as List).cast<int>();
+    final labels   = (chartData['labels']  as List).cast<String>();
+    final todayIdx = chartData['todayIdx'] as int;
+
+    const periods = ['This Week', 'Last Week', 'This Month', 'Last 3 Months'];
+    const metrics = ['All', 'Confirmed', 'Cancelled', 'Pending'];
+
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: _card(),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+
+        // ── Title row ────────────────────────────────────────────────────────
+        Row(children: [
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Performance', style: GoogleFonts.dmSans(
+                fontSize: 16, fontWeight: FontWeight.w800, color: _txtMain)),
+            const SizedBox(height: 2),
+            Text(_chartSubtitle, style: GoogleFonts.dmSans(
+                fontSize: 11.5, color: _txtSub, fontWeight: FontWeight.w500)),
+          ])),
+          // Live total badge
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
+            decoration: BoxDecoration(
+              color: _accent.withOpacity(0.10),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: _accent.withOpacity(0.25)),
+            ),
+            child: Text(
+              '${data.reduce((a, b) => a + b)} total',
+              style: GoogleFonts.dmSans(fontSize: 11, fontWeight: FontWeight.w800, color: _accent),
+            ),
+          ),
+        ]),
+
+        const SizedBox(height: 14),
+
+        // ── Period filter chips ───────────────────────────────────────────────
+        SizedBox(
+          height: 32,
+          child: ListView(
+            scrollDirection: Axis.horizontal,
+            children: periods.map((p) {
+              final sel = _chartPeriod == p;
+              return GestureDetector(
+                onTap: () => setState(() => _chartPeriod = p),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 180),
+                  margin: const EdgeInsets.only(right: 8),
+                  padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
+                  decoration: BoxDecoration(
+                    gradient: sel ? LinearGradient(colors: _btnGradient) : null,
+                    color: sel ? null : _cardBg,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: sel ? _accent.withOpacity(0.5) : _border,
+                      width: 1.3,
+                    ),
+                    boxShadow: sel ? [BoxShadow(
+                        color: _btnShadow.withOpacity(0.28),
+                        blurRadius: 8, offset: const Offset(0, 3))] : [],
+                  ),
+                  child: Text(p, style: GoogleFonts.dmSans(
+                      fontSize: 11.5, fontWeight: FontWeight.w700,
+                      color: sel ? Colors.white : _txtSub)),
+                ),
+              );
+            }).toList(),
+          ),
+        ),
+
+        const SizedBox(height: 10),
+
+        // ── Metric filter chips ───────────────────────────────────────────────
+        SizedBox(
+          height: 28,
+          child: ListView(
+            scrollDirection: Axis.horizontal,
+            children: metrics.map((m) {
+              final sel = _chartMetric == m;
+              final metricColor = m == 'Confirmed' ? const Color(0xFF2ECC96)
+                  : m == 'Cancelled' ? const Color(0xFFE05C5C)
+                  : m == 'Pending'   ? const Color(0xFFF4A24A)
+                  : _accent;
+              return GestureDetector(
+                onTap: () => setState(() => _chartMetric = m),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 180),
+                  margin: const EdgeInsets.only(right: 8),
+                  padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: sel ? metricColor.withOpacity(0.14) : Colors.transparent,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                      color: sel ? metricColor.withOpacity(0.55) : _border.withOpacity(0.6),
+                      width: 1.2,
+                    ),
+                  ),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Container(
+                      width: 6, height: 6,
+                      decoration: BoxDecoration(
+                        color: sel ? metricColor : _txtSub.withOpacity(0.5),
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 5),
+                    Text(m, style: GoogleFonts.dmSans(
+                        fontSize: 11, fontWeight: FontWeight.w700,
+                        color: sel ? metricColor : _txtSub)),
+                  ]),
+                ),
+              );
+            }).toList(),
+          ),
+        ),
+
+        const SizedBox(height: 20),
+
+        // ── Chart ─────────────────────────────────────────────────────────────
+        SizedBox(height: 150, child: CustomPaint(
+          painter: _LineChartPainter(
+            data:           data,
+            labels:         labels,
+            todayIdx:       todayIdx,
+            lineColor:      _chartMetric == 'Confirmed' ? const Color(0xFF2ECC96)
+                : _chartMetric == 'Cancelled' ? const Color(0xFFE05C5C)
+                : _chartMetric == 'Pending'   ? const Color(0xFFF4A24A)
+                : _accent,
+            todayDotColor:  _btnShadow,
+            gridColor:      _border,
+            labelColor:     _txtSub,
+            todayLabelColor: _btnShadow,
+            bgDark:         _dark,
+          ),
+          size: const Size(double.infinity, 150),
+        )),
+
+        const SizedBox(height: 14),
+        Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+          if (todayIdx >= 0) ...[
+            _legendDot(_btnShadow, 'Today'),
+            const SizedBox(width: 20),
+          ],
+          _legendDot(
+            _chartMetric == 'Confirmed' ? const Color(0xFF2ECC96)
+                : _chartMetric == 'Cancelled' ? const Color(0xFFE05C5C)
+                : _chartMetric == 'Pending'   ? const Color(0xFFF4A24A)
+                : _accent,
+            _chartMetric == 'All' ? 'Appointments' : _chartMetric,
+          ),
+        ]),
+      ]),
+    );
+  }
+
+  Widget _legendDot(Color c, String label) => Row(children: [
+    Container(width: 9, height: 9, decoration: BoxDecoration(color: c, shape: BoxShape.circle)),
+    const SizedBox(width: 6),
+    Text(label, style: GoogleFonts.dmSans(
+        fontSize: 11.5, color: _txtSub, fontWeight: FontWeight.w600)),
+  ]);
+
+}
+
+/// Element-wise list equality for the chart painters' shouldRepaint.
+bool _listEquals<T>(List<T> a, List<T> b) {
+  if (identical(a, b)) return true;
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
 // ── LINE CHART CUSTOM PAINTER ─────────────────────────────────────────────────
 class _LineChartPainter extends CustomPainter {
   final List<int> data;
@@ -2578,7 +2807,10 @@ class _LineChartPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    // Guard maxVal == 0 (no appointments): dividing by 0 produced
+    // NaN points and an invisible/broken chart.
     final maxVal = data.reduce((a, b) => a > b ? a : b).toDouble();
+    final safeMax = maxVal == 0 ? 1.0 : maxVal;
     final chartH = size.height - 28.0;
     final stepX = size.width / (data.length - 1);
 
@@ -2590,7 +2822,7 @@ class _LineChartPainter extends CustomPainter {
 
     final pts = List.generate(data.length, (i) => Offset(
       i * stepX,
-      chartH * (1 - data[i] / maxVal),
+      chartH * (1 - data[i] / safeMax),
     ));
 
     final fillPath = Path()..moveTo(pts.first.dx, chartH);
@@ -2640,8 +2872,11 @@ class _LineChartPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_LineChartPainter old) =>
-      old.data != data ||
-      old.labels != labels ||
+      // Lists are compared by CONTENT: the old identity check was
+      // always true (new lists are built per build), so the chart
+      // repainted on every rebuild.
+      !_listEquals(old.data, data) ||
+      !_listEquals(old.labels, labels) ||
       old.todayIdx != todayIdx ||
       old.lineColor != lineColor ||
       old.todayDotColor != todayDotColor ||
@@ -2709,5 +2944,9 @@ class _DonutPainter extends CustomPainter {
       old.confirmedFrac != confirmedFrac ||
       old.completedFrac != completedFrac ||
       old.cancelledFrac != cancelledFrac ||
-      old.pendingFrac != pendingFrac;
+      old.pendingFrac != pendingFrac ||
+      // Colours were ignored — the donut went stale on theme change.
+      old.trackColor != trackColor ||
+      old.accentColor != accentColor ||
+      old.secondColor != secondColor;
 }

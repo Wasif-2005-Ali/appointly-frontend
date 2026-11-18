@@ -23,7 +23,19 @@ int _durMinsFromStr(String d) {
 }
 
 class MyAppointmentsScreen extends StatefulWidget {
-  const MyAppointmentsScreen({super.key});
+  /// Opens the list pre-filtered: 0 All, 1 Today, 2 Upcoming,
+  /// 3 Past, 4 Cancelled (see `_filters`).
+  final int initialFilter;
+  /// Opens the list pre-filtered to one status (null = all).
+  final ApptStatus? initialStatusFilter;
+  /// Opens the list pre-searched (e.g. one client's name).
+  final String initialSearchQuery;
+  const MyAppointmentsScreen({
+    super.key,
+    this.initialFilter = 0,
+    this.initialStatusFilter,
+    this.initialSearchQuery = '',
+  });
   @override
   State<MyAppointmentsScreen> createState() => _MyAppointmentsScreenState();
 }
@@ -36,14 +48,20 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
   late Animation<double> _headerFade;
   late Animation<Offset> _headerSlide;
 
-  int _selectedFilter = 0;
+  late int _selectedFilter;
   final List<String> _filters = ['All', 'Today', 'Upcoming', 'Past', 'Cancelled'];
 
   // Local text search (header search icon) + status filter (tune icon).
   final _searchCtrl = TextEditingController();
   String _searchQuery = '';
   bool _searching = false;
-  ApptStatus? _statusFilter; // null = All statuses
+  ApptStatus? _statusFilter; // null = All statuses (set from widget.initialStatusFilter)
+
+  // Expanded cards, keyed by appointment id (or the appointment
+  // object itself for legacy rows without an id). Kept in the
+  // parent so cards don't need AutomaticKeepAliveClientMixin —
+  // keep-alive on EVERY card defeated the SliverList's laziness.
+  final Set<Object> _expandedKeys = {};
 
   List<Appointment> get _allAppts =>
       List<Appointment>.from(AppStateProvider.of(context).appointments)
@@ -74,6 +92,13 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
   @override
   void initState() {
     super.initState();
+    _selectedFilter = widget.initialFilter.clamp(0, _filters.length - 1);
+    _statusFilter = widget.initialStatusFilter;
+    _searchQuery = widget.initialSearchQuery;
+    if (_searchQuery.isNotEmpty) {
+      _searchCtrl.text = _searchQuery;
+      _searching = true;
+    }
     _tabCtrl = TabController(length: 2, vsync: this);
     _headerCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 700));
     _headerFade = CurvedAnimation(parent: _headerCtrl, curve: Curves.easeOut)
@@ -105,6 +130,18 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
       _dayCounts[appt.displayDate] = (_dayCounts[appt.displayDate] ?? 0) + 1;
       return _dayCounts[appt.displayDate];
     }).toList();
+
+    // Personal-task overlap, precomputed ONCE per build for all
+    // cards (the old code ran the O(tasks) check inside every
+    // card's build, on every rebuild).
+    final taskOverlapKeys = <Object>{};
+    for (final appt in items) {
+      final end = appt.dateTime.add(
+          Duration(minutes: _durMinsFromStr(appt.duration)));
+      if (PersonalTaskStore.instance.conflictFor(appt.dateTime, end) != null) {
+        taskOverlapKeys.add(appt.id ?? appt);
+      }
+    }
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: SystemUiOverlayStyle.light,
@@ -161,13 +198,22 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
                     if (i >= items.length) return null;
                     final appt = items[i];
                     final showHeader = i == 0 || items[i - 1].displayDate != appt.displayDate;
+                    final key = appt.id ?? appt;
                     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                       if (showHeader) _dateHeader(appt.displayDate),
                       _ApptCard(
                         appointment: appt,
                         index: i,
                         dayNumber: dayNumbers[i],
-                        onReschedule: (appt) => _openReschedule(appt),
+                        expanded: _expandedKeys.contains(key),
+                        hasTaskOverlap: taskOverlapKeys.contains(key),
+                        onToggleExpanded: () => setState(() {
+                          if (!_expandedKeys.remove(key)) {
+                            _expandedKeys.add(key);
+                          }
+                        }),
+                        onReschedule: (appt, [suggested]) =>
+                            _openReschedule(appt, suggested),
                       ),
                     ]);
                   },
@@ -183,12 +229,13 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
     );
   }
 
-  void _openReschedule(Appointment appt) {
+  void _openReschedule(Appointment appt, [DateTime? suggestedSlot]) {
     Navigator.push(
       context,
       PageRouteBuilder(
         pageBuilder: (_, __, ___) => RescheduleScreen(
           appointment: appt,
+          initialDateTime: suggestedSlot,
           onConfirm: (newDateTime, {String note = ''}) async {
             // Reschedule only: a reschedule does not change the status
             // on the server, so no status is passed here (passing
@@ -200,20 +247,10 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
                 cancellationNote: note,
               ),
             );
-            if (!context.mounted) return;
-            // Format the new time for the notification
-            final h  = newDateTime.hour;
-            final hh = h == 0 ? 12 : (h > 12 ? h - 12 : h);
-            final mm = newDateTime.minute.toString().padLeft(2, '0');
-            final ampm = h < 12 ? 'AM' : 'PM';
-            final newTimeStr = '$hh:$mm $ampm';
-            _ApptCardState._showNotificationBanner(
-              context,
-              clientName: appt.name,
-              action: 'reschedule',
-              note: note,
-              newTime: newTimeStr,
-            );
+            // No snackbar here: RescheduleScreen already shows the
+            // single "Rescheduled to …" confirmation. The old code
+            // ALSO showed the fake "Reminder sent" banner, so the
+            // user got two snackbars for one action.
           },
         ),
         transitionsBuilder: (_, a, __, child) => SlideTransition(
@@ -465,7 +502,9 @@ class _MyAppointmentsScreenState extends State<MyAppointmentsScreen>
           Expanded(child: TextField(
             controller: _searchCtrl,
             autofocus: true,
-            onChanged: (v) => setState(() => _searchQuery = v),
+            onChanged: (v) {
+              if (v != _searchQuery) setState(() => _searchQuery = v);
+            },
             style: GoogleFonts.dmSans(fontSize: 14,
                 fontWeight: FontWeight.w600, color: dmTxtMain),
             decoration: InputDecoration(
@@ -588,12 +627,18 @@ class _ApptCard extends StatefulWidget {
   final Appointment appointment;
   final int index;
   final int? dayNumber;
-  final void Function(Appointment) onReschedule;
+  final bool expanded;
+  final bool hasTaskOverlap;
+  final VoidCallback onToggleExpanded;
+  final void Function(Appointment, [DateTime? suggestedSlot]) onReschedule;
 
   const _ApptCard({
     required this.appointment,
     required this.index,
     required this.dayNumber,
+    required this.expanded,
+    required this.hasTaskOverlap,
+    required this.onToggleExpanded,
     required this.onReschedule,
   });
 
@@ -602,14 +647,11 @@ class _ApptCard extends StatefulWidget {
 }
 
 class _ApptCardState extends State<_ApptCard>
-    with SingleTickerProviderStateMixin, DarkMode, AutomaticKeepAliveClientMixin {
+    with SingleTickerProviderStateMixin, DarkMode {
 
-  @override
-  bool get wantKeepAlive => true;
   late AnimationController _ctrl;
   late Animation<double> _fade;
   late Animation<Offset> _slide;
-  bool _expanded = false;
 
   @override
   void initState() {
@@ -620,7 +662,9 @@ class _ApptCardState extends State<_ApptCard>
         .drive(Tween(begin: 0.0, end: 1.0));
     _slide = Tween<Offset>(begin: const Offset(0, 0.25), end: Offset.zero)
         .animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeOutCubic));
-    Future.delayed(Duration(milliseconds: 60 + widget.index * 50), () {
+    // Stagger capped at 8 items — the old 60+index*50ms delay meant
+    // a card at index 40 waited over 2 seconds to appear.
+    Future.delayed(Duration(milliseconds: 60 + (widget.index % 8) * 50), () {
       if (mounted) _ctrl.forward();
     });
   }
@@ -676,24 +720,21 @@ class _ApptCardState extends State<_ApptCard>
             return false;
           }
           // Persist the cancellation note (local-only: the API has no
-          // such field) and show the confirmation banner.
+          // such field) and show an honest confirmation. The old
+          // code showed a banner claiming "Reminder sent to <client>"
+          // — no push system exists and nothing was sent.
           final updated = widget.appointment.copyWith(
             status: ApptStatus.cancelled,
             cancellationNote: note,
           );
           await AppStateProvider.of(context).updateAppointment(updated);
           if (!context.mounted) return false;
-          _showNotificationBanner(
-            context,
-            clientName: widget.appointment.name,
-            action: 'cancellation',
-            note: note,
-          );
+          _showDoneSnackBar(context, 'Appointment cancelled');
           return true;
         },
-        onReschedule: () {
+        onReschedule: ([DateTime? suggestedSlot]) {
           Navigator.pop(context); // close the sheet
-          widget.onReschedule(widget.appointment);
+          widget.onReschedule(widget.appointment, suggestedSlot);
         },
       ),
     );
@@ -701,7 +742,6 @@ class _ApptCardState extends State<_ApptCard>
 
   @override
   Widget build(BuildContext context) {
-    super.build(context); // required by AutomaticKeepAliveClientMixin
     AppStateProvider.of(context);
     final a = widget.appointment;
     final isCancelled = a.status == ApptStatus.cancelled || a.status == ApptStatus.rejected;
@@ -712,7 +752,7 @@ class _ApptCardState extends State<_ApptCard>
       child: FadeTransition(
         opacity: _fade,
         child: GestureDetector(
-          onTap: () => setState(() => _expanded = !_expanded),
+          onTap: widget.onToggleExpanded,
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 250),
             margin: const EdgeInsets.only(bottom: 12),
@@ -778,18 +818,11 @@ class _ApptCardState extends State<_ApptCard>
                                         ? TextDecoration.lineThrough : null),
                                 overflow: TextOverflow.ellipsis),
                           ),
-                          // Personal task overlap badge (Feature E)
-                          Builder(builder: (_) {
-                            final hasPT = PersonalTaskStore.instance.tasks.any((t) {
-                              if (!t.hasTime || t.dueDate == null || t.startTime == null || t.done) return false;
-                              final ts = DateTime(t.dueDate!.year, t.dueDate!.month,
-                                  t.dueDate!.day, t.startTime!.hour, t.startTime!.minute);
-                              final te = ts.add(Duration(minutes: _durMinsFromStr(t.duration)));
-                              final ae = a.dateTime.add(Duration(minutes: _durMinsFromStr(a.duration)));
-                              return a.dateTime.isBefore(te) && ae.isAfter(ts);
-                            });
-                            if (!hasPT || isCancelled || isCompleted) return const SizedBox.shrink();
-                            return Container(
+                          // Personal task overlap badge (Feature E).
+                          // The overlap is precomputed once per build
+                          // by the parent — see _MyAppointmentsScreenState.
+                          if (widget.hasTaskOverlap && !isCancelled && !isCompleted)
+                            Container(
                               margin: const EdgeInsets.only(left: 6),
                               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                               decoration: BoxDecoration(
@@ -804,8 +837,7 @@ class _ApptCardState extends State<_ApptCard>
                                     fontSize: 9, fontWeight: FontWeight.w800,
                                     color: const Color(0xFF4A90D9))),
                               ]),
-                            );
-                          }),
+                            ),
                         ]),
                         const SizedBox(height: 2),
                         Text('${a.service} · ${a.duration}',
@@ -837,7 +869,7 @@ class _ApptCardState extends State<_ApptCard>
                 AnimatedCrossFade(
                   firstChild: const SizedBox.shrink(),
                   secondChild: _expandedBody(a),
-                  crossFadeState: _expanded
+                  crossFadeState: widget.expanded
                       ? CrossFadeState.showSecond
                       : CrossFadeState.showFirst,
                   duration: const Duration(milliseconds: 220),
@@ -922,7 +954,7 @@ class _ApptCardState extends State<_ApptCard>
               dmAccent.withOpacity(0.1),
               dmAccent,
               () {
-                setState(() => _expanded = false);
+                widget.onToggleExpanded();
                 widget.onReschedule(a);
               },
             )),
@@ -968,79 +1000,20 @@ class _ApptCardState extends State<_ApptCard>
         ),
       );
 
-  /// Simulates sending an immediate push notification to the client
-  /// by displaying a prominent in-app banner.
-  static void _showNotificationBanner(
-    BuildContext context, {
-    required String clientName,
-    required String action,   // 'cancellation' | 'reschedule'
-    String note = '',
-    String? newTime,
-  }) {
-    final isCancel  = action == 'cancellation';
-    final color     = isCancel ? const Color(0xFFE05C5C) : const Color(0xFFF4A24A);
-    final icon      = isCancel ? Icons.cancel_outlined : Icons.edit_calendar_rounded;
-    final mainMsg   = isCancel
-        ? 'Appointment cancelled'
-        : 'Appointment rescheduled';
-    final subMsg    = isCancel
-        ? 'Reminder sent to $clientName about the cancellation.'
-        : 'Reminder sent to $clientName with the new time${newTime != null ? ': $newTime' : ''}.';
+}
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        duration: const Duration(seconds: 5),
-        behavior: SnackBarBehavior.floating,
-        margin: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-        padding: EdgeInsets.zero,
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        content: Container(
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: color.withOpacity(0.95),
-            borderRadius: BorderRadius.circular(16),
-            boxShadow: [BoxShadow(
-                color: color.withOpacity(0.35), blurRadius: 18,
-                offset: const Offset(0, 6))],
-          ),
-          child: Row(children: [
-            Container(
-              width: 38, height: 38,
-              decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(11)),
-              child: Icon(icon, color: Colors.white, size: 20),
-            ),
-            const SizedBox(width: 12),
-            Expanded(child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(children: [
-                  const Icon(Icons.notifications_active_rounded,
-                      color: Colors.white, size: 13),
-                  const SizedBox(width: 5),
-                  Text('Reminder sent', style: GoogleFonts.dmSans(
-                      fontSize: 10.5, fontWeight: FontWeight.w700,
-                      color: Colors.white.withOpacity(0.75))),
-                ]),
-                const SizedBox(height: 2),
-                Text(mainMsg, style: GoogleFonts.dmSans(
-                    fontSize: 13.5, fontWeight: FontWeight.w800,
-                    color: Colors.white)),
-                const SizedBox(height: 2),
-                Text(subMsg, style: GoogleFonts.dmSans(
-                    fontSize: 11.5, color: Colors.white.withOpacity(0.85),
-                    fontWeight: FontWeight.w500),
-                    maxLines: 2, overflow: TextOverflow.ellipsis),
-              ],
-            )),
-          ]),
-        ),
-      ),
-    );
-  }
+/// Plain confirmation snackbar (file scope, shared by the card and
+/// the reschedule flow). The old `_showNotificationBanner` claimed
+/// "Reminder sent to <client>" — no push system exists and nothing
+/// was ever sent, so it was deleted.
+void _showDoneSnackBar(BuildContext context, String message) {
+  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+    content: Text(message,
+        style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+    backgroundColor: const Color(0xFF2ECC96),
+    behavior: SnackBarBehavior.floating,
+    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+  ));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1049,11 +1022,16 @@ class _ApptCardState extends State<_ApptCard>
 class RescheduleScreen extends StatefulWidget {
   final Appointment appointment;
   final Future<void> Function(DateTime newDateTime, {String note}) onConfirm;
+  /// Pre-selected date/time — used when the user taps a suggested
+  /// free slot in the emergency sheet (the old code opened this
+  /// screen WITHOUT applying the tapped slot).
+  final DateTime? initialDateTime;
 
   const RescheduleScreen({
     super.key,
     required this.appointment,
     required this.onConfirm,
+    this.initialDateTime,
   });
 
   @override
@@ -1066,14 +1044,19 @@ class _RescheduleScreenState extends State<RescheduleScreen> with DarkMode {
   late int _selectedMinute;
   final _noteCtrl = TextEditingController();
 
-  final List<int> _hours   = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+  // 7:00–21:00 (the old 8:00–19:45 range cut off early and late slots).
+  final List<int> _hours   = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
   final List<int> _minutes = [0, 15, 30, 45];
 
   @override
   void initState() {
     super.initState();
-    final orig      = widget.appointment.dateTime;
-    _selectedDate   = orig.add(const Duration(days: 1));
+    final orig = widget.initialDateTime ?? widget.appointment.dateTime;
+    if (widget.initialDateTime != null) {
+      _selectedDate = DateTime(orig.year, orig.month, orig.day);
+    } else {
+      _selectedDate = orig.add(const Duration(days: 1));
+    }
     _selectedHour   = orig.hour;
     _selectedMinute = orig.minute;
   }
@@ -1226,14 +1209,22 @@ class _RescheduleScreenState extends State<RescheduleScreen> with DarkMode {
                 height: 82,
                 child: ListView.builder(
                   scrollDirection: Axis.horizontal,
-                  itemCount: 21,
+                  // Today + 6 weeks (the old strip started tomorrow
+                  // and stopped at 3 weeks).
+                  itemCount: 43,
                   itemBuilder: (_, i) {
-                    final day = DateTime.now().add(Duration(days: i + 1));
+                    final now = DateTime.now();
+                    final day = DateTime(now.year, now.month, now.day)
+                        .add(Duration(days: i));
                     final sel = _selectedDate.day == day.day &&
                         _selectedDate.month == day.month &&
                         _selectedDate.year == day.year;
+                    // Leave days offer no slots.
+                    final onLeave = AppStateProvider.of(context).isOnLeave(day);
                     return GestureDetector(
-                      onTap: () => setState(() => _selectedDate = day),
+                      onTap: onLeave
+                          ? null
+                          : () => setState(() => _selectedDate = day),
                       child: AnimatedContainer(
                         duration: const Duration(milliseconds: 200),
                         width: 56,
@@ -1264,12 +1255,18 @@ class _RescheduleScreenState extends State<RescheduleScreen> with DarkMode {
                                   fontWeight: FontWeight.w600,
                                   color: sel
                                       ? Colors.white.withOpacity(0.7)
-                                      : dmTxtSub)),
+                                      : onLeave
+                                          ? dmTxtSub.withOpacity(0.35)
+                                          : dmTxtSub)),
                           const SizedBox(height: 4),
                           Text('${day.day}',
                               style: GoogleFonts.dmSans(fontSize: 20,
                                   fontWeight: FontWeight.w900,
-                                  color: sel ? Colors.white : dmTxtMain)),
+                                  color: sel
+                                      ? Colors.white
+                                      : onLeave
+                                          ? dmTxtSub.withOpacity(0.35)
+                                          : dmTxtMain)),
                         ]),
                       ),
                     );
@@ -1284,20 +1281,40 @@ class _RescheduleScreenState extends State<RescheduleScreen> with DarkMode {
               const SizedBox(height: 12),
 
               Builder(builder: (outerCtx) {
-                final allAppts = AppStateProvider.of(outerCtx).appointments;
+                final appState = AppStateProvider.of(outerCtx);
                 final a        = widget.appointment;
                 final durM     = _durationToMins(a.duration);
-                // Build set of blocked hour+minute combos
+                // Precompute the selected day's blocked minute ranges
+                // ONCE. The old code ran the O(all appointments) scan
+                // for every one of the 48+ time chips, per build.
+                final blockedRanges = <List<int>>[];
+                for (final existing in appState.appointments) {
+                  if (existing.id == a.id) continue;
+                  if (existing.status == ApptStatus.cancelled) continue;
+                  final es = existing.dateTime;
+                  if (es.year != _selectedDate.year ||
+                      es.month != _selectedDate.month ||
+                      es.day != _selectedDate.day) {
+                    continue;
+                  }
+                  final startM = es.hour * 60 + es.minute;
+                  blockedRanges.add([
+                    startM,
+                    startM + _durationToMins(existing.duration),
+                  ]);
+                }
+                final now = DateTime.now();
+                final isToday = _selectedDate.year == now.year &&
+                    _selectedDate.month == now.month &&
+                    _selectedDate.day == now.day;
+                final nowMins = now.hour * 60 + now.minute;
                 bool _isBlocked(int h, int m) {
-                  final proposed = DateTime(
-                    _selectedDate.year, _selectedDate.month, _selectedDate.day, h, m);
-                  final propEnd = proposed.add(Duration(minutes: durM));
-                  for (final existing in allAppts) {
-                    if (existing.id == a.id) continue;
-                    if (existing.status == ApptStatus.cancelled) continue;
-                    final es = existing.dateTime;
-                    final ee = es.add(Duration(minutes: _durationToMins(existing.duration)));
-                    if (proposed.isBefore(ee) && propEnd.isAfter(es)) return true;
+                  final startM = h * 60 + m;
+                  // Past times today are not bookable.
+                  if (isToday && startM <= nowMins) return true;
+                  final endM = startM + durM;
+                  for (final r in blockedRanges) {
+                    if (startM < r[1] && endM > r[0]) return true;
                   }
                   return false;
                 }
@@ -1361,7 +1378,7 @@ class _RescheduleScreenState extends State<RescheduleScreen> with DarkMode {
                   fontSize: 16, fontWeight: FontWeight.w800,
                   color: dmTxtMain)),
               const SizedBox(height: 6),
-              Text('This note will be included in the reminder sent to your client.',
+              Text('This note is saved with the appointment for your own record.',
                   style: GoogleFonts.dmSans(fontSize: 12.5, color: dmTxtSub,
                       fontWeight: FontWeight.w500)),
               const SizedBox(height: 10),
@@ -1486,7 +1503,9 @@ class _EmergencyActionSheet extends StatefulWidget {
   /// Returns true when the cancellation succeeded (sheet may close),
   /// false when it failed (sheet stays open).
   final Future<bool> Function(String note) onCancel;
-  final VoidCallback                 onReschedule;
+  /// Opens the reschedule screen, optionally pre-selecting the
+  /// suggested free slot the user tapped.
+  final void Function([DateTime? suggestedSlot]) onReschedule;
 
   const _EmergencyActionSheet({
     required this.appointment,
@@ -1503,6 +1522,10 @@ class _EmergencyActionSheetState extends State<_EmergencyActionSheet> with DarkM
   final _noteCtrl = TextEditingController();
   String? _selectedReason;
   bool    _saving = false;
+  bool    _notePreviewShown = false;
+  // Memoized free-slot suggestions: computed once per sheet, not on
+  // every build (the old code ran _nextFreeSlots inside build()).
+  List<DateTime>? _freeSlotsCache;
 
   static const _quickReasons = [
     '🚨 Medical emergency',
@@ -1541,10 +1564,17 @@ class _EmergencyActionSheetState extends State<_EmergencyActionSheet> with DarkM
         .add(const Duration(days: 1));
 
     // Keep the same hour/minute as the original, try up to 14 days ahead
+    final appState = AppStateProvider.of(context);
     for (int d = 0; d < 14 && results.length < count; d++) {
       final dt  = DateTime(candidate.year, candidate.month, candidate.day,
           appt.dateTime.hour, appt.dateTime.minute);
       final end = dt.add(Duration(minutes: durMins));
+
+      // Leave days offer no slots.
+      if (appState.isOnLeave(dt)) {
+        candidate = candidate.add(const Duration(days: 1));
+        continue;
+      }
 
       bool blocked = false;
       // Check no appointment overlap
@@ -1695,8 +1725,10 @@ class _EmergencyActionSheetState extends State<_EmergencyActionSheet> with DarkM
                 children: _quickReasons.map((reason) {
                   final sel = _selectedReason == reason;
                   return GestureDetector(
-                    onTap: () => setState(() =>
-                        _selectedReason = sel ? null : reason),
+                    onTap: () => setState(() {
+                      _selectedReason = sel ? null : reason;
+                      _notePreviewShown = _effectiveNote.isNotEmpty;
+                    }),
                     child: AnimatedContainer(
                       duration: const Duration(milliseconds: 180),
                       padding: const EdgeInsets.symmetric(
@@ -1741,11 +1773,19 @@ class _EmergencyActionSheetState extends State<_EmergencyActionSheet> with DarkM
                   controller: _noteCtrl,
                   maxLines: 3,
                   style: GoogleFonts.dmSans(fontSize: 13.5, color: dmTxtMain),
-                  onChanged: (_) => setState(() {}),
+                  // Only rebuild when the note-preview visibility
+                  // flips — the old onChanged rebuilt on every
+                  // keystroke.
+                  onChanged: (_) {
+                    final show = _effectiveNote.isNotEmpty;
+                    if (show != _notePreviewShown) {
+                      setState(() => _notePreviewShown = show);
+                    }
+                  },
                   decoration: InputDecoration(
                     border: InputBorder.none,
                     contentPadding: const EdgeInsets.all(14),
-                    hintText: 'Describe the situation to your client…',
+                    hintText: 'Add a note for your own record…',
                     hintStyle: GoogleFonts.dmSans(
                         color: dmTxtSub, fontSize: 13),
                   ),
@@ -1753,7 +1793,7 @@ class _EmergencyActionSheetState extends State<_EmergencyActionSheet> with DarkM
               ),
 
               // Note preview chip
-              if (_effectiveNote.isNotEmpty) ...[ 
+              if (_notePreviewShown) ...[ 
                 const SizedBox(height: 8),
                 Container(
                   padding: const EdgeInsets.symmetric(
@@ -1777,34 +1817,16 @@ class _EmergencyActionSheetState extends State<_EmergencyActionSheet> with DarkM
                 ),
               ],
 
-              const SizedBox(height: 8),
-              // Notification preview pill
-              Container(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 12, vertical: 8),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF2ECC96).withOpacity(0.08),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                      color: const Color(0xFF2ECC96).withOpacity(0.25)),
-                ),
-                child: Row(children: [
-                  const Icon(Icons.notifications_active_rounded,
-                      size: 13, color: Color(0xFF2ECC96)),
-                  const SizedBox(width: 8),
-                  Expanded(child: Text(
-                    'An immediate reminder will be sent to ${a.name}.',
-                    style: GoogleFonts.dmSans(
-                        fontSize: 12, color: const Color(0xFF2ECC96),
-                        fontWeight: FontWeight.w600),
-                  )),
-                ]),
-              ),
+              // NOTE: the old "An immediate reminder will be sent to
+              // <client>" pill was removed — no push system exists and
+              // nothing is sent. The note above is saved locally only.
               const SizedBox(height: 20),
 
               // ── Quick-reschedule suggestions (Feature F) ──────────────────
               Builder(builder: (_) {
-                final freeSlots = _nextFreeSlots(widget.appointment, 3);
+                _freeSlotsCache ??=
+                    _nextFreeSlots(widget.appointment, 3);
+                final freeSlots = _freeSlotsCache!;
                 if (freeSlots.isEmpty) return const SizedBox.shrink();
                 return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Row(children: [
@@ -1818,10 +1840,11 @@ class _EmergencyActionSheetState extends State<_EmergencyActionSheet> with DarkM
                   ...freeSlots.map((dt) {
                     final label = _formatSuggestion(dt);
                     return GestureDetector(
-                      onTap: () {
-                        Navigator.pop(context);
-                        widget.onReschedule();
-                      },
+                      // Apply the tapped slot: the old code opened
+                      // the reschedule screen WITHOUT applying it —
+                      // and popped twice (once here, once in the
+                      // handler), closing the appointments list too.
+                      onTap: () => widget.onReschedule(dt),
                       child: Container(
                         margin: const EdgeInsets.only(bottom: 6),
                         padding: const EdgeInsets.symmetric(
@@ -1911,7 +1934,7 @@ class _EmergencyActionSheetState extends State<_EmergencyActionSheet> with DarkM
                                 fontSize: 13, fontWeight: FontWeight.w800,
                                 color: const Color(0xFFE05C5C))),
                             const SizedBox(height: 2),
-                            Text('Notify client now', style: GoogleFonts.dmSans(
+                            Text('This cannot be undone', style: GoogleFonts.dmSans(
                                 fontSize: 10.5,
                                 color: const Color(0xFFE05C5C).withOpacity(0.65),
                                 fontWeight: FontWeight.w500)),

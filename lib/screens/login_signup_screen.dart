@@ -65,6 +65,221 @@ class _PremiumBg extends StatelessWidget {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Shared Google Sign-In flow (Welcome + Login screens)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// True while a Google sign-in is in flight anywhere — the double-tap
+/// guard (the old Welcome button could be tapped twice and start two
+/// sign-ins).
+bool googleSignInInFlight = false;
+
+/// Real Google Sign-In: opens the Google account picker, exchanges
+/// the ID token at POST /api/v1/auth/google/, then goes to the
+/// dashboard — the same landing as email login. When Google Sign-In
+/// is not configured yet (empty client ID), the service throws a
+/// friendly message shown in the snackbar below.
+///
+/// The loading dialog has a Cancel button: on a cold Render wake-up
+/// the sign-in can hang ~90s, and the old barrierDismissible:false
+/// dialog with no cancel left the user stuck.
+Future<void> runGoogleSignIn(BuildContext context) async {
+  if (googleSignInInFlight) return;
+  googleSignInInFlight = true;
+  bool dialogOpen = false;
+  void dismissLoading() {
+    if (!dialogOpen) return;
+    dialogOpen = false;
+    if (context.mounted) Navigator.pop(context);
+  }
+
+  void showLoading() {
+    dialogOpen = true;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogCtx) => PopScope(
+        canPop: false,
+        child: Center(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const CircularProgressIndicator(),
+            const SizedBox(height: 20),
+            TextButton(
+              onPressed: () {
+                // Cancels the WAIT, not the sign-in: the request
+                // keeps running in the background and still lands on
+                // the dashboard if it succeeds.
+                dismissLoading();
+              },
+              child: const Text('Cancel',
+                  style: TextStyle(color: Colors.white)),
+            ),
+          ]),
+        ),
+      ),
+    ).then((_) => dialogOpen = false);
+  }
+
+  void showError(String message) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: const Color(0xFFE05C5C),
+      ),
+    );
+  }
+
+  Future<Map<String, dynamic>?> attempt() async {
+    try {
+      return await AuthService.instance.signInWithGoogle();
+    } on GoogleSignInCancelledException {
+      // The user dismissed the picker — not an error, stay silent.
+      return null;
+    } on ApiException catch (e) {
+      // Brand-new Google users need a profession (backend 400);
+      // ask for it and retry once with the chosen value.
+      if (_needsProfession(e.message)) {
+        dismissLoading();
+        final profession = await _askProfession(context);
+        if (profession == null || profession.isEmpty) return null;
+        if (!context.mounted) return null;
+        showLoading();
+        try {
+          return await AuthService.instance
+              .signInWithGoogle(profession: profession);
+        } on GoogleSignInCancelledException {
+          return null;
+        } on ApiException catch (e2) {
+          dismissLoading();
+          showError(e2.message);
+          return null;
+        } catch (_) {
+          dismissLoading();
+          showError('Something went wrong. Please try again.');
+          return null;
+        }
+      }
+      dismissLoading();
+      showError(e.message);
+      return null;
+    } catch (_) {
+      dismissLoading();
+      showError('Something went wrong. Please try again.');
+      return null;
+    }
+  }
+
+  try {
+    showLoading();
+    final user = await attempt();
+    if (user == null) return;
+    if (!context.mounted) return;
+    dismissLoading();
+    UserSession.instance.setFromMap(user);
+    await AppStateProvider.of(context).loadUserData();
+    if (!context.mounted) return;
+    Navigator.pushAndRemoveUntil(
+      context,
+      _slide(const DashboardScreen()),
+      (r) => false,
+    );
+  } finally {
+    googleSignInInFlight = false;
+  }
+}
+
+/// The backend rejects a brand-new Google account without a
+/// profession; its error message names the missing field.
+// The backend 400 for a brand-new Google user is
+// {"profession": ["This field is required for new Google users."]} and
+// ApiClient.errorMessage returns only the value text, so the field
+// name never appears in the message — match the message wording too.
+bool _needsProfession(String message) {
+  final m = message.toLowerCase();
+  return m.contains('profession') || m.contains('new google user');
+}
+
+/// Asks a first-time Google user for their profession (free text
+/// plus suggested chips). Returns null when the user cancels.
+Future<String?> _askProfession(BuildContext context) async {
+  final ctrl = TextEditingController();
+  const suggestions = ['Doctor', 'Therapist', 'Consultant', 'Other'];
+  String? error;
+  final result = await showDialog<String>(
+    context: context,
+    barrierDismissible: false,
+    builder: (dialogCtx) => StatefulBuilder(
+      builder: (ctx, setDialogState) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text('What is your profession?',
+            style: GoogleFonts.poppins(fontWeight: FontWeight.w700, fontSize: 18)),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Google sign-in needs a profession for new accounts.',
+              style: GoogleFonts.poppins(fontSize: 13, color: Colors.grey[600])),
+          const SizedBox(height: 12),
+          Wrap(spacing: 8, runSpacing: 8, children: suggestions.map((s) => ChoiceChip(
+            label: Text(s, style: GoogleFonts.poppins(fontSize: 13)),
+            selected: ctrl.text == s,
+            onSelected: (_) => setDialogState(() => ctrl.text = s),
+          )).toList()),
+          const SizedBox(height: 12),
+          TextField(
+            controller: ctrl,
+            textCapitalization: TextCapitalization.words,
+            decoration: InputDecoration(
+              hintText: 'e.g. Doctor',
+              errorText: error,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+          ),
+        ]),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('Cancel', style: GoogleFonts.poppins(fontWeight: FontWeight.w600)),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              final value = ctrl.text.trim();
+              if (value.isEmpty) {
+                setDialogState(() => error = 'Please enter or pick a profession.');
+                return;
+              }
+              Navigator.pop(ctx, value);
+            },
+            child: Text('Continue', style: GoogleFonts.poppins(fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    ),
+  );
+  ctrl.dispose();
+  return result;
+}
+
+/// Theme-aware error box (the old one used hardcoded light colours
+/// — 0xFFFFECEC background, dark-red text — which looked wrong in
+/// dark mode).
+Widget _errorBox(String message, bool isDark) => Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFFE05C5C).withOpacity(isDark ? 0.18 : 0.08),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFE05C5C).withOpacity(0.4)),
+      ),
+      child: Row(children: [
+        const Icon(Icons.error_outline_rounded, color: Color(0xFFE05C5C), size: 18),
+        const SizedBox(width: 8),
+        Expanded(child: Text(message,
+            style: GoogleFonts.poppins(
+                fontSize: 12.5,
+                color: isDark ? const Color(0xFFFF9D9D) : const Color(0xFFB83232),
+                fontWeight: FontWeight.w500))),
+      ]),
+    );
+
 PageRoute _slide(Widget page) => PageRouteBuilder(
   pageBuilder: (_, __, ___) => page,
   transitionsBuilder: (_, a, __, child) => SlideTransition(
@@ -136,7 +351,7 @@ class WelcomeScreen extends StatelessWidget {
                     child: Column(children: [
                       _socialBtn(context, 'Continue with Google',
                           isGoogle: true, accent: accent, border: border, txtMain: txtMain,
-                          onTap: () => _signInWithGoogle(context)),
+                          onTap: googleSignInInFlight ? null : () => _signInWithGoogle(context)),
                       const SizedBox(height: 16),
                       _socialBtn(context, 'Continue with email',
                           icon: Icons.email_outlined, accent: accent, border: border, txtMain: txtMain,
@@ -152,155 +367,11 @@ class WelcomeScreen extends StatelessWidget {
     );
   }
 
-  /// Real Google Sign-In: opens the Google account picker, exchanges
-  /// the ID token at POST /api/v1/auth/google/, then goes to the
-  /// dashboard — the same landing as email login. When Google Sign-In
-  /// is not configured yet (empty client ID), the service throws a
-  /// friendly message shown in the snackbar below.
-  Future<void> _signInWithGoogle(BuildContext context) async {
-    _showLoading(context);
-    Map<String, dynamic>? user;
-    try {
-      user = await AuthService.instance.signInWithGoogle();
-    } on GoogleSignInCancelledException {
-      // The user dismissed the picker — not an error, stay silent.
-      if (context.mounted) Navigator.pop(context); // Dismiss loading.
-      return;
-    } on ApiException catch (e) {
-      // Brand-new Google users need a profession (backend 400);
-      // ask for it and retry once with the chosen value.
-      if (_needsProfession(e.message)) {
-        if (context.mounted) Navigator.pop(context); // Dismiss loading.
-        final profession = await _askProfession(context);
-        if (profession == null || profession.isEmpty) return;
-        if (!context.mounted) return;
-        _showLoading(context);
-        try {
-          user = await AuthService.instance.signInWithGoogle(profession: profession);
-        } on GoogleSignInCancelledException {
-          // Cancelled on the retry too — still not an error.
-          if (context.mounted) Navigator.pop(context);
-          return;
-        } on ApiException catch (e2) {
-          if (context.mounted) Navigator.pop(context);
-          if (context.mounted) _showGoogleError(context, e2.message);
-          return;
-        } catch (_) {
-          if (context.mounted) Navigator.pop(context);
-          if (context.mounted) {
-            _showGoogleError(context, 'Something went wrong. Please try again.');
-          }
-          return;
-        }
-      } else {
-        if (context.mounted) Navigator.pop(context);
-        if (context.mounted) _showGoogleError(context, e.message);
-        return;
-      }
-    } catch (_) {
-      if (context.mounted) Navigator.pop(context);
-      if (context.mounted) {
-        _showGoogleError(context, 'Something went wrong. Please try again.');
-      }
-      return;
-    }
-    if (!context.mounted) return;
-    Navigator.pop(context); // Dismiss the loading indicator.
-    UserSession.instance.setFromMap(user);
-    await AppStateProvider.of(context).loadUserData();
-    if (!context.mounted) return;
-    Navigator.pushAndRemoveUntil(
-      context,
-      _slide(const DashboardScreen()),
-      (r) => false,
-    );
-  }
-
-  /// The backend rejects a brand-new Google account without a
-  /// profession; its error message names the missing field.
-  // The backend 400 for a brand-new Google user is
-  // {"profession": ["This field is required for new Google users."]} and
-  // ApiClient.errorMessage returns only the value text, so the field
-  // name never appears in the message — match the message wording too.
-  bool _needsProfession(String message) {
-    final m = message.toLowerCase();
-    return m.contains('profession') || m.contains('new google user');
-  }
-
-  void _showLoading(BuildContext context) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => const Center(child: CircularProgressIndicator()),
-    );
-  }
-
-  void _showGoogleError(BuildContext context, String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: const Color(0xFFE05C5C),
-      ),
-    );
-  }
-
-  /// Asks a first-time Google user for their profession (free text
-  /// plus suggested chips). Returns null when the user cancels.
-  Future<String?> _askProfession(BuildContext context) async {
-    final ctrl = TextEditingController();
-    const suggestions = ['Doctor', 'Therapist', 'Consultant', 'Other'];
-    String? error;
-    final result = await showDialog<String>(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogCtx) => StatefulBuilder(
-        builder: (ctx, setDialogState) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          title: Text('What is your profession?',
-              style: GoogleFonts.poppins(fontWeight: FontWeight.w700, fontSize: 18)),
-          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('Google sign-in needs a profession for new accounts.',
-                style: GoogleFonts.poppins(fontSize: 13, color: Colors.grey[600])),
-            const SizedBox(height: 12),
-            Wrap(spacing: 8, runSpacing: 8, children: suggestions.map((s) => ChoiceChip(
-              label: Text(s, style: GoogleFonts.poppins(fontSize: 13)),
-              selected: ctrl.text == s,
-              onSelected: (_) => setDialogState(() => ctrl.text = s),
-            )).toList()),
-            const SizedBox(height: 12),
-            TextField(
-              controller: ctrl,
-              textCapitalization: TextCapitalization.words,
-              decoration: InputDecoration(
-                hintText: 'e.g. Doctor',
-                errorText: error,
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-              ),
-            ),
-          ]),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: Text('Cancel', style: GoogleFonts.poppins(fontWeight: FontWeight.w600)),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                final value = ctrl.text.trim();
-                if (value.isEmpty) {
-                  setDialogState(() => error = 'Please enter or pick a profession.');
-                  return;
-                }
-                Navigator.pop(ctx, value);
-              },
-              child: Text('Continue', style: GoogleFonts.poppins(fontWeight: FontWeight.w700)),
-            ),
-          ],
-        ),
-      ),
-    );
-    ctrl.dispose();
-    return result;
-  }
+  /// Real Google Sign-In — shared with the login screen (see
+  /// [runGoogleSignIn] below). Guarded against double-taps and with
+  /// a cancellable loading dialog.
+  Future<void> _signInWithGoogle(BuildContext context) =>
+      runGoogleSignIn(context);
 
   Widget _socialBtn(BuildContext ctx, String text, {
     IconData? icon, bool isGoogle = false, bool isSmall = false,
@@ -463,21 +534,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       const SizedBox(height: 12),
                     ],
                     if (_error.isNotEmpty) ...[
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFFFECEC),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: const Color(0xFFE05C5C).withOpacity(0.4)),
-                        ),
-                        child: Row(children: [
-                          const Icon(Icons.error_outline_rounded, color: Color(0xFFE05C5C), size: 18),
-                          const SizedBox(width: 8),
-                          Expanded(child: Text(_error, style: GoogleFonts.poppins(
-                              fontSize: 12.5, color: const Color(0xFFB83232), fontWeight: FontWeight.w500))),
-                        ]),
-                      ),
+                      _errorBox(_error, isDark),
                       const SizedBox(height: 12),
                     ],
                     SizedBox(width: double.infinity, height: 55,
@@ -505,6 +562,29 @@ class _LoginScreenState extends State<LoginScreen> {
                         ),
                       ),
                     ),
+                    const SizedBox(height: 16),
+                    // Google sign-in on the login screen too — the
+                    // old login screen had none, forcing users back
+                    // to Welcome for Google.
+                    SizedBox(
+                      width: double.infinity,
+                      height: 52,
+                      child: OutlinedButton.icon(
+                        onPressed: (_loading || googleSignInInFlight)
+                            ? null
+                            : () => runGoogleSignIn(context),
+                        icon: const _GoogleLogo(size: 20),
+                        label: Text('Continue with Google',
+                            style: GoogleFonts.poppins(
+                                fontSize: 14, fontWeight: FontWeight.w500,
+                                color: txtMain)),
+                        style: OutlinedButton.styleFrom(
+                          side: BorderSide(color: border),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12)),
+                        ),
+                      ),
+                    ),
                   ]),
                 ),
               ),
@@ -527,7 +607,9 @@ class _LoginScreenState extends State<LoginScreen> {
   void _showForgotPassword(BuildContext ctx, AppState appState) {
     final ctrl = TextEditingController();
     String? error;
-    showDialog(context: ctx, builder: (_) => StatefulBuilder(
+    bool sending = false;
+    showDialog(context: ctx, barrierDismissible: false,
+        builder: (_) => StatefulBuilder(
       builder: (dialogCtx, setDialogState) => AlertDialog(
       backgroundColor: appState.cardBg,
       shape: RoundedRectangleBorder(
@@ -559,11 +641,11 @@ class _LoginScreenState extends State<LoginScreen> {
         ),
       ]),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(dialogCtx),
+        TextButton(onPressed: sending ? null : () => Navigator.pop(dialogCtx),
             child: Text('Cancel', style: GoogleFonts.dmSans(
                 color: appState.txtSub, fontWeight: FontWeight.w600))),
         ElevatedButton(
-          onPressed: () async {
+          onPressed: sending ? null : () async {
             final email = ctrl.text.trim();
             // Inline error — never close the dialog silently.
             if (email.isEmpty) {
@@ -574,9 +656,16 @@ class _LoginScreenState extends State<LoginScreen> {
               setDialogState(() => error = 'Enter a valid email address.');
               return;
             }
-            Navigator.pop(dialogCtx);
+            // Await the request INSIDE the dialog with a spinner —
+            // the old code closed the dialog first, so the user had
+            // no idea whether the request was even running.
+            setDialogState(() {
+              sending = true;
+              error = null;
+            });
             try {
               await AuthService.instance.requestPasswordReset(email);
+              if (dialogCtx.mounted) Navigator.pop(dialogCtx);
               if (!ctx.mounted) return;
               ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
                 content: Text('Reset link sent! Check your email.',
@@ -585,21 +674,24 @@ class _LoginScreenState extends State<LoginScreen> {
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
               ));
             } on ApiException catch (e) {
-              if (!ctx.mounted) return;
-              ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
-                content: Text(e.message,
-                    style: GoogleFonts.dmSans(fontWeight: FontWeight.w600, color: Colors.white)),
-                backgroundColor: const Color(0xFFE05C5C), behavior: SnackBarBehavior.floating,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-              ));
+              if (dialogCtx.mounted) {
+                setDialogState(() {
+                  sending = false;
+                  error = e.message;
+                });
+              }
             }
           },
           style: ElevatedButton.styleFrom(
             backgroundColor: appState.accent,
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           ),
-          child: Text('Send Link', style: GoogleFonts.dmSans(
-              fontWeight: FontWeight.w700, color: Colors.white)),
+          child: sending
+              ? const SizedBox(width: 18, height: 18,
+                  child: CircularProgressIndicator(
+                      color: Colors.white, strokeWidth: 2))
+              : Text('Send Link', style: GoogleFonts.dmSans(
+                  fontWeight: FontWeight.w700, color: Colors.white)),
         ),
       ],
     )));
@@ -635,12 +727,26 @@ class _SignupScreenState extends State<SignupScreen> {
     super.dispose();
   }
 
-  void _checkStrength(String pw) => setState(() {
-    _hasMinLength = pw.length >= 8;
-    _hasUppercase = pw.contains(RegExp(r'[A-Z]'));
-    _hasLowercase = pw.contains(RegExp(r'[a-z]'));
-    _hasNumber    = pw.contains(RegExp(r'[0-9]'));
-  });
+  void _checkStrength(String pw) {
+    final minLen = pw.length >= 8;
+    final upper = pw.contains(RegExp(r'[A-Z]'));
+    final lower = pw.contains(RegExp(r'[a-z]'));
+    final number = pw.contains(RegExp(r'[0-9]'));
+    // Only rebuild when a flag actually flips — the old version
+    // rebuilt the whole signup form on every keystroke.
+    if (minLen == _hasMinLength &&
+        upper == _hasUppercase &&
+        lower == _hasLowercase &&
+        number == _hasNumber) {
+      return;
+    }
+    setState(() {
+      _hasMinLength = minLen;
+      _hasUppercase = upper;
+      _hasLowercase = lower;
+      _hasNumber = number;
+    });
+  }
 
   Future<void> _register() async {
     if (!_formKey.currentState!.validate()) return;
@@ -787,21 +893,7 @@ class _SignupScreenState extends State<SignupScreen> {
                         }),
                     const SizedBox(height: 20),
                     if (_error.isNotEmpty) ...[
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFFFECEC),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: const Color(0xFFE05C5C).withOpacity(0.4)),
-                        ),
-                        child: Row(children: [
-                          const Icon(Icons.error_outline_rounded, color: Color(0xFFE05C5C), size: 18),
-                          const SizedBox(width: 8),
-                          Expanded(child: Text(_error, style: GoogleFonts.poppins(
-                              fontSize: 12.5, color: const Color(0xFFB83232), fontWeight: FontWeight.w500))),
-                        ]),
-                      ),
+                      _errorBox(_error, isDark),
                       const SizedBox(height: 12),
                     ],
                     SizedBox(width: double.infinity, height: 55,
