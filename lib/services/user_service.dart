@@ -72,6 +72,31 @@ class UserService {
         .toList();
   }
 
+  /// Cache for [fetchUserById]: call history resolves a name per
+  /// peer, and the list must not refire a request per row per build.
+  final Map<int, AppUser> _userCache = {};
+
+  /// GET /api/v1/auth/users/<id>/ — one user by ID, for showing
+  /// names (instead of "User #id") in call history. Cached: repeat
+  /// lookups for the same ID never hit the network again. Returns
+  /// null on any failure (unknown user, endpoint missing, offline)
+  /// — callers fall back to "User #id".
+  Future<AppUser?> fetchUserById(int id) async {
+    final cached = _userCache[id];
+    if (cached != null) return cached;
+    try {
+      final res = await ApiClient.instance.get('$_auth/users/$id/');
+      if (res.statusCode != 200) return null;
+      final user = AppUser.fromJson(
+        jsonDecode(res.body) as Map<String, dynamic>,
+      );
+      _userCache[id] = user;
+      return user;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// PATCH /api/v1/auth/me/ — update the logged-in user's name and/or
   /// profession. Only the fields passed are sent. Returns the full
   /// updated user object (same shape as GET /me/).
