@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'user_session.dart';
@@ -152,6 +153,7 @@ class AppState extends ChangeNotifier {
     if (_compactView == value) return;
     _compactView = value;
     notifyListeners();
+    _persistBoolSetting('compact_view', value);
   }
 
   bool _showAccessibilityButton = true;
@@ -160,6 +162,15 @@ class AppState extends ChangeNotifier {
     if (_showAccessibilityButton == value) return;
     _showAccessibilityButton = value;
     notifyListeners();
+    _persistBoolSetting('show_accessibility_button', value);
+  }
+
+  /// Fire-and-forget per-user bool persistence (Settings toggles).
+  void _persistBoolSetting(String key, bool value) {
+    final uid = UserSession.instance.userId;
+    if (uid == null) return;
+    unawaited(
+        DBHelper.instance.setUserSetting(uid, key, value ? '1' : '0'));
   }
 
   AppThemeMode get themeMode => _themeMode;
@@ -500,6 +511,23 @@ class AppState extends ChangeNotifier {
   int _maxPerDay     = 8;
   int _bufferMinutes = 15;
 
+  // Daily break window (blocks bookings every working day), the
+  // booking window (how far ahead clients may book), and the
+  // availability status shown on the availability screen. All are
+  // persisted with the schedule — the UI used to promise them while
+  // silently dropping them on every save.
+  bool _breakEnabled = false;
+  String _breakStart = '1:00 PM';
+  String _breakEnd = '2:00 PM';
+  int _bookingWindowDays = 30;
+  String _availabilityStatus = 'Available';
+
+  /// True once the schedule has been loaded from the server or the
+  /// local cache. Until then the in-memory defaults are demo values,
+  /// not the user's real availability.
+  bool _availabilityLoaded = false;
+  bool get availabilityLoaded => _availabilityLoaded;
+
   /// IANA time zone of my published schedule. The API needs one but the
   /// UI has no time-zone picker, so this defaults to the user's zone and
   /// is refreshed from the server whenever the schedule loads.
@@ -509,6 +537,84 @@ class AppState extends ChangeNotifier {
   Map<String, List<List<String>>> get availabilitySlots => Map.unmodifiable(_availSlots);
   int get maxPerDay      => _maxPerDay;
   int get bufferMinutes  => _bufferMinutes;
+  bool get breakEnabled  => _breakEnabled;
+  String get breakStart  => _breakStart;
+  String get breakEnd    => _breakEnd;
+  int get bookingWindowDays => _bookingWindowDays;
+  String get availabilityStatus => _availabilityStatus;
+
+  /// Break window as [startMinutes, endMinutes] past midnight, or
+  /// null when the break is disabled or invalid. Used by the slot
+  /// computation so the break really blocks bookings.
+  List<int>? get breakRangeMinutes {
+    if (!_breakEnabled) return null;
+    int toMin(String t) {
+      final m = RegExp(r'(\d{1,2}):(\d{2})\s*([AaPp][Mm])?').firstMatch(t.trim());
+      if (m == null) return 0;
+      var h = int.parse(m.group(1)!);
+      final min = int.parse(m.group(2)!);
+      final period = m.group(3)?.toUpperCase();
+      if (period == 'PM' && h != 12) h += 12;
+      if (period == 'AM' && h == 12) h = 0;
+      return h * 60 + min;
+    }
+
+    final start = toMin(_breakStart);
+    final end = toMin(_breakEnd);
+    if (end <= start) return null;
+    return [start, end];
+  }
+
+  // ── Leave period ──────────────────────────────────────────────────────────
+  // Set on the profile screen; leave days offer no booking slots.
+  bool _leaveEnabled = false;
+  DateTime? _leaveFrom;
+  DateTime? _leaveTo;
+  bool get leaveEnabled => _leaveEnabled;
+  DateTime? get leaveFrom => _leaveFrom;
+  DateTime? get leaveTo => _leaveTo;
+
+  /// True when [day] falls inside an enabled leave period.
+  bool isOnLeave(DateTime day) {
+    if (!_leaveEnabled || _leaveFrom == null || _leaveTo == null) {
+      return false;
+    }
+    final d = DateTime(day.year, day.month, day.day);
+    final from = DateTime(_leaveFrom!.year, _leaveFrom!.month, _leaveFrom!.day);
+    final to = DateTime(_leaveTo!.year, _leaveTo!.month, _leaveTo!.day);
+    return !d.isBefore(from) && !d.isAfter(to);
+  }
+
+  Future<void> setLeavePeriod(
+      {required bool enabled, DateTime? from, DateTime? to}) async {
+    _leaveEnabled = enabled;
+    _leaveFrom = from;
+    _leaveTo = to;
+    final uid = UserSession.instance.userId;
+    if (uid != null) {
+      await DBHelper.instance
+          .setUserSetting(uid, 'leave_enabled', enabled ? '1' : '0');
+      await DBHelper.instance.setUserSetting(
+          uid, 'leave_from', from?.toIso8601String() ?? '');
+      await DBHelper.instance.setUserSetting(
+          uid, 'leave_to', to?.toIso8601String() ?? '');
+    }
+    notifyListeners();
+  }
+
+  // ── Services offered (profile screen, local list) ─────────────────────────
+  List<String> _services = [];
+  List<String> get services => List.unmodifiable(_services);
+
+  Future<void> setServices(List<String> services) async {
+    _services = List.from(services);
+    final uid = UserSession.instance.userId;
+    if (uid != null) {
+      await DBHelper.instance
+          .setUserSetting(uid, 'profile_services', jsonEncode(_services));
+    }
+    notifyListeners();
+  }
 
   /// "9:00 AM" (or 24-hour "9:00") → "09:00" for the API.
   static String _to24h(String t) {
@@ -536,6 +642,7 @@ class AppState extends ChangeNotifier {
 
   /// Applies a schedule fetched from the API to the local day/slot maps.
   void _applyApiSchedule(WeeklySchedule schedule) {
+    _availabilityLoaded = true;
     if (schedule.timezone != null && schedule.timezone!.isNotEmpty) {
       _availabilityTimezone = schedule.timezone!;
     }
@@ -556,6 +663,11 @@ class AppState extends ChangeNotifier {
     required Map<String, List<List<String>>> slots,
     int maxPerDay     = 8,
     int bufferMinutes = 15,
+    bool breakEnabled = false,
+    String breakStart = '1:00 PM',
+    String breakEnd = '2:00 PM',
+    int bookingWindowDays = 30,
+    String status = 'Available',
   }) async {
     // Publish to the backend first — the server validates the rules
     // (no overlaps per weekday, end after start). Throws [ApiException]
@@ -585,10 +697,28 @@ class AppState extends ChangeNotifier {
     _availSlots[k] = v.map((s) => List<String>.from(s)).toList());
     _maxPerDay     = maxPerDay;
     _bufferMinutes = bufferMinutes;
-    // Persist to DB
+    _breakEnabled = breakEnabled;
+    _breakStart = breakStart;
+    _breakEnd = breakEnd;
+    _bookingWindowDays = bookingWindowDays;
+    _availabilityStatus = status;
+    _availabilityLoaded = true;
+    // Persist everything to DB (days + slots + rules), so reopening
+    // the screen restores exactly what was saved.
     final userId = UserSession.instance.userId;
     if (userId != null) {
-      await DBHelper.instance.saveAvailability(userId, _availDays, _availSlots);
+      await DBHelper.instance.saveAvailability(
+        userId,
+        _availDays,
+        _availSlots,
+        maxPerDay: _maxPerDay,
+        bufferMinutes: _bufferMinutes,
+        breakEnabled: _breakEnabled,
+        breakStart: _breakStart,
+        breakEnd: _breakEnd,
+        bookingWindowDays: _bookingWindowDays,
+        status: _availabilityStatus,
+      );
     }
     notifyListeners();
   }
@@ -613,12 +743,41 @@ class AppState extends ChangeNotifier {
     if (userId == null) return;
     final savedTheme = UserSession.instance.themeMode;
     _applyEncodedTheme(savedTheme);
+    // Restore the persisted Settings toggles, leave period and
+    // services list (all local-only, stored in user_settings).
+    final compact =
+        await DBHelper.instance.getUserSetting(userId, 'compact_view');
+    if (compact != null) _compactView = compact == '1';
+    final accessBtn = await DBHelper.instance
+        .getUserSetting(userId, 'show_accessibility_button');
+    if (accessBtn != null) _showAccessibilityButton = accessBtn == '1';
+    final leaveOn =
+        await DBHelper.instance.getUserSetting(userId, 'leave_enabled');
+    _leaveEnabled = leaveOn == '1';
+    final leaveFrom =
+        await DBHelper.instance.getUserSetting(userId, 'leave_from');
+    _leaveFrom =
+        leaveFrom == null || leaveFrom.isEmpty ? null : DateTime.tryParse(leaveFrom);
+    final leaveTo =
+        await DBHelper.instance.getUserSetting(userId, 'leave_to');
+    _leaveTo =
+        leaveTo == null || leaveTo.isEmpty ? null : DateTime.tryParse(leaveTo);
+    final servicesJson =
+        await DBHelper.instance.getUserSetting(userId, 'profile_services');
+    if (servicesJson != null) {
+      try {
+        _services = (jsonDecode(servicesJson) as List)
+            .map((e) => e.toString())
+            .toList();
+      } catch (_) { /* keep the empty list */ }
+    }
     // Appointments + availability come from the backend now (falling
     // back to the local SQLite cache when offline — see loadAppointments).
     // They are independent, so fetch them in parallel instead of one
-    // after the other.
+    // after the other. Both load silently (no notify) — this method
+    // notifies exactly once at the end.
     final availFuture = _fetchAvailabilityFromServer();
-    await Future.wait([loadAppointments(), availFuture]);
+    await Future.wait([loadAppointments(notify: false), availFuture]);
     if (!await availFuture) {
       final avail = await DBHelper.instance.loadAvailability(userId);
       if (avail != null) {
@@ -630,11 +789,54 @@ class AppState extends ChangeNotifier {
             _availSlots[k] = (v as List).map<List<String>>((r) =>
                 (r as List).map<String>((e) => e.toString()).toList()).toList();
           });
+          if (avail['maxPerDay'] != null) _maxPerDay = avail['maxPerDay'] as int;
+          if (avail['bufferMinutes'] != null) {
+            _bufferMinutes = avail['bufferMinutes'] as int;
+          }
+          _breakEnabled = avail['breakEnabled'] as bool? ?? false;
+          if (avail['breakStart'] != null) {
+            _breakStart = avail['breakStart'] as String;
+          }
+          if (avail['breakEnd'] != null) _breakEnd = avail['breakEnd'] as String;
+          if (avail['bookingWindowDays'] != null) {
+            _bookingWindowDays = avail['bookingWindowDays'] as int;
+          }
+          if (avail['status'] != null) {
+            _availabilityStatus = avail['status'] as String;
+          }
+        } catch (_) { /* keep defaults if parse fails */ }
+        _availabilityLoaded = true;
+      }
+    } else {
+      // The server answered but carries no break/window/status fields
+      // (they are local-only) — restore those from the local cache.
+      final avail = await DBHelper.instance.loadAvailability(userId);
+      if (avail != null) {
+        try {
+          if (avail['maxPerDay'] != null) _maxPerDay = avail['maxPerDay'] as int;
+          if (avail['bufferMinutes'] != null) {
+            _bufferMinutes = avail['bufferMinutes'] as int;
+          }
+          _breakEnabled = avail['breakEnabled'] as bool? ?? false;
+          if (avail['breakStart'] != null) {
+            _breakStart = avail['breakStart'] as String;
+          }
+          if (avail['breakEnd'] != null) _breakEnd = avail['breakEnd'] as String;
+          if (avail['bookingWindowDays'] != null) {
+            _bookingWindowDays = avail['bookingWindowDays'] as int;
+          }
+          if (avail['status'] != null) {
+            _availabilityStatus = avail['status'] as String;
+          }
         } catch (_) { /* keep defaults if parse fails */ }
       }
     }
-    await autoCompleteExpired();
     notifyListeners();
+    // Completing expired appointments is a serial per-appointment
+    // API call — it must not block startup. It runs in the
+    // background after the first frame and notifies on its own if
+    // anything changed.
+    unawaited(Future(autoCompleteExpired));
   }
 
   /// Marks expired ACCEPTED appointments as [ApptStatus.completed].
@@ -645,7 +847,7 @@ class AppState extends ChangeNotifier {
   /// the server complete call SUCCEEDS (complete is provider-only, so
   /// a requester's device keeps the appointment as accepted instead
   /// of claiming "completed" while the server says "accepted").
-  Future<void> autoCompleteExpired() async {
+  Future<void> autoCompleteExpired({bool notify = true}) async {
     bool changed = false;
     for (final a in _appointments) {
       if (a.status != ApptStatus.confirmed) continue;
@@ -662,10 +864,14 @@ class AppState extends ChangeNotifier {
       a.status = ApptStatus.completed;
       changed = true;
     }
-    if (changed) notifyListeners();
+    if (changed && notify) notifyListeners();
   }
 
-  Future<void> loadAppointments() async {
+  /// Returns true when the server answered, false when the local
+  /// SQLite cache was used instead (offline / server error) — callers
+  /// that need to distinguish "empty" from "failed to load" use it.
+  Future<bool> loadAppointments({bool notify = true}) async {
+    bool fromServer = true;
     try {
       // The backend is the source of truth now. It already rejects
       // overlapping active appointments, so the old local conflict
@@ -674,13 +880,15 @@ class AppState extends ChangeNotifier {
     } on ApiException {
       // Offline or server error — fall back to the local SQLite cache
       // so the app still shows the previously stored appointments.
+      fromServer = false;
       final userId = UserSession.instance.userId;
       if (userId != null) {
         _appointments = await DBHelper.instance.getAllAppointments(userId);
       }
     }
     _appointments.sort((a, b) => a.dateTime.compareTo(b.dateTime));
-    notifyListeners();
+    if (notify) notifyListeners();
+    return fromServer;
   }
 
   /// Parse the encoded theme string (handles both plain names and custom_HEX).
@@ -742,10 +950,10 @@ class AppState extends ChangeNotifier {
     return 30;
   }
 
-  void _replaceInMemory(Appointment updated) {
+  void _replaceInMemory(Appointment updated, {bool notify = true}) {
     final idx = _appointments.indexWhere((a) => a.id == updated.id);
     if (idx != -1) _appointments[idx] = updated;
-    notifyListeners();
+    if (notify) notifyListeners();
   }
 
   /// Updates an appointment. The backend decides what is allowed:
@@ -772,16 +980,18 @@ class AppState extends ChangeNotifier {
             Duration(minutes: _durationMins(appt.duration))),
       );
       // Server is authoritative for times/status; keep the local note.
+      // Silent: this method notifies exactly once at the end.
       _replaceInMemory(
-          updated.copyWith(cancellationNote: appt.cancellationNote));
+          updated.copyWith(cancellationNote: appt.cancellationNote),
+          notify: false);
       // A status change the caller asked for alongside the new time is
       // applied too (compared against the pre-reschedule status, so a
       // reschedule alone never triggers a spurious status call).
       if (appt.status != stored.status) {
-        await updateAppointmentStatus(appt.id!, appt.status);
+        await updateAppointmentStatus(appt.id!, appt.status, notify: false);
       }
     } else if (stored != null && appt.status != stored.status) {
-      await updateAppointmentStatus(appt.id!, appt.status);
+      await updateAppointmentStatus(appt.id!, appt.status, notify: false);
     }
     // Local-only fields (notes): persist to SQLite and keep in memory.
     await DBHelper.instance.updateAppointment(appt);
@@ -802,27 +1012,36 @@ class AppState extends ChangeNotifier {
   /// - `rejected` → POST reject (provider only, pending only).
   /// `pending` has no API transition and stays local-only.
   /// Throws [ApiException] when the backend rejects the change.
-  Future<void> updateAppointmentStatus(int id, ApptStatus status) async {
+  Future<void> updateAppointmentStatus(int id, ApptStatus status,
+      {bool notify = true}) async {
     if (status == ApptStatus.cancelled) {
-      _replaceInMemory(await AppointmentService.instance.cancelAppointment(id));
+      _replaceInMemory(
+          await AppointmentService.instance.cancelAppointment(id),
+          notify: notify);
       return;
     }
     if (status == ApptStatus.confirmed) {
-      _replaceInMemory(await AppointmentService.instance.acceptAppointment(id));
+      _replaceInMemory(
+          await AppointmentService.instance.acceptAppointment(id),
+          notify: notify);
       return;
     }
     if (status == ApptStatus.completed) {
-      _replaceInMemory(await AppointmentService.instance.completeAppointment(id));
+      _replaceInMemory(
+          await AppointmentService.instance.completeAppointment(id),
+          notify: notify);
       return;
     }
     if (status == ApptStatus.rejected) {
-      _replaceInMemory(await AppointmentService.instance.rejectAppointment(id));
+      _replaceInMemory(
+          await AppointmentService.instance.rejectAppointment(id),
+          notify: notify);
       return;
     }
     await DBHelper.instance.updateAppointmentStatus(id, status);
     final idx = _appointments.indexWhere((a) => a.id == id);
     if (idx != -1) _appointments[idx].status = status;
-    notifyListeners();
+    if (notify) notifyListeners();
   }
 
   /// Marks an accepted appointment complete (provider only).
