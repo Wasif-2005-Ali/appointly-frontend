@@ -77,7 +77,11 @@ class _ImageCropPageState extends State<_ImageCropPage>
     final codec = await ui.instantiateImageCodec(widget.imageBytes);
     final frame = await codec.getNextFrame();
     final img = frame.image;
-    if (!mounted) return;
+    codec.dispose();
+    if (!mounted) {
+      img.dispose();
+      return;
+    }
     setState(() {
       _image = img;
       _imageSize = Size(img.width.toDouble(), img.height.toDouble());
@@ -160,8 +164,11 @@ class _ImageCropPageState extends State<_ImageCropPage>
     try {
       // Render the RepaintBoundary to image
       final boundary = _cropKey.currentContext!.findRenderObject()! as RenderRepaintBoundary;
-      final img = await boundary.toImage(pixelRatio: 3.0);
+      // pixelRatio 2.0 → 560×560 PNG: plenty for a 94px avatar circle,
+      // and ~55% smaller in SQLite than the old 3.0 (840×840).
+      final img = await boundary.toImage(pixelRatio: 2.0);
       final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+      img.dispose();
       final bytes = byteData!.buffer.asUint8List();
       if (mounted) Navigator.of(context).pop(bytes);
     } catch (e) {
@@ -171,6 +178,9 @@ class _ImageCropPageState extends State<_ImageCropPage>
 
   @override
   void dispose() {
+    // The decoded ui.Image holds a GPU texture — dispose it, or every
+    // open of this dialog leaks one.
+    _image?.dispose();
     _snapCtrl.dispose();
     super.dispose();
   }
@@ -204,7 +214,9 @@ class _ImageCropPageState extends State<_ImageCropPage>
                       fontSize: 17, fontWeight: FontWeight.w800, color: Colors.white, letterSpacing: -0.3)),
                   const Spacer(),
                   GestureDetector(
-                    onTap: _fitToCircle,
+                    // _fitToCircle only mutates fields — without
+                    // setState the tap visibly did nothing.
+                    onTap: () => setState(_fitToCircle),
                     child: Container(
                       width: 40, height: 40,
                       decoration: BoxDecoration(

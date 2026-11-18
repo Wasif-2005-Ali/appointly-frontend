@@ -16,7 +16,7 @@ import 'package:path_drawing/path_drawing.dart';
 //  Colors: navy #132E4D, silver #B0B3AB, alice blue #DAE8F5
 // ─────────────────────────────────────────────────────────────────────────────
 
-enum _SS { idle, saving, success }
+enum _SS { idle, saving, success, error }
 
 class SaveIconButton extends StatefulWidget {
   final Future<void> Function() onSave;
@@ -59,8 +59,8 @@ class _SaveIconButtonState extends State<SaveIconButton>
   late final AnimationController _pressCtrl;
   late final Animation<double>   _pressAnim;
 
-  // ── Idle border glow pulse ────────────────────────────────────────────────
-  late final AnimationController _glowCtrl;
+  // NOTE: an idle "glow" controller used to repeat forever here, but its
+  // value was never consumed by the painter — deleted, not wired.
 
   _SS _state = _SS.idle;
 
@@ -68,7 +68,9 @@ class _SaveIconButtonState extends State<SaveIconButton>
   void initState() {
     super.initState();
 
-    _ticker = createTicker(_onTick)..start();
+    // The ticker starts only while a save is in flight — it used to
+    // run at 60fps forever, rebuilding this button even when idle.
+    _ticker = createTicker(_onTick);
 
     // Tick stays at 0 on idle — only plays on success
     _tickCtrl = AnimationController(
@@ -79,10 +81,6 @@ class _SaveIconButtonState extends State<SaveIconButton>
         vsync: this, duration: const Duration(milliseconds: 110));
     _pressAnim = Tween<double>(begin: 1.0, end: 0.84)
         .animate(CurvedAnimation(parent: _pressCtrl, curve: Curves.easeOut));
-
-    _glowCtrl = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 2200))
-      ..repeat(reverse: true);
 
     widget.changeSignal?.addListener(_onChangeSignal);
   }
@@ -97,10 +95,9 @@ class _SaveIconButtonState extends State<SaveIconButton>
   }
 
   void _onChangeSignal() {
-    if (_state == _SS.success && mounted) {
+    if ((_state == _SS.success || _state == _SS.error) && mounted) {
       _tickCtrl.reset();
       setState(() { _state = _SS.idle; _angleDeg = 0; });
-      _glowCtrl.repeat(reverse: true);
     }
   }
 
@@ -118,10 +115,18 @@ class _SaveIconButtonState extends State<SaveIconButton>
       _workDone    = false;
       _curSpeed    = 0;
       _tgtSpeed    = 0;
+      _ticker.stop();
       if (mounted) _triggerSuccess();
       return;
     }
 
+    // Settled (idle, no speed): stop ticking entirely instead of
+    // rebuilding at 60fps forever.
+    if (_tgtSpeed == 0 && _curSpeed.abs() < 0.01) {
+      _curSpeed = 0;
+      _ticker.stop();
+      return;
+    }
     if (mounted) setState(() {});
   }
 
@@ -131,29 +136,43 @@ class _SaveIconButtonState extends State<SaveIconButton>
     await _pressCtrl.forward();
     _pressCtrl.reverse();
 
-    if (_state == _SS.success) {
-      // Back to idle — logo no tick
+    if (_state == _SS.success || _state == _SS.error) {
+      // Back to idle — logo, no tick
       _tickCtrl.reset();
       setState(() { _state = _SS.idle; _angleDeg = 0; });
-      _glowCtrl.repeat(reverse: true);
       return;
     }
 
     // Idle → Saving: arcs spin during the entire onSave() call.
-    // A guaranteed minimum of 800 ms ensures the rotation is always
-    // clearly visible, even when the save completes instantly.
-    _glowCtrl.stop();
+    // A short minimum spin (350 ms) keeps the rotation visible
+    // without making every save feel ~1.2 s long.
     setState(() => _state = _SS.saving);
     _tgtSpeed    = _spinSpeed;
     _waitForStop = true;
     _workDone    = false;
+    _lastAt      = null;
+    _ticker.start();
 
     final started = DateTime.now();
-    await widget.onSave();
+    try {
+      await widget.onSave();
+    } catch (_) {
+      // A failed save used to spin "saving" forever (and screens
+      // that swallowed the error showed a SUCCESS tick). Show the
+      // error state instead — the screen shows the reason.
+      if (!mounted) return;
+      _waitForStop = false;
+      _workDone = false;
+      _tgtSpeed = 0;
+      _curSpeed = 0;
+      _ticker.stop();
+      _triggerError();
+      return;
+    }
     if (!mounted) return;
 
     final elapsed = DateTime.now().difference(started);
-    const minSpin = Duration(milliseconds: 800);
+    const minSpin = Duration(milliseconds: 350);
     if (elapsed < minSpin) {
       await Future.delayed(minSpin - elapsed);
     }
@@ -170,13 +189,18 @@ class _SaveIconButtonState extends State<SaveIconButton>
     _tickCtrl.forward();
   }
 
+  void _triggerError() {
+    if (!mounted) return;
+    setState(() => _state = _SS.error);
+    HapticFeedback.heavyImpact();
+  }
+
   @override
   void dispose() {
     widget.changeSignal?.removeListener(_onChangeSignal);
     _ticker.dispose();
     _tickCtrl.dispose();
     _pressCtrl.dispose();
-    _glowCtrl.dispose();
     super.dispose();
   }
 
@@ -197,7 +221,9 @@ class _SaveIconButtonState extends State<SaveIconButton>
             angleDeg:       _angleDeg,
             tickT:          _tickCtrl.value,
             btnSize:        s,
-            foregroundColor: widget.foregroundColor,
+            foregroundColor: _state == _SS.error
+                ? const Color(0xFFE05C5C)
+                : widget.foregroundColor,
           ),
         ),
       ),
@@ -318,6 +344,12 @@ class _SaveBtnPainter extends CustomPainter {
         _paintTick(canvas,
             drawT: tickT,
             fillT: (tickT - 0.5).clamp(0.0, 1.0));
+
+      case _SS.error:
+        // Static logo in red (foregroundColor is swapped to red by
+        // the widget) — no tick, no spin. Tapping resets to idle.
+        _paintBody(canvas, opacity: 0.95);
+        _paintArcs(canvas, spin: false, opacity: 0.95);
     }
   }
 
