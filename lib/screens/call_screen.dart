@@ -1,13 +1,27 @@
 import 'dart:async';
 
+import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import '../app_state.dart';
 import '../services/api_client.dart';
 import '../services/call_service.dart';
 import '../services/user_service.dart';
+import '../theme/app_theme.dart';
 import 'call_history_screen.dart';
 import 'user_picker_screen.dart';
+
+/// Initials for an avatar from a display name ("Test B" → "TB",
+/// single word → first letter). Shared by the call screen and the
+/// incoming-call screen.
+String initialsFor(String name) {
+  final parts = name.trim().split(' ').where((w) => w.isNotEmpty).toList();
+  if (parts.isEmpty) return '?';
+  if (parts.length == 1) return parts.first[0].toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
+}
 
 /// Full-screen voice/video call.
 ///
@@ -52,7 +66,7 @@ class _CallScreenState extends State<CallScreen> {
   StreamSubscription<String>? _errorsSub;
   StreamSubscription<MediaStream>? _localSub;
   StreamSubscription<MediaStream>? _remoteSub;
-  Timer? _durationTimer;
+  StreamSubscription<bool>? _peerRingingSub;
   DateTime? _connectedAt;
 
   bool _popped = false;
@@ -115,16 +129,16 @@ class _CallScreenState extends State<CallScreen> {
       if (!mounted) return;
       if (state == CallState.connected && _connectedAt == null) {
         _connectedAt = DateTime.now();
-        _durationTimer?.cancel();
-        _durationTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-          if (mounted) setState(() {});
-        });
       }
       if (state == CallState.ended || state == CallState.failed) {
         _popWithResult();
         return;
       }
       setState(() {});
+    });
+    // The peer started ringing: "Calling…" becomes "Ringing…".
+    _peerRingingSub = connection.peerRingingChanges.listen((_) {
+      if (mounted) setState(() {});
     });
     _errorsSub = connection.errors.listen((message) {
       if (!mounted) return;
@@ -147,17 +161,25 @@ class _CallScreenState extends State<CallScreen> {
     final connection = _connection;
     String? message;
     if (connection?.state == CallState.failed) {
-      message = 'Call failed. Please try again.';
+      // The honest reason (e.g. the ICE watchdog's media-connection
+      // message) beats a generic "Call failed".
+      message = connection?.failureMessage ?? 'Call failed. Please try again.';
     } else {
       switch (connection?.endReason) {
         case CallEndReason.declined:
           message = 'Call declined.';
+        case CallEndReason.busy:
+          message = 'User is busy.';
         case CallEndReason.noAnswer:
           message = 'No answer.';
         case CallEndReason.connectionLost:
           message = 'Connection lost.';
         default:
-          message = null; // Clean end — nothing to say.
+          // Clean end — confirm it with the duration, so the call
+          // does not just vanish without feedback.
+          message = _connectedAt == null
+              ? null
+              : 'Call ended • $_elapsedText';
       }
     }
     if (mounted) Navigator.pop(context, message);
@@ -170,7 +192,8 @@ class _CallScreenState extends State<CallScreen> {
     }
     switch (connection.state) {
       case CallState.ringing:
-        return connection.isOutgoing ? 'Calling…' : 'Connecting…';
+        if (!connection.isOutgoing) return 'Connecting…';
+        return connection.peerRinging ? 'Ringing…' : 'Calling…';
       case CallState.connecting:
         return 'Connecting…';
       case CallState.connected:
@@ -181,6 +204,18 @@ class _CallScreenState extends State<CallScreen> {
       case CallState.idle:
         return 'Starting call…';
     }
+  }
+
+  /// Status line for the current state. While connected this is the
+  /// live duration rendered by [_CallDurationText], which ticks
+  /// itself every second — so the 1s timer rebuilds only that tiny
+  /// text widget, not the whole call screen (incl. the RTCVideoViews).
+  Widget _buildStatusText(TextStyle style) {
+    final connection = _connection;
+    if (connection?.state == CallState.connected && _connectedAt != null) {
+      return _CallDurationText(connectedAt: _connectedAt!, style: style);
+    }
+    return Text(_statusText, style: style);
   }
 
   String get _elapsedText {
@@ -208,7 +243,7 @@ class _CallScreenState extends State<CallScreen> {
     _errorsSub?.cancel();
     _localSub?.cancel();
     _remoteSub?.cancel();
-    _durationTimer?.cancel();
+    _peerRingingSub?.cancel();
     // Ends the call server-side if it is still active.
     unawaited(_connection?.dispose());
     _localRenderer.dispose();
@@ -218,10 +253,21 @@ class _CallScreenState extends State<CallScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: SafeArea(
-        child: _isVideo ? _buildVideoLayout() : _buildAudioLayout(),
+    // System back must end the call explicitly (same as pressing
+    // End), not pop the screen and hang up silently: the vetoed pop
+    // runs [_endCall], and the states listener pops the screen once
+    // the call actually ends. (Programmatic Navigator.pop is not
+    // vetoed by PopScope — only the system back gesture is.)
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _endCall();
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: SafeArea(
+          child: _isVideo ? _buildVideoLayout() : _buildAudioLayout(),
+        ),
       ),
     );
   }
@@ -262,9 +308,11 @@ class _CallScreenState extends State<CallScreen> {
                   ),
                 ),
                 const SizedBox(height: 4),
-                const Text(
-                  'Video call',
-                  style: TextStyle(color: Colors.white38, fontSize: 13),
+                // Live status under the peer name — the call duration
+                // once connected (it was a static "Video call" here,
+                // so the timer was invisible on video calls).
+                _buildStatusText(
+                  const TextStyle(color: Colors.white70, fontSize: 13),
                 ),
               ],
             ),
@@ -322,9 +370,8 @@ class _CallScreenState extends State<CallScreen> {
               style: const TextStyle(color: Colors.white, fontSize: 20),
             ),
             const SizedBox(height: 6),
-            Text(
-              _statusText,
-              style: const TextStyle(color: Colors.white70, fontSize: 14),
+            _buildStatusText(
+              const TextStyle(color: Colors.white70, fontSize: 14),
             ),
           ],
         ),
@@ -332,13 +379,7 @@ class _CallScreenState extends State<CallScreen> {
     );
   }
 
-  String get _initials {
-    final name = _peerName.trim();
-    if (name.isEmpty) return '?';
-    final parts = name.split(' ').where((w) => w.isNotEmpty).toList();
-    if (parts.length == 1) return parts.first[0].toUpperCase();
-    return (parts[0][0] + parts[1][0]).toUpperCase();
-  }
+  String get _initials => initialsFor(_peerName);
 
   // ------------------------------------------------------------------
   // Audio-only layout
@@ -370,9 +411,8 @@ class _CallScreenState extends State<CallScreen> {
           ),
         ),
         const SizedBox(height: 8),
-        Text(
-          _statusText,
-          style: const TextStyle(color: Colors.white70, fontSize: 15),
+        _buildStatusText(
+          const TextStyle(color: Colors.white70, fontSize: 15),
         ),
         const SizedBox(height: 8),
         const Text(
@@ -484,6 +524,45 @@ class _CallScreenState extends State<CallScreen> {
   }
 }
 
+/// Live call duration ("04:32") that ticks itself every second, so
+/// the 1s timer rebuilds only this text — not the whole call screen
+/// (and its RTCVideoViews).
+class _CallDurationText extends StatefulWidget {
+  final DateTime connectedAt;
+  final TextStyle style;
+
+  const _CallDurationText({required this.connectedAt, required this.style});
+
+  @override
+  State<_CallDurationText> createState() => _CallDurationTextState();
+}
+
+class _CallDurationTextState extends State<_CallDurationText> {
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final elapsed = DateTime.now().difference(widget.connectedAt);
+    final m = elapsed.inMinutes.toString().padLeft(2, '0');
+    final s = (elapsed.inSeconds % 60).toString().padLeft(2, '0');
+    return Text('$m:$s', style: widget.style);
+  }
+}
+
 /// Start a call: pick the other person from the user directory and
 /// choose video or voice, then open [CallScreen].
 class StartCallScreen extends StatefulWidget {
@@ -535,34 +614,90 @@ class _StartCallScreenState extends State<StartCallScreen> {
   @override
   Widget build(BuildContext context) {
     final selected = _selectedUser;
+    final heroColors = AppStateProvider.of(context).heroGradient;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('New Call'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.history_rounded),
-            tooltip: 'Call history',
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => const CallHistoryScreen(),
-                ),
-              );
-            },
-          ),
-        ],
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const Text(
-              'Call another Appointly user. '
-              'They need to be online in the app to receive the call.',
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Gradient hero, matching the dashboard's header.
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: heroColors,
+                stops: const [0.0, 0.35, 0.7, 1.0],
+              ),
             ),
-            const SizedBox(height: 20),
+            child: SafeArea(
+              bottom: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(8, 8, 8, 24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        IconButton(
+                          icon: const Icon(
+                            Icons.arrow_back_rounded,
+                            color: Colors.white,
+                          ),
+                          onPressed: () => Navigator.pop(context),
+                        ),
+                        const Spacer(),
+                        IconButton(
+                          icon: const Icon(
+                            Icons.history_rounded,
+                            color: Colors.white,
+                          ),
+                          tooltip: 'Call history',
+                          onPressed: () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => const CallHistoryScreen(),
+                              ),
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 16),
+                      child: Text(
+                        'New Call',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 28,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 16),
+                      child: Text(
+                        'Call another Appointly user. They need to be '
+                        'online in the app to receive the call.',
+                        style: TextStyle(
+                          color: Colors.white70,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const SizedBox(height: 4),
             // Person picker (replaces the old numeric user-ID field).
             GestureDetector(
               onTap: _pickUser,
@@ -640,44 +775,126 @@ class _StartCallScreenState extends State<StartCallScreen> {
               icon: const Icon(Icons.call),
               label: const Text('Call'),
             ),
+                ],
+              ),
+            ),
+          ),
           ],
         ),
-      ),
-    );
+      );
   }
 }
 
-/// Incoming-call dialog, shown by the app root when a `call.incoming`
-/// frame arrives (see `main.dart`).
+/// Full-screen incoming-call screen (WhatsApp-style), shown by the
+/// app root when a `call.incoming` frame arrives (see `main.dart`).
 ///
 /// Returns `true` when the user accepts, `false` when they decline,
-/// and null when the dialog is dismissed or times out after 30
-/// seconds (matching the caller's ring timeout — the server keeps
-/// the call RINGING until the caller ends it, so the dialog must go
-/// away on its own).
-class IncomingCallDialog extends StatefulWidget {
+/// and null when the screen times out after 30 seconds (matching the
+/// caller's ring timeout — the server keeps the call RINGING until
+/// the caller ends it, so the screen must go away on its own) or the
+/// caller cancels (`call.cancelled`, dismissed from `main.dart`).
+///
+/// While shown, the ringtone loops and the phone vibrates every ~2s.
+/// Both stop on EVERY exit path: accept, decline, timeout, cancel,
+/// and the app backgrounding (see [didChangeAppLifecycleState]).
+/// The back button cannot dismiss the screen (PopScope).
+class IncomingCallScreen extends StatefulWidget {
   final IncomingCall incoming;
 
-  const IncomingCallDialog({super.key, required this.incoming});
+  const IncomingCallScreen({super.key, required this.incoming});
 
   @override
-  State<IncomingCallDialog> createState() => _IncomingCallDialogState();
+  State<IncomingCallScreen> createState() => _IncomingCallScreenState();
 }
 
-class _IncomingCallDialogState extends State<IncomingCallDialog> {
+class _IncomingCallScreenState extends State<IncomingCallScreen>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   Timer? _timeout;
+  Timer? _vibrationTimer;
+  AudioPlayer? _ringtonePlayer;
+  late final AnimationController _pulseController;
+  bool _popped = false;
 
   @override
   void initState() {
     super.initState();
-    _timeout = Timer(CallService.ringTimeout, () {
-      if (mounted) Navigator.pop(context);
+    WidgetsBinding.instance.addObserver(this);
+    _pulseController =
+        AnimationController(
+          vsync: this,
+          duration: const Duration(milliseconds: 2000),
+        )..repeat();
+    _timeout = Timer(CallService.ringTimeout, () => _pop(null));
+    _startAlerting();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Backgrounding stops the ringtone + vibration (the screen is
+    // hidden); coming back resumes them while the call still rings.
+    if (!mounted || _popped) return;
+    if (state == AppLifecycleState.resumed) {
+      _startAlerting();
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
+      _stopAlerting();
+    }
+  }
+
+  /// Start the looping ringtone + periodic vibration. Idempotent —
+  /// safe to call again on resume.
+  Future<void> _startAlerting() async {
+    if (_popped || !mounted) return;
+    if (_ringtonePlayer == null) {
+      try {
+        final player = AudioPlayer();
+        _ringtonePlayer = player;
+        await player.setReleaseMode(ReleaseMode.loop);
+        await player.play(AssetSource('ringtone.mp3'));
+      } catch (_) {
+        // No audio on this device — vibration still alerts.
+        _ringtonePlayer = null;
+      }
+    }
+    _vibrationTimer ??= Timer.periodic(const Duration(seconds: 2), (_) {
+      HapticFeedback.vibrate();
     });
+    HapticFeedback.vibrate();
+  }
+
+  Future<void> _stopAlerting() async {
+    _vibrationTimer?.cancel();
+    _vibrationTimer = null;
+    final player = _ringtonePlayer;
+    _ringtonePlayer = null;
+    if (player == null) return;
+    try {
+      await player.stop();
+    } catch (_) {
+      // Already stopped.
+    }
+    try {
+      await player.dispose();
+    } catch (_) {
+      // Already disposed.
+    }
+  }
+
+  void _pop(bool? accepted) {
+    if (_popped) return;
+    _popped = true;
+    unawaited(_stopAlerting());
+    if (mounted) Navigator.pop(context, accepted);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _timeout?.cancel();
+    _pulseController.dispose();
+    unawaited(_stopAlerting());
     super.dispose();
   }
 
@@ -685,47 +902,122 @@ class _IncomingCallDialogState extends State<IncomingCallDialog> {
   Widget build(BuildContext context) {
     final incoming = widget.incoming;
     final isVideo = incoming.callType == 'video';
-    return Dialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            CircleAvatar(
-              radius: 40,
-              child: Icon(isVideo ? Icons.videocam : Icons.call, size: 36),
+    final heroColors = AppStateProvider.of(context).heroGradient;
+    return PopScope(
+      canPop: false,
+      child: Scaffold(
+        body: Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: heroColors,
+              stops: const [0.0, 0.35, 0.7, 1.0],
             ),
-            const SizedBox(height: 16),
-            Text(
-              incoming.displayName,
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 6),
-            Text(
-              isVideo ? 'Incoming video call' : 'Incoming voice call',
-              style: TextStyle(color: Colors.grey[600]),
-            ),
-            const SizedBox(height: 24),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          ),
+          child: SafeArea(
+            child: Column(
               children: [
-                _answerButton(
-                  icon: Icons.call_end,
-                  label: 'Decline',
-                  backgroundColor: Colors.red,
-                  onPressed: () => Navigator.pop(context, false),
+                const SizedBox(height: 32),
+                Icon(
+                  isVideo ? Icons.videocam_rounded : Icons.call_rounded,
+                  color: Colors.white70,
+                  size: 28,
                 ),
-                _answerButton(
-                  icon: Icons.call,
-                  label: 'Accept',
-                  backgroundColor: Colors.green,
-                  onPressed: () => Navigator.pop(context, true),
+                const SizedBox(height: 8),
+                Text(
+                  isVideo ? 'Incoming video call' : 'Incoming voice call',
+                  style: const TextStyle(color: Colors.white70, fontSize: 15),
                 ),
+                const Spacer(),
+                // Pulsing rings around the caller's avatar.
+                AnimatedBuilder(
+                  animation: _pulseController,
+                  builder: (context, child) {
+                    return SizedBox(
+                      width: 200,
+                      height: 200,
+                      child: Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          _pulseRing((_pulseController.value + 0.0) % 1.0),
+                          _pulseRing((_pulseController.value + 0.5) % 1.0),
+                          child!,
+                        ],
+                      ),
+                    );
+                  },
+                  child: CircleAvatar(
+                    radius: 56,
+                    backgroundColor: Colors.white.withValues(alpha: 0.16),
+                    child: Text(
+                      initialsFor(incoming.displayName),
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 40,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 24),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 32),
+                  child: Text(
+                    incoming.displayName,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 26,
+                      fontWeight: FontWeight.w700,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'wants to talk to you',
+                  style: TextStyle(color: Colors.white60, fontSize: 14),
+                ),
+                const Spacer(),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 48),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      _answerButton(
+                        icon: Icons.call_end_rounded,
+                        label: 'Decline',
+                        backgroundColor: AppColors.danger,
+                        onPressed: () => _pop(false),
+                      ),
+                      _answerButton(
+                        icon: Icons.call_rounded,
+                        label: 'Accept',
+                        backgroundColor: AppColors.green,
+                        onPressed: () => _pop(true),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 48),
               ],
             ),
-          ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// One expanding, fading ring of the pulsing avatar animation.
+  Widget _pulseRing(double progress) {
+    return Container(
+      width: 112 + 72 * progress,
+      height: 112 + 72 * progress,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: Colors.white.withValues(alpha: 0.45 * (1 - progress)),
+          width: 2,
         ),
       ),
     );
@@ -741,15 +1033,15 @@ class _IncomingCallDialogState extends State<IncomingCallDialog> {
       mainAxisSize: MainAxisSize.min,
       children: [
         CircleAvatar(
-          radius: 28,
+          radius: 32,
           backgroundColor: backgroundColor,
           child: IconButton(
-            icon: Icon(icon, color: Colors.white),
+            icon: Icon(icon, color: Colors.white, size: 28),
             onPressed: onPressed,
           ),
         ),
-        const SizedBox(height: 6),
-        Text(label),
+        const SizedBox(height: 8),
+        Text(label, style: const TextStyle(color: Colors.white, fontSize: 13)),
       ],
     );
   }
