@@ -11,6 +11,7 @@ import '../database/bd_helper.dart';
 import '../widgets/image_crop_dialog.dart';
 import '../widgets/save_icon_button.dart';
 import '../widgets/appointly_hand_icon.dart';
+import '../services/api_client.dart';
 
 
 class ProfileScreen extends StatefulWidget {
@@ -44,6 +45,10 @@ class _ProfileScreenState extends State<ProfileScreen>
   DateTime _leaveFrom    = DateTime.now();
   DateTime _leaveTo      = DateTime.now().add(const Duration(days: 1));
   bool _showAccessibility = false;
+
+  // Services offered (local list, persisted via AppState).
+  List<String> _services = [];
+  final _serviceCtrl = TextEditingController();
 
   // ── Draggable FAB position (right, bottom offsets) ────────────────────────
   late ValueNotifier<Offset> _fabPosNotifier;
@@ -96,12 +101,33 @@ class _ProfileScreenState extends State<ProfileScreen>
     }
   }
 
+  void _showError(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(msg, style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+      backgroundColor: const Color(0xFFE05C5C),
+      behavior: SnackBarBehavior.floating,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+    ));
+  }
+
   /// Persists the profile (local SQLite + best-effort server name
   /// sync). Shared by the header save button and the FAB "Save Profile"
-  /// action so both actually save.
-  Future<void> _saveProfile() async {
+  /// action so both actually save. Returns false when validation
+  /// fails (the message is already shown) — callers must not report
+  /// success then.
+  Future<bool> _saveProfile() async {
     final uid = UserSession.instance.userId;
-    if (uid == null) return;
+    if (uid == null) return false;
+    // Validation: an empty name used to save fine, and a leave
+    // period with From after To was silently accepted.
+    if (_nameCtrl.text.trim().isEmpty) {
+      _showError('Please enter your name — it cannot be empty.');
+      return false;
+    }
+    if (_leaveEnabled && _leaveFrom.isAfter(_leaveTo)) {
+      _showError('Leave "From" must be on or before "Until".');
+      return false;
+    }
     // Persist all profile fields to SQLite
     await DBHelper.instance.updateUserProfile(
       uid,
@@ -112,6 +138,16 @@ class _ProfileScreenState extends State<ProfileScreen>
       privacyMode:   _privacyMode,
       profileImage:  UserSession.instance.profileImageBytes,
     );
+    // Leave period + services are persisted through AppState (they
+    // used to be lost on leaving the screen). Leave days block
+    // booking via AppState.isOnLeave.
+    final appState = AppStateProvider.of(context);
+    await appState.setLeavePeriod(
+      enabled: _leaveEnabled,
+      from: _leaveEnabled ? _leaveFrom : null,
+      to: _leaveEnabled ? _leaveTo : null,
+    );
+    await appState.setServices(_services);
     // Update in-memory session
     UserSession.instance.fullName      = _nameCtrl.text.trim();
     UserSession.instance.phone         = _phoneCtrl.text.trim();
@@ -128,6 +164,16 @@ class _ProfileScreenState extends State<ProfileScreen>
       );
     } catch (_) {
       // Offline or server error — local profile is saved.
+    }
+    return true;
+  }
+
+  /// SaveIconButton wrapper: the button shows its error state when
+  /// the save fails or validation rejects it, instead of a success
+  /// tick for a save that never happened.
+  Future<void> _saveProfileOrThrow() async {
+    if (!await _saveProfile()) {
+      throw const ApiException('Profile was not saved.');
     }
   }
 
@@ -147,6 +193,49 @@ class _ProfileScreenState extends State<ProfileScreen>
         .animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeOut));
     _ctrl.forward();
     _fabPosNotifier = ValueNotifier(const Offset(_kFabRight, _kFabBottom));
+    // Leave period, services and the FAB position live in AppState /
+    // user_settings — load them after the first frame (they need a
+    // context with the provider).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _loadPersistedProfileBits();
+      _loadFabPosition();
+    });
+  }
+
+  void _loadPersistedProfileBits() {
+    final appState = AppStateProvider.of(context);
+    setState(() {
+      _leaveEnabled = appState.leaveEnabled;
+      if (appState.leaveFrom != null) _leaveFrom = appState.leaveFrom!;
+      if (appState.leaveTo != null) _leaveTo = appState.leaveTo!;
+      _services = List.from(appState.services);
+    });
+  }
+
+  Future<void> _loadFabPosition() async {
+    final uid = UserSession.instance.userId;
+    if (uid == null) return;
+    final rStr = await DBHelper.instance.getUserSetting(uid, 'profile_fab_right');
+    final bStr = await DBHelper.instance.getUserSetting(uid, 'profile_fab_bottom');
+    if (!mounted) return;
+    final r = double.tryParse(rStr ?? '');
+    final b = double.tryParse(bStr ?? '');
+    if (r != null || b != null) {
+      _fabPosNotifier.value = Offset(
+        r ?? _kFabRight,
+        b ?? _kFabBottom,
+      );
+    }
+  }
+
+  Future<void> _saveFabPosition() async {
+    final uid = UserSession.instance.userId;
+    if (uid == null) return;
+    final pos = _fabPosNotifier.value;
+    await DBHelper.instance.setUserSetting(
+        uid, 'profile_fab_right', pos.dx.toStringAsFixed(2));
+    await DBHelper.instance.setUserSetting(
+        uid, 'profile_fab_bottom', pos.dy.toStringAsFixed(2));
   }
 
   @override
@@ -155,6 +244,7 @@ class _ProfileScreenState extends State<ProfileScreen>
     _ctrl.dispose();
     _nameCtrl.dispose(); _emailCtrl.dispose();
     _phoneCtrl.dispose(); _bioCtrl.dispose();
+    _serviceCtrl.dispose();
     _fabPosNotifier.dispose();
     super.dispose();
   }
@@ -251,7 +341,7 @@ class _ProfileScreenState extends State<ProfileScreen>
         SaveIconButton(
           changeSignal: _cs,
           foregroundColor: Colors.white,
-          onSave: _saveProfile,
+          onSave: _saveProfileOrThrow,
         ),
       ]),
     )),
@@ -369,6 +459,44 @@ class _ProfileScreenState extends State<ProfileScreen>
         ),
 
         const SizedBox(height: 20),
+        // Visible Edit button: edit mode used to be reachable ONLY
+        // from the accessibility FAB menu — with the FAB disabled in
+        // Settings, the profile could not be edited at all.
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: () async {
+              if (_isEditing) {
+                if (await _saveProfile()) {
+                  if (!mounted) return;
+                  setState(() => _isEditing = false);
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                    content: Text('Profile saved',
+                        style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                    backgroundColor: const Color(0xFF2ECC96),
+                    behavior: SnackBarBehavior.floating,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                  ));
+                }
+              } else {
+                setState(() => _isEditing = true);
+              }
+            },
+            icon: Icon(
+                _isEditing ? Icons.check_rounded : Icons.edit_rounded,
+                size: 17),
+            label: Text(_isEditing ? 'Save Profile' : 'Edit Profile',
+                style: GoogleFonts.dmSans(fontWeight: FontWeight.w700)),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: dmAccent,
+              side: BorderSide(color: dmAccent.withOpacity(0.4)),
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
+          ),
+        ),
       ]),
     );
   }
@@ -435,11 +563,16 @@ class _ProfileScreenState extends State<ProfileScreen>
   }
 
   Widget _buildPrivacyCard() {
+    // Honest copy: privacy mode is a label shown on your profile.
+    // There is no contacts concept and no server enforcement, so the
+    // old descriptions ("Only people in your contacts can book",
+    // "No one can send requests") promised enforcement that does
+    // not exist.
     final modes = [
-      {'label':'Public',        'icon':Icons.public_rounded,         'color':const Color(0xFF2ECC96),  'desc':'Anyone can send you appointment requests'},
-      {'label':'Contacts Only', 'icon':Icons.people_rounded,         'color':const Color(0xFF4A90D9),  'desc':'Only people in your contacts can book'},
-      {'label':'Protected',     'icon':Icons.verified_user_rounded,  'color':const Color(0xFFF4A24A),  'desc':'Only selected people can send requests'},
-      {'label':'Private',       'icon':Icons.lock_rounded,           'color':const Color(0xFFE05C5C),  'desc':'No one can send requests — you initiate only'},
+      {'label':'Public',        'icon':Icons.public_rounded,         'color':const Color(0xFF2ECC96),  'desc':'Shown as open to appointment requests'},
+      {'label':'Contacts Only', 'icon':Icons.people_rounded,         'color':const Color(0xFF4A90D9),  'desc':'Shown as contacts-only on your profile'},
+      {'label':'Protected',     'icon':Icons.verified_user_rounded,  'color':const Color(0xFFF4A24A),  'desc':'Shown as protected on your profile'},
+      {'label':'Private',       'icon':Icons.lock_rounded,           'color':const Color(0xFFE05C5C),  'desc':'Shown as private on your profile'},
     ];
     return _card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       _cardTitle('Privacy Mode', Icons.privacy_tip_outlined, _privacyColor),
@@ -481,6 +614,13 @@ class _ProfileScreenState extends State<ProfileScreen>
           ),
         );
       }),
+      const SizedBox(height: 4),
+      Text(
+        'Privacy mode is shown on your profile. It does not block '
+        'requests — anyone can still send you an appointment request.',
+        style: GoogleFonts.dmSans(
+            fontSize: 11.5, color: dmTxtSub, fontWeight: FontWeight.w500),
+      ),
     ]));
   }
 
@@ -636,14 +776,90 @@ class _ProfileScreenState extends State<ProfileScreen>
   ]));
 
   Widget _buildServicesCard() {
-    // No services data exists — honest empty state instead of a
-    // hardcoded list.
     return _card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       _cardTitle('Services Offered', Icons.medical_services_outlined, dmAccent),
       const SizedBox(height: 14),
-      Text('No services added yet.', style: GoogleFonts.dmSans(
-          fontSize: 13, color: dmTxtSub, fontWeight: FontWeight.w500)),
+      if (_services.isEmpty)
+        Text('No services added yet.', style: GoogleFonts.dmSans(
+            fontSize: 13, color: dmTxtSub, fontWeight: FontWeight.w500))
+      else
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: _services.map((svc) => Container(
+            padding: const EdgeInsets.fromLTRB(12, 7, 6, 7),
+            decoration: BoxDecoration(
+              color: dmAccent.withOpacity(0.08),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: dmAccent.withOpacity(0.25)),
+            ),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              Text(svc, style: GoogleFonts.dmSans(
+                  fontSize: 12.5, fontWeight: FontWeight.w700, color: dmTxtMain)),
+              const SizedBox(width: 4),
+              GestureDetector(
+                onTap: () => setState(() => _services.remove(svc)),
+                child: Icon(Icons.close_rounded, size: 15, color: dmTxtSub),
+              ),
+            ]),
+          )).toList(),
+        ),
+      const SizedBox(height: 12),
+      Row(children: [
+        Expanded(
+          child: TextField(
+            controller: _serviceCtrl,
+            onSubmitted: (_) => _addService(),
+            style: GoogleFonts.dmSans(fontSize: 13.5, color: dmTxtMain),
+            decoration: InputDecoration(
+              hintText: 'Add a service, e.g. Consultation',
+              hintStyle: GoogleFonts.dmSans(color: dmTxtSub, fontSize: 13),
+              filled: true,
+              fillColor: dmCard2,
+              border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none),
+              focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide(color: dmAccent, width: 1.5)),
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        GestureDetector(
+          onTap: _addService,
+          child: Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              color: dmAccent.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: dmAccent.withOpacity(0.3)),
+            ),
+            child: Icon(Icons.add_rounded, color: dmAccent, size: 20),
+          ),
+        ),
+      ]),
+      const SizedBox(height: 6),
+      Text('Tap the save icon above to keep your services.',
+          style: GoogleFonts.dmSans(
+              fontSize: 11, color: dmTxtSub, fontWeight: FontWeight.w500)),
     ]));
+  }
+
+  void _addService() {
+    final value = _serviceCtrl.text.trim();
+    if (value.isEmpty) return;
+    if (_services.any((s) => s.toLowerCase() == value.toLowerCase())) {
+      _serviceCtrl.clear();
+      return;
+    }
+    setState(() {
+      _services.add(value);
+      _serviceCtrl.clear();
+    });
   }
 
   Widget _buildReviewsCard() {
@@ -756,15 +972,16 @@ class _ProfileScreenState extends State<ProfileScreen>
                       const SizedBox(height: 6),
                       _accessBtn(Icons.edit_rounded, _isEditing ? 'Save Profile' : 'Edit Profile', AppColors.green, () async {
                         if (_isEditing) {
-                          await _saveProfile();
-                          if (!mounted) return;
-                          setState(() { _isEditing = false; _showAccessibility = false; });
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                            content: Text('Profile saved', style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
-                            backgroundColor: const Color(0xFF2ECC96),
-                            behavior: SnackBarBehavior.floating,
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                          ));
+                          if (await _saveProfile()) {
+                            if (!mounted) return;
+                            setState(() { _isEditing = false; _showAccessibility = false; });
+                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                              content: Text('Profile saved', style: GoogleFonts.dmSans(fontWeight: FontWeight.w600)),
+                              backgroundColor: const Color(0xFF2ECC96),
+                              behavior: SnackBarBehavior.floating,
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                            ));
+                          }
                         } else {
                           setState(() { _isEditing = true; _showAccessibility = false; });
                         }
@@ -816,6 +1033,7 @@ class _ProfileScreenState extends State<ProfileScreen>
                     );
                     if (_showAccessibility) setState(() => _showAccessibility = false);
                   },
+                  onPanEnd: (_) => _saveFabPosition(),
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: isOnLeft
