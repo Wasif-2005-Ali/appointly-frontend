@@ -43,7 +43,8 @@ class ChatConversation {
   String lastMsg, time;
   int unread;
   bool isPinned, isMuted, isArchived;
-  // API-only fields (not in SQLite): group flag + member user IDs.
+  // Pin/mute/archive are persisted per room in SQLite (ChatDB);
+  // group flag + member user IDs are API-only (not in SQLite).
   final bool isGroup;
   final List<String> participantIds;
 
@@ -105,6 +106,13 @@ class ChatMessage {
   final String? appointmentTitle;
   final String? appointmentDate;
   final String? appointmentTime;
+  // Backend appointment id embedded in a shared appointment card
+  // ("📅 Appointment [id]: …"). Null for old shares without an id.
+  final int? appointmentId;
+  // When the message was created (server time for API messages).
+  // Used for the date separators; null for old cached messages that
+  // predate the column.
+  final DateTime? createdAt;
   // For image messages
   final Color? imageColor;
   // For image/file messages from the API: the original file name and
@@ -123,6 +131,8 @@ class ChatMessage {
         return fileName != null && fileName!.isNotEmpty ? fileName! : 'File';
       case MessageType.voice:
         return 'Voice message';
+      case MessageType.appointment:
+        return 'Appointment: ${appointmentTitle ?? 'Consultation'}';
       default:
         return text;
     }
@@ -145,6 +155,8 @@ class ChatMessage {
     this.appointmentTitle,
     this.appointmentDate,
     this.appointmentTime,
+    this.appointmentId,
+    this.createdAt,
     this.imageColor,
     this.fileName,
     this.fileSize,
@@ -152,8 +164,12 @@ class ChatMessage {
 
   /// Maps a backend message to the local model. [currentUserId] is
   /// the logged-in user's ID (as a string) — it decides [fromMe].
-  /// The backend has no replies, reactions, stars, or voice notes,
-  /// so those stay at their local defaults.
+  /// The backend has no replies, reactions, or stars, so those stay
+  /// at their local defaults. Voice notes and shared appointment
+  /// cards are detected from the payload: voice notes arrive as
+  /// `file` messages whose name starts with `voice_note_` (or ends
+  /// in `.m4a`), and appointment shares are text messages starting
+  /// with the `📅 Appointment` prefix (see [_parseAppointmentShare]).
   factory ChatMessage.fromApi(
     ChatApiMessage msg, {
     required String? currentUserId,
@@ -161,6 +177,12 @@ class ChatMessage {
     final fromMe = currentUserId != null && msg.senderId == currentUserId;
     // read_by always contains the sender; anyone else means read.
     final read = fromMe && msg.readBy.any((id) => id != msg.senderId);
+    final appt = msg.messageType == 'text'
+        ? _parseAppointmentShare(msg.content)
+        : null;
+    final isVoice =
+        msg.messageType == 'voice' ||
+        (msg.messageType == 'file' && _looksLikeVoiceNote(msg.fileName));
     return ChatMessage(
       id: msg.id.isNotEmpty
           ? msg.id
@@ -168,17 +190,86 @@ class ChatMessage {
       text: msg.content,
       fromMe: fromMe,
       time: _fmtTime(msg.createdAt.toLocal()),
-      type: switch (msg.messageType) {
-        'image' => MessageType.image,
-        'file' => MessageType.file,
-        _ => MessageType.text,
-      },
+      createdAt: msg.createdAt,
+      type: appt != null
+          ? MessageType.appointment
+          : isVoice
+              ? MessageType.voice
+              : switch (msg.messageType) {
+                  'image' => MessageType.image,
+                  'file' => MessageType.file,
+                  _ => MessageType.text,
+                },
       status: fromMe
           ? (read ? MessageStatus.read : MessageStatus.delivered)
           : MessageStatus.delivered,
       fileName: msg.fileName,
       fileSize: msg.fileSize,
+      appointmentId: appt?.id,
+      appointmentTitle: appt?.title,
+      appointmentDate: appt?.date,
+      appointmentTime: appt?.time,
     );
+  }
+
+  /// True when [fileName] looks like a recorded voice note: the
+  /// recorder names them `voice_note_<ts>.m4a`, and any `.m4a` file
+  /// is audio the voice player can handle. Pure.
+  static bool _looksLikeVoiceNote(String? fileName) {
+    if (fileName == null) return false;
+    final lower = fileName.toLowerCase();
+    return lower.startsWith('voice_note_') || lower.endsWith('.m4a');
+  }
+
+  /// Parse a shared appointment card out of message text. Shares are
+  /// sent as `📅 Appointment [id]: Name — Service\nDate at Time •
+  /// status` (see `ChatThreadScreen._shareAppointment`); forwards
+  /// use the single-line form `📅 Appointment [id]: Title — Date at
+  /// Time`. Returns null when the text is not a share — a user just
+  /// typing "📅 Appointment…" without the colon is plain text.
+  /// Pure.
+  static ({int? id, String title, String date, String time})?
+  _parseAppointmentShare(String content) {
+    const prefix = '📅 Appointment';
+    if (!content.startsWith(prefix)) return null;
+    var rest = content.substring(prefix.length);
+    int? id;
+    final idMatch = RegExp(r'^\s*\[(\d+)\]:').firstMatch(rest);
+    if (idMatch != null) {
+      id = int.tryParse(idMatch.group(1)!);
+      rest = rest.substring(idMatch.end);
+    } else if (rest.startsWith(':')) {
+      rest = rest.substring(1);
+    } else {
+      return null;
+    }
+    rest = rest.trimLeft();
+    if (rest.isEmpty) return (id: id, title: 'Consultation', date: '', time: '');
+    final lines = rest.split('\n');
+    final firstLine = lines.first.trim();
+    // Date/time source: the second line of a share ("Date at Time •
+    // status"), or the part after " — " in a single-line forward.
+    String? dateTimePart;
+    String title = firstLine;
+    if (lines.length > 1) {
+      dateTimePart = lines[1].split(' • ').first.trim();
+    } else {
+      final dash = firstLine.indexOf(' — ');
+      if (dash >= 0 && firstLine.substring(dash + 3).contains(' at ')) {
+        title = firstLine.substring(0, dash).trim();
+        dateTimePart = firstLine.substring(dash + 3).trim();
+      }
+    }
+    var date = '';
+    var time = '';
+    if (dateTimePart != null) {
+      final at = dateTimePart.indexOf(' at ');
+      if (at >= 0) {
+        date = dateTimePart.substring(0, at).trim();
+        time = dateTimePart.substring(at + 4).trim();
+      }
+    }
+    return (id: id, title: title, date: date, time: time);
   }
 }
 
