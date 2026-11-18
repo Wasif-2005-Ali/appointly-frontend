@@ -39,7 +39,6 @@ class _ImageCropPageState extends State<_ImageCropPage>
   double _scale = 1.0;
   Offset _lastFocalPoint = Offset.zero;
   double _lastScale = 1.0;
-  Offset _startOffset = Offset.zero;
 
   // Image natural size
   ui.Image? _image;
@@ -100,7 +99,6 @@ class _ImageCropPageState extends State<_ImageCropPage>
     _snapCtrl.stop();
     _lastFocalPoint = d.localFocalPoint;
     _lastScale = _scale;
-    _startOffset = _offset;
   }
 
   void _onScaleUpdate(ScaleUpdateDetails d) {
@@ -179,7 +177,6 @@ class _ImageCropPageState extends State<_ImageCropPage>
 
   @override
   Widget build(BuildContext context) {
-    final size = MediaQuery.of(context).size;
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: SafeArea(
