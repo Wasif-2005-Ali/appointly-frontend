@@ -89,6 +89,9 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
           final last = ChatMessage.fromApi(
             preview.lastMessage!,
             currentUserId: myId,
+            otherMemberIds: convo.participantIds
+                .where((id) => id != myId)
+                .toList(),
           );
           convo.lastMsg = last.previewText;
           convo.time = last.time;
@@ -127,6 +130,38 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
       if (!mounted) return;
       setState(() => _convos.remove(c));
       _toast('You left the chat');
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      _toast(e.message);
+    }
+  }
+
+  /// Add someone to a group chat: pick them from the user directory,
+  /// then call the real add-participant endpoint (group rooms only).
+  Future<void> _addParticipant(ChatConversation c) async {
+    final user = await Navigator.push<AppUser?>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => const UserPickerScreen(title: 'Add a person'),
+      ),
+    );
+    if (user == null || !mounted) return;
+    if (c.participantIds.contains(user.id.toString())) {
+      _toast('${user.fullName} is already in this chat.');
+      return;
+    }
+    try {
+      final room = await ChatService.instance.addParticipant(
+        c.id,
+        user.id.toString(),
+      );
+      if (!mounted) return;
+      setState(() {
+        c.participantIds
+          ..clear()
+          ..addAll(room.participants);
+      });
+      _toast('${user.fullName} added to the chat.');
     } on ApiException catch (e) {
       if (!mounted) return;
       _toast(e.message);
@@ -413,7 +448,7 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
       margin: const EdgeInsets.only(bottom: 8), padding: const EdgeInsets.only(right: 20),
       decoration: BoxDecoration(color: const Color(0xFFE05C5C), borderRadius: BorderRadius.circular(20)),
       alignment: Alignment.centerRight,
-      child: const Icon(Icons.delete_rounded, color: Colors.white, size: 26),
+      child: const Icon(Icons.exit_to_app_rounded, color: Colors.white, size: 26),
     ),
     confirmDismiss: (dir) async {
       if (dir == DismissDirection.startToEnd) {
@@ -542,7 +577,11 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
           _menuItem(c.isMuted ? Icons.volume_up_rounded : Icons.volume_off_rounded,
               c.isMuted ? 'Unmute' : 'Mute', () { setState(() => c.isMuted = !c.isMuted); _persistFlags(c); }),
           _menuItem(Icons.archive_rounded, 'Archive', () { setState(() => c.isArchived = true); _persistFlags(c); _toast('Archived'); }),
-          _menuItem(Icons.block_rounded, 'Block', () => _toast('${c.name} blocked')),
+          // No Block item: no block endpoint exists, so the old
+          // toast-only "Block" was fake.
+          if (c.isGroup)
+            _menuItem(Icons.person_add_alt_rounded, 'Add participant',
+                () => _addParticipant(c)),
         ]),
       ),
     );
@@ -746,7 +785,10 @@ class _ChatInboxScreenState extends State<ChatInboxScreen>
                   SwitchListTile(
                     title: Text('Group chat',
                         style: GoogleFonts.dmSans(fontSize: 14, fontWeight: FontWeight.w600, color: _txtMain)),
-                    subtitle: Text('More people can be added later.',
+                    subtitle: Text(
+                        isGroup
+                            ? 'More people can be added later from the chat menu.'
+                            : 'Direct chats have just the two of you.',
                         style: GoogleFonts.dmSans(fontSize: 12, color: _txtSub)),
                     value: isGroup,
                     activeColor: _accent,

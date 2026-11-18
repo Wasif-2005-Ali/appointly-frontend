@@ -15,8 +15,8 @@ import '../../app_state.dart';
 import '../../models/appointment.dart';
 import '../../screens/appointment_detail_screen.dart';
 import '../../screens/call_screen.dart';
-import '../../screens/my_appointments_screen.dart';
 import '../../services/api_client.dart';
+import '../../services/appointment_service.dart';
 import '../../services/chat_service.dart';
 import '../../user_session.dart';
 import '../data/chat_db.dart';
@@ -44,7 +44,7 @@ class ChatThreadScreen extends StatefulWidget {
 }
 
 class _ChatThreadScreenState extends State<ChatThreadScreen>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   final TextEditingController _msgCtrl    = TextEditingController();
   final ScrollController      _scrollCtrl = ScrollController();
   final List<ChatMessage>     _msgs       = [];
@@ -55,7 +55,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
 
   // ── Live chat state ────────────────────────────────────────────────────────
   ChatRoomConnection? _connection;
-  StreamSubscription? _msgSub, _errSub, _stateSub;
+  StreamSubscription? _msgSub, _errSub, _stateSub, _timeoutSub, _readSub;
   bool _loadingHistory = true;
   bool _wsLive = false;
   String? _loadError;
@@ -63,13 +63,32 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   final Set<String> _seenIds = {};
   // Optimistic copies of my sends, replaced when the echo arrives.
   final List<ChatMessage> _pending = [];
+  // Outgoing queue: sends made while disconnected wait here and
+  // flush IN ORDER on reconnect — never dropped, never lost.
+  final List<_QueuedSend> _outgoingQueue = [];
+  // IDs of optimistic messages still queued (not yet sent): shown
+  // with a clock + "sending…" state.
+  final Set<String> _queuedIds = {};
+  // sendText() send ids → optimistic message, for echo timeouts.
+  final Map<String, ChatMessage> _sendIds = {};
+  // Latest connection state (drives the honest banner) + in-flight
+  // guard so rapid taps can't launch concurrent connectRoom()s.
+  ChatConnectionState _connState = ChatConnectionState.connecting;
+  bool _connectingLive = false;
+  // Debounced mark-as-read for incoming live messages.
+  Timer? _markReadTimer;
+  // Message ids already entrance-animated (history never animates).
+  final Set<String> _animatedIds = {};
+  // Keys per message for jump-to-message from search.
+  final Map<String, GlobalKey> _msgKeys = {};
+  // Message id highlighted after a search jump.
+  String? _highlightId;
+  // Recording seconds, scoped to the overlay (not a full rebuild).
+  final ValueNotifier<int> _recSecondsNotifier = ValueNotifier<int>(0);
   // Media upload in progress (photo/file). While true, a sending
   // indicator shows above the input bar.
   bool _uploadingMedia = false;
   String _uploadingLabel = '';
-  // True once the live connection has failed and is waiting for a
-  // manual reconnect (see the banner in [build]).
-  bool _connFailed = false;
   // Pagination cursor from the last history page (`?before=`); null
   // when there is no older history left to load.
   String? _nextBefore;
@@ -84,6 +103,15 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   Timer? _recTimer;
 
   String get _convId => widget.conversation.id;
+
+  /// Every other member of the room (for the group-read rule: a
+  /// message is read only once ALL of them read it).
+  List<String> get _otherMemberIds {
+    final myId = UserSession.instance.userId?.toString();
+    return widget.conversation.participantIds
+        .where((id) => id != myId)
+        .toList();
+  }
 
   String _fmt(DateTime dt) {
     final h = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
@@ -107,9 +135,27 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   void initState() {
     super.initState();
     _sendCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 200));
-    _recCtrl  = AnimationController(vsync: this, duration: const Duration(milliseconds: 1200))..repeat(reverse: true);
+    // The recording pulse runs ONLY while recording (started in
+    // [_startRecording]) — repeating from initState rebuilt the mic
+    // button every tick for the whole thread lifetime.
+    _recCtrl  = AnimationController(vsync: this, duration: const Duration(milliseconds: 1200));
     _scrollCtrl.addListener(_onScroll);
+    WidgetsBinding.instance.addObserver(this);
     _initMessages();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Reconnect on app resume: a socket dropped while backgrounded
+    // should come back now, not on the next 60s long-tail tick.
+    if (state == AppLifecycleState.resumed) {
+      final conn = _connection;
+      if (conn == null) {
+        _connectLive();
+      } else {
+        conn.handleAppResumed();
+      }
+    }
   }
 
   /// Scrolled to the top: page in older history (see [_loadOlder]).
@@ -136,7 +182,13 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       if (!mounted) return;
       final myId = UserSession.instance.userId?.toString();
       final older = page.messages
-          .map((m) => ChatMessage.fromApi(m, currentUserId: myId))
+          .map(
+            (m) => ChatMessage.fromApi(
+              m,
+              currentUserId: myId,
+              otherMemberIds: _otherMemberIds,
+            ),
+          )
           .where((m) => !_seenIds.contains(m.id))
           .toList();
       // Snapshot the scroll geometry before prepending so the view
@@ -148,12 +200,12 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       setState(() {
         _msgs.insertAll(0, older);
         _seenIds.addAll(older.map((m) => m.id));
+        // History never entrance-animates.
+        _animatedIds.addAll(older.map((m) => m.id));
         _nextBefore = page.nextBefore;
         _loadingOlder = false;
       });
-      for (final m in older) {
-        ChatDB.save(_convId, m).catchError((_) {});
-      }
+      ChatDB.saveAll(_convId, older).catchError((_) {});
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!_scrollCtrl.hasClients) return;
         final newExtent = _scrollCtrl.position.maxScrollExtent;
@@ -176,11 +228,19 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       final page = await ChatService.instance.listMessages(_convId);
       if (!mounted) return;
       final apiMsgs = page.messages
-          .map((m) => ChatMessage.fromApi(m, currentUserId: myId))
+          .map(
+            (m) => ChatMessage.fromApi(
+              m,
+              currentUserId: myId,
+              otherMemberIds: _otherMemberIds,
+            ),
+          )
           .toList();
       setState(() {
         _msgs.addAll(apiMsgs);
         _seenIds.addAll(apiMsgs.map((m) => m.id));
+        // History never entrance-animates.
+        _animatedIds.addAll(apiMsgs.map((m) => m.id));
         _nextBefore = page.nextBefore;
         _loadingHistory = false;
       });
@@ -189,10 +249,10 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         widget.conversation.lastMsg = apiMsgs.last.previewText;
         widget.conversation.time = apiMsgs.last.time;
       }
-      // Cache for offline use.
-      for (final m in apiMsgs) {
-        ChatDB.save(_convId, m).catchError((_) {});
-      }
+      // Heal the cache: upsert the server messages and drop stale
+      // orphan undated rows (see ChatDB.syncRoom) so a pre-v3 row
+      // with createdAt NULL can't live forever under the wrong day.
+      ChatDB.syncRoom(_convId, apiMsgs).catchError((_) {});
       // Mark the room read server-side so the unread badge stays
       // cleared across devices and app restarts (best-effort).
       await ChatService.instance.markRoomRead(_convId);
@@ -207,6 +267,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       setState(() {
         _msgs.addAll(saved);
         _seenIds.addAll(saved.map((m) => m.id));
+        _animatedIds.addAll(saved.map((m) => m.id));
         _loadingHistory = false;
         _loadError = saved.isEmpty ? e.message : null;
       });
@@ -220,40 +281,87 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
 
   /// Open the live WebSocket connection for this room.
   Future<void> _connectLive() async {
+    // In-flight guard: without it, rapid taps launch multiple
+    // concurrent connectRoom()s that leak connections, timers and
+    // subscriptions.
+    if (_connectingLive) return;
+    _connectingLive = true;
     try {
-      _connection = await ChatService.instance.connectRoom(_convId);
-    } on ApiException catch (e) {
-      // The connection never opened, so no state event will ever
-      // fire — set the failed state here or the reconnect banner
-      // never shows and the user has no way to retry.
-      if (mounted) {
-        setState(() => _connFailed = true);
-        _toast('${e.message} Live updates are off.');
+      // Cancel the old subscriptions and close the old connection
+      // BEFORE replacing them.
+      await _msgSub?.cancel();
+      await _errSub?.cancel();
+      await _stateSub?.cancel();
+      await _timeoutSub?.cancel();
+      await _readSub?.cancel();
+      _msgSub = _errSub = _stateSub = _timeoutSub = _readSub = null;
+      final old = _connection;
+      _connection = null;
+      await old?.close();
+      ChatRoomConnection connection;
+      try {
+        connection = await ChatService.instance.connectRoom(_convId);
+      } catch (e) {
+        // The connection never opened, so no state event will ever
+        // fire — set the failed state here or the reconnect banner
+        // never shows and the user has no way to retry. Catch
+        // broadly: anything the connect throws (not just
+        // ApiException) must land here.
+        if (mounted) {
+          setState(() => _connState = ChatConnectionState.failed);
+          _toast(
+            '${e is ApiException ? e.message : 'Could not connect.'} '
+            'Live updates are off.',
+          );
+        }
+        return;
       }
-      return;
-    }
-    _msgSub = _connection!.messages.listen(_onLiveMessage);
-    _errSub = _connection!.errors.listen((e) {
-      if (mounted) _toast(e);
-    });
-    _stateSub = _connection!.states.listen((s) {
-      if (!mounted) return;
-      setState(() {
-        _wsLive = s == ChatConnectionState.connected;
-        if (s == ChatConnectionState.failed) _connFailed = true;
-        if (s == ChatConnectionState.connected) _connFailed = false;
+      // Mounted check after the await: a post-dispose connection
+      // would never be closed.
+      if (!mounted) {
+        await connection.close();
+        return;
+      }
+      _connection = connection;
+      _msgSub = connection.messages.listen(_onLiveMessage);
+      _errSub = connection.errors.listen((e) {
+        if (mounted) _toast(e);
       });
-      if (s == ChatConnectionState.failed) {
-        _toast('Live connection lost. Tap Reconnect to try again.');
+      _stateSub = connection.states.listen((s) {
+        if (!mounted) return;
+        setState(() {
+          _connState = s;
+          _wsLive = s == ChatConnectionState.connected;
+        });
+        if (s == ChatConnectionState.connected) {
+          _flushQueue();
+        } else if (s == ChatConnectionState.failed) {
+          // Single toast for the failed transition — the service
+          // deliberately emits no errors-stream toast here, or the
+          // user sees two identical toasts. The text is honest: it
+          // does not claim "reconnecting" when the budget is spent
+          // (the long-tail retry still runs in the background).
+          _toast('Not connected. Tap to retry.');
+        }
+      });
+      _timeoutSub = connection.sendTimeouts.listen(_onSendTimeout);
+      _readSub = connection.readReceipts.listen(_onReadReceipt);
+      // The connection may already be connected (fast handshake) —
+      // sync the banner state now.
+      if (mounted) {
+        setState(() => _connState = connection.currentState);
       }
-    });
+    } finally {
+      _connectingLive = false;
+    }
   }
 
-  /// Manual reconnect from the "Connection lost" banner. Reuses the
+  /// Manual reconnect from the "Not connected" banner. Reuses the
   /// live connection when there is one; otherwise opens a fresh one.
+  /// The banner only hides on `connected` (see the state listener)
+  /// — never before the attempt completes.
   Future<void> _reconnectLive() async {
     final conn = _connection;
-    setState(() => _connFailed = false);
     if (conn == null) {
       await _connectLive();
       return;
@@ -280,8 +388,13 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   void _onLiveMessage(ChatApiMessage apiMsg) {
     if (_seenIds.contains(apiMsg.id)) return;
     final myId = UserSession.instance.userId?.toString();
-    final msg = ChatMessage.fromApi(apiMsg, currentUserId: myId);
+    final msg = ChatMessage.fromApi(
+      apiMsg,
+      currentUserId: myId,
+      otherMemberIds: _otherMemberIds,
+    );
     ChatMessage? toSave;
+    String? deleteId;
     setState(() {
       _seenIds.add(apiMsg.id);
       if (msg.fromMe) {
@@ -292,9 +405,11 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         if (idx >= 0) {
           final old = _msgs[idx];
           _pending.remove(old);
+          _queuedIds.remove(old.id);
           // Keep the local rendering (e.g. big emoji) of my message,
-          // and the local-only reply quote and forward flag — the
-          // backend has no replies, so the echo would drop them.
+          // and the local-only forward flag — the echo would drop
+          // them. Prefer the SERVER reply quote when the broadcast
+          // carried one; fall back to the local quote.
           _msgs[idx] = ChatMessage(
             id: msg.id,
             text: msg.text,
@@ -303,10 +418,14 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
             createdAt: msg.createdAt,
             type: old.type,
             status: MessageStatus.delivered,
-            replyTo: old.replyTo,
+            replyTo: msg.replyTo ?? old.replyTo,
             isForwarded: old.isForwarded,
           );
           toSave = _msgs[idx];
+          // The optimistic row (local id) must not survive: the echo
+          // saves under the server id, and the stale row would
+          // resurface as a duplicate on cache fallback.
+          deleteId = old.id;
           return;
         }
       }
@@ -314,20 +433,163 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       widget.conversation.lastMsg = msg.previewText;
       widget.conversation.time = msg.time;
       toSave = msg;
+      if (!msg.fromMe) _scheduleMarkRead();
     });
+    if (deleteId != null) ChatDB.delete(deleteId!).catchError((_) {});
     if (toSave != null) ChatDB.save(_convId, toSave!).catchError((_) {});
     _scrollDown();
   }
 
+  /// Mark the room read server-side for incoming live messages
+  /// (debounced 2s) — previously only the initial load marked the
+  /// room read, so messages arriving in an open thread stayed unread
+  /// server-side until the thread was reopened.
+  void _scheduleMarkRead() {
+    _markReadTimer?.cancel();
+    _markReadTimer = Timer(const Duration(seconds: 2), () {
+      ChatService.instance.markRoomReadLocally(_convId);
+      unawaited(ChatService.instance.markRoomRead(_convId));
+    });
+  }
+
+  /// A send's server echo never arrived (half-open socket): mark the
+  /// optimistic message failed — tapping it retries — instead of
+  /// leaving it "sending" forever.
+  void _onSendTimeout(String sendId) {
+    final msg = _sendIds.remove(sendId);
+    if (msg == null || !mounted) return;
+    setState(() {
+      _pending.remove(msg);
+      msg.sendFailed = true;
+    });
+  }
+
+  /// A `chat.read` broadcast: when the PEER read the room, flip my
+  /// own messages to read. My own receipts are ignored. Groups need
+  /// ALL members to read (see ChatMessage.fromApi), so a single
+  /// reader's receipt only flips ticks in 1:1 rooms; in groups the
+  /// ticks update on the next REST load via read_by.
+  void _onReadReceipt(({String roomId, String readerId}) receipt) {
+    if (receipt.roomId != _convId) return;
+    final myId = UserSession.instance.userId?.toString();
+    if (receipt.readerId == myId) return;
+    if (_otherMemberIds.length != 1) return;
+    if (!mounted) return;
+    var changed = false;
+    for (final m in _msgs) {
+      if (m.fromMe && m.status != MessageStatus.read) {
+        m.status = MessageStatus.read;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    setState(() {});
+    for (final m in _msgs.where((m) => m.fromMe)) {
+      ChatDB.update(_convId, m).catchError((_) {});
+    }
+  }
+
+  /// Flush the outgoing queue IN ORDER now that the socket is live.
+  /// Stops at the first failure — the rest stay queued for the next
+  /// reconnect.
+  Future<void> _flushQueue() async {
+    if (_outgoingQueue.isEmpty) return;
+    final conn = _connection;
+    if (conn == null || !_wsLive) return;
+    while (_outgoingQueue.isNotEmpty) {
+      if (!mounted) return;
+      final item = _outgoingQueue.first;
+      final msg = item.message;
+      try {
+        final sendId = await conn.sendText(
+          msg.text,
+          replyToId: item.replyToId,
+          replyToText: item.replyToText,
+        );
+        _sendIds[sendId] = msg;
+        setState(() {
+          _outgoingQueue.removeAt(0);
+          _queuedIds.remove(msg.id);
+          _pending.add(msg);
+        });
+      } on ApiException {
+        return; // Stays queued; the next reconnect flushes again.
+      }
+    }
+  }
+
+  /// Enqueue an outgoing message while disconnected: the optimistic
+  /// bubble shows immediately with a "sending…" clock, and the send
+  /// flushes in order on reconnect. Also kicks off a reconnect.
+  void _enqueue(
+    ChatMessage msg, {
+    String? replyToId,
+    String? replyToText,
+  }) {
+    setState(() {
+      if (!_msgs.contains(msg)) _msgs.add(msg);
+      _queuedIds.add(msg.id);
+      _outgoingQueue.add(
+        _QueuedSend(
+          message: msg,
+          replyToId: replyToId,
+          replyToText: replyToText,
+        ),
+      );
+    });
+    _scrollDown();
+    _kickReconnect();
+    _toast('Not connected — message queued, will send on reconnect.');
+  }
+
+  /// Retry a failed send (tap the failed bubble). The message goes
+  /// back to pending — or back to the queue when still offline.
+  Future<void> _retrySend(ChatMessage msg) async {
+    if (!msg.sendFailed) return;
+    setState(() => msg.sendFailed = false);
+    if (_connection == null || !_wsLive) {
+      _enqueue(msg);
+      return;
+    }
+    setState(() => _pending.add(msg));
+    try {
+      final sendId = await _connection!.sendText(msg.text);
+      _sendIds[sendId] = msg;
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _pending.remove(msg);
+        msg.sendFailed = true;
+      });
+      _toast(e.message);
+    }
+  }
+
+  /// The quoted message's SERVER id, or null when it has none yet
+  /// (a local optimistic id is digits-only; server ids are 24-hex).
+  /// Replies to not-yet-echoed messages still send the text snippet,
+  /// just without the id.
+  String? _serverIdOf(ChatMessage? quoted) {
+    final id = quoted?.id;
+    if (id == null) return null;
+    if (RegExp(r'^[0-9a-f]{24}$').hasMatch(id)) return id;
+    return null;
+  }
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _msgSub?.cancel();
     _errSub?.cancel();
     _stateSub?.cancel();
+    _timeoutSub?.cancel();
+    _readSub?.cancel();
+    _markReadTimer?.cancel();
     _connection?.close();
     _msgCtrl.dispose(); _scrollCtrl.dispose();
     _sendCtrl.dispose(); _recCtrl.dispose();
     _recTimer?.cancel();
+    _recSecondsNotifier.dispose();
     unawaited(_recorder.dispose());
     super.dispose();
   }
@@ -336,47 +598,66 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   // Sends go over the WebSocket; the server broadcasts the saved message
   // back to the room (including us) and [_onLiveMessage] renders it. The
   // message below is optimistic — it is replaced by the server echo.
-  // Note: the backend has no reply threading, so a reply quote only
-  // shows on this device until the echo arrives.
+  // Replies travel in the frame (reply_to_id / reply_to_text) and the
+  // echo carries the server quote back; the local quote is the fallback.
+  // Sends made while disconnected are QUEUED ([_enqueue]) and flush in
+  // order on reconnect — never dropped.
   Future<void> _send() async {
     final text = _msgCtrl.text.trim();
     if (text.isEmpty) return;
-    if (_connection == null || !_wsLive) {
-      // Kick off a reconnect instead of silently dropping the send.
-      _kickReconnect();
-      _toast('Not connected — reconnecting. Please try again in a moment.');
-      return;
-    }
+    final replyTo = _replyTo;
+    final replyId = _serverIdOf(replyTo);
+    final replyText = replyTo?.previewText;
     _sendCtrl.forward().then((_) => _sendCtrl.reverse());
     final msg = ChatMessage(
       id: _mkId(), text: text, fromMe: true,
       time: _fmt(DateTime.now()), createdAt: DateTime.now(),
       type: MessageType.text,
-      replyTo: _replyTo, status: MessageStatus.sent,
+      replyTo: replyTo, status: MessageStatus.sent,
     );
+    if (_connection == null || !_wsLive) {
+      // Queue it — the typed text lives on in the queued bubble.
+      setState(() { _msgCtrl.clear(); _typing = false; _showEmoji = false; _replyTo = null; });
+      _enqueue(msg, replyToId: replyId, replyToText: replyText);
+      return;
+    }
     setState(() { _msgs.add(msg); _pending.add(msg); _msgCtrl.clear(); _typing = false; _showEmoji = false; _replyTo = null; });
     _scrollDown();
     try {
-      await _connection!.sendText(text);
+      final sendId = await _connection!.sendText(
+        text,
+        replyToId: replyId,
+        replyToText: replyText,
+      );
+      _sendIds[sendId] = msg;
     } on ApiException catch (e) {
       if (!mounted) return;
-      setState(() { _msgs.remove(msg); _pending.remove(msg); });
+      // Restore the typed text — the input was already cleared, and
+      // on the race path the message must not just vanish.
+      setState(() {
+        _msgs.remove(msg);
+        _pending.remove(msg);
+        _msgCtrl.text = text;
+        _typing = true;
+      });
       _toast(e.message);
     }
   }
 
   Future<void> _sendEmoji(String e) async {
+    RecentEmojis.record(e);
+    final msg = ChatMessage(id: _mkId(), text: e, fromMe: true, time: _fmt(DateTime.now()), createdAt: DateTime.now(), type: MessageType.emoji);
     if (_connection == null || !_wsLive) {
-      _kickReconnect();
-      _toast('Not connected — reconnecting. Please try again in a moment.');
+      setState(() => _showEmoji = false);
+      _enqueue(msg);
       return;
     }
-    final msg = ChatMessage(id: _mkId(), text: e, fromMe: true, time: _fmt(DateTime.now()), createdAt: DateTime.now(), type: MessageType.emoji);
     setState(() { _msgs.add(msg); _pending.add(msg); _showEmoji = false; });
     _scrollDown();
     try {
       // Emoji travel as plain text; the server has no emoji type.
-      await _connection!.sendText(e);
+      final sendId = await _connection!.sendText(e);
+      _sendIds[sendId] = msg;
     } on ApiException catch (err) {
       if (!mounted) return;
       setState(() { _msgs.remove(msg); _pending.remove(msg); });
@@ -403,9 +684,14 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       );
       _recordingPath = path;
       _recSeconds = 0;
+      _recSecondsNotifier.value = 0;
+      _recCtrl.repeat(reverse: true);
       _recTimer?.cancel();
       _recTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (mounted) setState(() => _recSeconds++);
+        // Scoped to the overlay via the notifier — no full-screen
+        // setState every second.
+        _recSeconds++;
+        _recSecondsNotifier.value = _recSeconds;
       });
       setState(() => _recording = true);
     } catch (_) {
@@ -417,6 +703,8 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   /// a voice-note file message; otherwise discard it.
   Future<void> _finishRecording({required bool send}) async {
     _recTimer?.cancel();
+    _recCtrl.stop();
+    _recCtrl.reset();
     String? path;
     try {
       path = await _recorder.stop();
@@ -464,23 +752,47 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   /// over the WebSocket, so the other side actually receives it.
   /// The appointment id is embedded (`📅 Appointment [id]: …`) so
   /// [ChatMessage.fromApi] can render it as a card whose "View
-  /// Appointment" button opens the real appointment.
+  /// Appointment" button opens the real appointment. While
+  /// disconnected the card is queued like any other send.
   Future<void> _shareAppointment(Appointment appt) async {
-    if (_connection == null || !_wsLive) {
-      _kickReconnect();
-      _toast('Not connected — reconnecting. Please try again in a moment.');
-      return;
-    }
     final date = DateFormat('EEEE, MMM d').format(appt.dateTime);
     final time = DateFormat('h:mm a').format(appt.dateTime);
     final idPart = appt.id != null ? ' [${appt.id}]' : '';
     final text =
         '📅 Appointment$idPart: ${appt.name} — ${appt.service}\n'
         '$date at $time • ${appt.status.name}';
+    final card = ChatMessage(
+      id: _mkId(),
+      text: text,
+      fromMe: true,
+      time: _fmt(DateTime.now()),
+      createdAt: DateTime.now(),
+      type: MessageType.appointment,
+      appointmentId: appt.id,
+      appointmentTitle: appt.name,
+      appointmentDate: date,
+      appointmentTime: time,
+      status: MessageStatus.sent,
+    );
+    if (_connection == null || !_wsLive) {
+      _enqueue(card);
+      return;
+    }
+    setState(() {
+      _msgs.add(card);
+      _pending.add(card);
+    });
+    _scrollDown();
     try {
-      await _connection!.sendText(text);
+      final sendId = await _connection!.sendText(text);
+      _sendIds[sendId] = card;
     } on ApiException catch (e) {
-      if (mounted) _toast(e.message);
+      if (!mounted) return;
+      setState(() {
+        _msgs.remove(card);
+        _pending.remove(card);
+      });
+      _toast(e.message);
     }
   }
 
@@ -548,7 +860,11 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       );
       if (!mounted) return;
       final myId = UserSession.instance.userId?.toString();
-      final msg = ChatMessage.fromApi(apiMsg, currentUserId: myId);
+      final msg = ChatMessage.fromApi(
+        apiMsg,
+        currentUserId: myId,
+        otherMemberIds: _otherMemberIds,
+      );
       setState(() {
         _seenIds.add(apiMsg.id);
         _msgs.add(msg);
@@ -616,7 +932,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       resizeToAvoidBottomInset: true,
       body: Column(children: [
         _buildHeader(c),
-        if (_connFailed) _reconnectBanner(),
+        if (_connState != ChatConnectionState.connected) _connectionBanner(),
         if (_loadError != null && _msgs.isEmpty)
           Expanded(child: Center(child: Padding(
             padding: const EdgeInsets.all(24),
@@ -654,10 +970,20 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
             itemCount: _msgs.length,
             itemBuilder: (_, i) {
               final msg = _msgs[i];
-              return Column(children: [
-                if (_showDateSeparator(i)) _dateSep(_dateLabel(msg.createdAt!)),
-                SwipeableMessage(onReply: () => setState(() => _replyTo = msg), child: _bubble(msg, c, i)),
-              ]);
+              final key = _msgKeys.putIfAbsent(msg.id, () => GlobalKey());
+              return Container(
+                key: key,
+                decoration: _highlightId == msg.id
+                    ? BoxDecoration(
+                        color: _accent.withOpacity(0.12),
+                        borderRadius: BorderRadius.circular(12),
+                      )
+                    : null,
+                child: Column(children: [
+                  if (_showDateSeparator(i)) _dateSep(_dateLabelForIndex(i)),
+                  SwipeableMessage(onReply: () => setState(() => _replyTo = msg), child: _bubble(msg, c, i)),
+                ]),
+              );
             },
           ),
           if (_loadingOlder)
@@ -756,42 +1082,64 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
     )),
   );
 
-  // ── "Connection lost" banner ─────────────────────────────────────────────
-  Widget _reconnectBanner() => Container(
-    width: double.infinity,
-    color: const Color(0xFFE05C5C).withOpacity(0.12),
-    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-    child: Row(children: [
-      const Icon(Icons.wifi_off_rounded, color: Color(0xFFE05C5C), size: 18),
-      const SizedBox(width: 10),
-      Expanded(
-        child: Text(
-          'Connection lost',
-          style: GoogleFonts.dmSans(
-            fontSize: 13,
-            fontWeight: FontWeight.w700,
-            color: const Color(0xFFE05C5C),
+  // ── Honest connection-state banner ───────────────────────────────────────
+  // Slim banner distinguishing connecting / reconnecting / failed /
+  // closed — visible until actually connected, never hidden early.
+  Widget _connectionBanner() {
+    final failed = _connState == ChatConnectionState.failed;
+    final label = switch (_connState) {
+      ChatConnectionState.connecting => 'Connecting…',
+      ChatConnectionState.reconnecting => 'Reconnecting…',
+      ChatConnectionState.failed => 'Not connected',
+      ChatConnectionState.closed => 'Connection closed',
+      ChatConnectionState.connected => '',
+    };
+    return Container(
+      width: double.infinity,
+      color: failed
+          ? const Color(0xFFE05C5C).withOpacity(0.12)
+          : _cardBg,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(children: [
+        if (failed)
+          const Icon(Icons.wifi_off_rounded, color: Color(0xFFE05C5C), size: 18)
+        else
+          SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2, color: _txtSub),
+          ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(
+            label,
+            style: GoogleFonts.dmSans(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: failed ? const Color(0xFFE05C5C) : _txtSub,
+            ),
           ),
         ),
-      ),
-      TextButton(
-        onPressed: _reconnectLive,
-        style: TextButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-          minimumSize: Size.zero,
-          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        ),
-        child: Text(
-          'Tap to reconnect',
-          style: GoogleFonts.dmSans(
-            fontSize: 13,
-            fontWeight: FontWeight.w800,
-            color: const Color(0xFFE05C5C),
+        if (failed)
+          TextButton(
+            onPressed: _reconnectLive,
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            child: Text(
+              'Tap to retry',
+              style: GoogleFonts.dmSans(
+                fontSize: 13,
+                fontWeight: FontWeight.w800,
+                color: const Color(0xFFE05C5C),
+              ),
+            ),
           ),
-        ),
-      ),
-    ]),
-  );
+      ]),
+    );
+  }
 
   /// Start a real call with the other party in this chat (same flow
   /// as the New Call screen). Group chats and rooms with no known
@@ -819,17 +1167,25 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
 
   // ── Date separator ─────────────────────────────────────────────────────────
   /// A separator goes above the first message and above the first
-  /// message of each new day. Messages without a known date (old
-  /// cached rows that predate the column) get none.
+  /// message of each new (effective) day. Messages without a known
+  /// date take their nearest dated neighbour's date (see
+  /// [DateSeparators]) — they never silently merge into the previous
+  /// day's group.
   bool _showDateSeparator(int i) {
-    final createdAt = _msgs[i].createdAt;
-    if (createdAt == null) return false;
-    if (i == 0) return true;
-    final prev = _msgs[i - 1].createdAt;
-    if (prev == null) return true;
-    final a = createdAt.toLocal();
-    final b = prev.toLocal();
-    return a.year != b.year || a.month != b.month || a.day != b.day;
+    return DateSeparators.showSeparator(
+      _msgs.map((m) => m.createdAt).toList(),
+      i,
+    );
+  }
+
+  /// Label for the separator above message [i]: its effective date.
+  String _dateLabelForIndex(int i) {
+    final effective = DateSeparators.effectiveDate(
+      _msgs.map((m) => m.createdAt).toList(),
+      i,
+    );
+    if (effective == null) return 'Messages';
+    return _dateLabel(effective);
   }
 
   /// "Today" / "Yesterday" / "Nov 18, 2026" for a separator.
@@ -855,6 +1211,14 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       Expanded(child: Divider(color: _border, height: 1)),
     ]),
   );
+
+  /// True the first time a message is built (live arrivals only —
+  /// history ids are pre-marked in [_animatedIds] on load).
+  bool _isNewlyArriving(ChatMessage msg) {
+    if (_animatedIds.contains(msg.id)) return false;
+    _animatedIds.add(msg.id);
+    return true;
+  }
 
   // ── Message bubble ─────────────────────────────────────────────────────────
   Widget _bubble(ChatMessage msg, ChatConversation c, int idx) {
@@ -885,13 +1249,19 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
 
     return TweenAnimationBuilder<double>(
       tween: Tween(begin: 0.0, end: 1.0),
-      duration: Duration(milliseconds: 220 + (math.min(idx, 8) * 25)),
+      // Entrance animation ONLY for newly arriving messages —
+      // history is pre-marked in [_animatedIds] on load, so opening
+      // a thread no longer re-animates every bubble.
+      duration: _isNewlyArriving(msg)
+          ? Duration(milliseconds: 220 + (math.min(idx, 8) * 25))
+          : Duration.zero,
       curve: Curves.easeOutCubic,
       builder: (_, v, child) => Transform.translate(
         offset: Offset(isMe ? (1 - v) * 18 : (1 - v) * -18, 0),
         child: Opacity(opacity: v, child: child),
       ),
       child: GestureDetector(
+        onTap: msg.sendFailed ? () => _retrySend(msg) : null,
         onLongPress: () => _msgMenu(msg, c),
         child: Padding(
           padding: EdgeInsets.only(bottom: 4, top: showAv && !isMe ? 8 : 0),
@@ -927,7 +1297,7 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
                 if (msg.reactions.isNotEmpty)
                   Transform.translate(offset: const Offset(0, -4),
                       child: GestureDetector(
-                        onTap: () => _showReactionDetails(msg, c),
+                        onTap: () => _showReactionDetails(msg),
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
                           decoration: BoxDecoration(color: _cardBg, borderRadius: BorderRadius.circular(12),
@@ -950,6 +1320,21 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
                 const SizedBox(height: 2),
                 Row(mainAxisSize: MainAxisSize.min, children: [
                   if (msg.isStarred) const Padding(padding: EdgeInsets.only(right: 4), child: Icon(Icons.star_rounded, size: 11, color: Color(0xFFFFD700))),
+                  // Queued (not yet sent): clock + "sending…" so the
+                  // user sees what will go out on reconnect.
+                  if (_queuedIds.contains(msg.id)) ...[
+                    Icon(Icons.schedule_rounded, size: 11, color: _txtSub.withOpacity(0.7)),
+                    const SizedBox(width: 3),
+                    Text('sending…', style: GoogleFonts.dmSans(fontSize: 10, color: _txtSub.withOpacity(0.7))),
+                    const SizedBox(width: 6),
+                  ],
+                  // Failed (echo timed out): tap the bubble to retry.
+                  if (msg.sendFailed) ...[
+                    const Icon(Icons.error_outline_rounded, size: 12, color: Color(0xFFE05C5C)),
+                    const SizedBox(width: 3),
+                    Text('Failed — tap to retry', style: GoogleFonts.dmSans(fontSize: 10, fontWeight: FontWeight.w700, color: const Color(0xFFE05C5C))),
+                    const SizedBox(width: 6),
+                  ],
                   Text(msg.time, style: GoogleFonts.dmSans(fontSize: 10, color: _txtSub.withOpacity(0.7))),
                   if (isMe) ...[const SizedBox(width: 4), _tick(msg.status)],
                 ]),
@@ -1071,9 +1456,12 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   );
 
   /// Open the appointment behind a shared card. The id is embedded
-  /// in the share text; when it can't be resolved (old share, or the
-  /// appointment is gone) fall back to My Appointments.
-  void _openAppointment(ChatMessage msg) {
+  /// in the share text. Local lookup first; when the receiver
+  /// doesn't have it locally, fetch it from the API; when that fails
+  /// too (not a participant, or gone), show a read-only detail view
+  /// built from the card's own title/date/time instead of dumping
+  /// the user on the appointments list.
+  Future<void> _openAppointment(ChatMessage msg) async {
     final id = msg.appointmentId;
     Appointment? appt;
     if (id != null) {
@@ -1082,6 +1470,14 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       ).appointments.where((a) => a.id == id);
       if (matches.isNotEmpty) appt = matches.first;
     }
+    if (appt == null && id != null) {
+      try {
+        appt = await AppointmentService.instance.getAppointment(id);
+      } catch (_) {
+        appt = null;
+      }
+    }
+    if (!mounted) return;
     if (appt != null) {
       Navigator.push(
         context,
@@ -1089,12 +1485,53 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
           builder: (_) => AppointmentDetailScreen(appointment: appt!),
         ),
       );
-    } else {
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => const MyAppointmentsScreen()),
-      );
+      return;
     }
+    final title = msg.appointmentTitle ?? 'Consultation';
+    final date = msg.appointmentDate ?? '';
+    final time = msg.appointmentTime ?? '';
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: _cardBg,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text(
+          title,
+          style: GoogleFonts.dmSans(
+            fontWeight: FontWeight.w800,
+            color: _txtMain,
+          ),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (date.isNotEmpty)
+              Text(date, style: GoogleFonts.dmSans(color: _txtSub)),
+            if (time.isNotEmpty)
+              Text(time, style: GoogleFonts.dmSans(color: _txtSub)),
+            const SizedBox(height: 8),
+            Text(
+              'Shared in this chat. The full appointment isn\'t '
+              'available on this device.',
+              style: GoogleFonts.dmSans(fontSize: 12, color: _txtSub),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text(
+              'Close',
+              style: GoogleFonts.dmSans(
+                color: _accent,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   /// Photo message: the image with rounded corners; tap opens it
@@ -1230,9 +1667,10 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   }
 
   // ── Recording overlay ──────────────────────────────────────────────────────
+  // The ticking timer and waveform listen to [_recSecondsNotifier]
+  // directly, so the 1s tick rebuilds only this overlay — not the
+  // whole thread.
   Widget _recordingOverlay() {
-    final mins = _recSeconds ~/ 60;
-    final secs = (_recSeconds % 60).toString().padLeft(2, '0');
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       decoration: BoxDecoration(color: _cardBg, border: Border(top: BorderSide(color: _border, width: 1)),
@@ -1246,20 +1684,30 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
             ),
             child: const Icon(Icons.mic_rounded, color: Color(0xFFE05C5C), size: 22))),
         const SizedBox(width: 14),
-        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Recording...', style: GoogleFonts.dmSans(fontSize: 13, fontWeight: FontWeight.w700, color: const Color(0xFFE05C5C))),
-          const SizedBox(height: 3),
-          AnimatedBuilder(animation: _recCtrl, builder: (_, __) => Row(children: [
-            ...List.generate(20, (i) {
-              final rng = math.Random(i * 13 + _recSeconds);
-              final h   = (0.2 + rng.nextDouble() * 0.8) * 18;
-              return Container(margin: const EdgeInsets.only(right: 2), width: 3, height: h,
-                  decoration: BoxDecoration(color: const Color(0xFFE05C5C).withOpacity(0.4 + _recCtrl.value * 0.5), borderRadius: BorderRadius.circular(2)));
-            }),
-          ])),
-        ])),
+        Expanded(child: ValueListenableBuilder<int>(
+          valueListenable: _recSecondsNotifier,
+          builder: (_, secs, __) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Recording...', style: GoogleFonts.dmSans(fontSize: 13, fontWeight: FontWeight.w700, color: const Color(0xFFE05C5C))),
+            const SizedBox(height: 3),
+            AnimatedBuilder(animation: _recCtrl, builder: (_, __) => Row(children: [
+              ...List.generate(20, (i) {
+                final rng = math.Random(i * 13 + secs);
+                final h   = (0.2 + rng.nextDouble() * 0.8) * 18;
+                return Container(margin: const EdgeInsets.only(right: 2), width: 3, height: h,
+                    decoration: BoxDecoration(color: const Color(0xFFE05C5C).withOpacity(0.4 + _recCtrl.value * 0.5), borderRadius: BorderRadius.circular(2)));
+              }),
+            ])),
+          ]),
+        )),
         const SizedBox(width: 12),
-        Text('$mins:$secs', style: GoogleFonts.dmSans(fontSize: 16, fontWeight: FontWeight.w800, color: const Color(0xFFE05C5C))),
+        ValueListenableBuilder<int>(
+          valueListenable: _recSecondsNotifier,
+          builder: (_, secs, __) {
+            final mins = secs ~/ 60;
+            final s = (secs % 60).toString().padLeft(2, '0');
+            return Text('$mins:$s', style: GoogleFonts.dmSans(fontSize: 16, fontWeight: FontWeight.w800, color: const Color(0xFFE05C5C)));
+          },
+        ),
         const SizedBox(width: 12),
         GestureDetector(
           onTap: () => _finishRecording(send: false),
@@ -1277,6 +1725,16 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         ),
       ]),
     );
+  }
+
+  /// Emojis for the selected tab: tab 0 ("Recent") shows the emojis
+  /// actually used this session (falling back to the defaults until
+  /// any are sent).
+  List<String> get _currentTabEmojis {
+    if (_emojiTab == 0 && RecentEmojis.recent.isNotEmpty) {
+      return RecentEmojis.recent;
+    }
+    return emojiCategories[_emojiTab].emojis;
   }
 
   // ── Emoji keyboard ─────────────────────────────────────────────────────────
@@ -1302,9 +1760,9 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       Expanded(child: GridView.builder(
           padding: const EdgeInsets.all(6),
           gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 8, mainAxisSpacing: 2, crossAxisSpacing: 2),
-          itemCount: emojiCategories[_emojiTab].emojis.length,
+          itemCount: _currentTabEmojis.length,
           itemBuilder: (_, i) {
-            final e = emojiCategories[_emojiTab].emojis[i];
+            final e = _currentTabEmojis[i];
             return GestureDetector(onTap: () => _sendEmoji(e),
                 child: Container(decoration: BoxDecoration(borderRadius: BorderRadius.circular(8)),
                     child: Center(child: Text(e, style: const TextStyle(fontSize: 22)))));
@@ -1470,7 +1928,13 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
             child: TextField(
               controller: _msgCtrl,
               onTap: () => setState(() => _showEmoji = false),
-              onChanged: (v) => setState(() => _typing = v.isNotEmpty),
+              onChanged: (v) {
+                // Only rebuild when the boolean actually changes —
+                // a setState per keystroke rebuilt the whole
+                // Scaffold (incl. the message list) on every key.
+                final typing = v.isNotEmpty;
+                if (typing != _typing) setState(() => _typing = typing);
+              },
               onSubmitted: (_) => _send(),
               maxLines: 4, minLines: 1,
               style: GoogleFonts.dmSans(fontSize: 14, color: _txtMain, fontWeight: FontWeight.w500),
@@ -1508,10 +1972,10 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
               onLongPressEnd: (_) {
                 if (_recording) _finishRecording(send: true);
               },
-              child: AnimatedBuilder(animation: _recCtrl, builder: (_, __) => Container(width: 44, height: 44,
+              child: Container(width: 44, height: 44,
                   decoration: BoxDecoration(color: _bg, borderRadius: BorderRadius.circular(14),
                       border: Border.all(color: _border, width: 1.5)),
-                  child: Icon(Icons.mic_rounded, color: _txtSub, size: 20)))),
+                  child: Icon(Icons.mic_rounded, color: _txtSub, size: 20))),
         ),
       ]),
     );
@@ -1555,6 +2019,9 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
                                 decoration: BoxDecoration(color: _accent, shape: BoxShape.circle))),
                           ])));
                 }).toList())),
+            Padding(padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+                child: Text('Reactions are only visible on this device.',
+                    style: GoogleFonts.dmSans(fontSize: 11, color: _txtSub))),
             Divider(color: _border, height: 1),
             _mAction(Icons.reply_rounded,          'Reply',    () => setState(() => _replyTo = msg)),
             _mAction(Icons.shortcut_rounded,        'Forward',  () => _showForwardSheet(msg)),
@@ -1638,12 +2105,53 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
   ));
 
   // ── In-chat search (NEW FEATURE) ───────────────────────────────────────────
-  void _openSearch() {
-    Navigator.push(context, MaterialPageRoute(builder: (_) => ChatSearchScreen(messages: _msgs)));
+  /// Search, then jump to the tapped result in this thread.
+  Future<void> _openSearch() async {
+    final id = await Navigator.push<String?>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ChatSearchScreen(
+          messages: _msgs,
+          peerName: widget.conversation.name,
+        ),
+      ),
+    );
+    if (id != null && mounted) _scrollToMessage(id);
+  }
+
+  /// Jump to a message (from search): scroll it into view and flash
+  /// a highlight. Messages far outside the built range need a rough
+  /// jump first so the row gets built.
+  Future<void> _scrollToMessage(String id) async {
+    final idx = _msgs.indexWhere((m) => m.id == id);
+    if (idx < 0 || !_scrollCtrl.hasClients) return;
+    if (_msgKeys[id]?.currentContext == null) {
+      final extent = _scrollCtrl.position.maxScrollExtent;
+      _scrollCtrl.jumpTo(
+        (idx / _msgs.length * extent).clamp(0.0, extent),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      if (!mounted) return;
+    }
+    final ctx = _msgKeys[id]?.currentContext;
+    if (ctx != null) {
+      await Scrollable.ensureVisible(
+        ctx,
+        duration: const Duration(milliseconds: 350),
+        curve: Curves.easeOut,
+      );
+    }
+    if (!mounted) return;
+    setState(() => _highlightId = id);
+    Future<void>.delayed(const Duration(seconds: 2), () {
+      if (mounted && _highlightId == id) {
+        setState(() => _highlightId = null);
+      }
+    });
   }
 
   // ── Reaction details ───────────────────────────────────────────────────────
-  void _showReactionDetails(ChatMessage msg, ChatConversation c) {
+  void _showReactionDetails(ChatMessage msg) {
     showModalBottomSheet(context: context, backgroundColor: Colors.transparent,
         builder: (_) => Container(
           padding: const EdgeInsets.fromLTRB(20, 8, 20, 32),
@@ -1653,10 +2161,15 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
             Container(width: 40, height: 4, margin: const EdgeInsets.only(bottom: 14),
                 decoration: BoxDecoration(color: _txtSub.withOpacity(0.3), borderRadius: BorderRadius.circular(4))),
             Text('Reactions', style: GoogleFonts.dmSans(fontSize: 16, fontWeight: FontWeight.w800, color: _txtMain)),
+            const SizedBox(height: 4),
+            Text('Reactions are only visible on this device.',
+                style: GoogleFonts.dmSans(fontSize: 12, color: _txtSub)),
             const SizedBox(height: 16),
             ...msg.reactions.entries.map((e) => ListTile(
               leading: Text(e.key, style: const TextStyle(fontSize: 28)),
-              title: Text(e.key == msg.myReaction ? 'You' : c.name.split(' ').first,
+              // Reactions are local-only, so only my own reaction is
+              // ever attributed — never the peer's name.
+              title: Text(e.key == msg.myReaction ? 'You' : 'On this device',
                   style: GoogleFonts.dmSans(fontSize: 14, fontWeight: FontWeight.w600, color: _txtMain)),
               subtitle: Text('${e.value} reaction${e.value > 1 ? "s" : ""}',
                   style: GoogleFonts.dmSans(fontSize: 12, color: _txtSub)),
@@ -1675,8 +2188,11 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
 
   // ── Forward message ────────────────────────────────────────────────────────
   // Text/emoji/appointment forwards are sent for real over the live
-  // connection; the server echo renders them. Media and old
-  // device-only voice notes cannot be forwarded yet.
+  // connection; the server echo renders them. Forwards to ANOTHER
+  // room open a short-lived connection to that room and send the
+  // content as a new message there (the backend has no forward
+  // endpoint). Media and old device-only voice notes cannot be
+  // forwarded yet.
   String? _forwardText(ChatMessage original) {
     switch (original.type) {
       case MessageType.text:
@@ -1759,21 +2275,13 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
 
   Future<void> _forwardTo(ChatConversation target, ChatMessage original) async {
     Navigator.pop(context);
-    if (target.id != _convId) {
-      // Forwarding to another room needs a second live connection;
-      // not wired yet — say so honestly instead of showing a fake
-      // success dialog.
-      _toast('Forwarding to other chats is not available yet.');
-      return;
-    }
     final text = _forwardText(original);
     if (text == null || text.isEmpty) {
       _toast('This message can\'t be forwarded yet.');
       return;
     }
-    if (_connection == null || !_wsLive) {
-      _kickReconnect();
-      _toast('Not connected — reconnecting. Please try again in a moment.');
+    if (target.id != _convId) {
+      await _forwardToOtherRoom(target, text);
       return;
     }
     final fwd = ChatMessage(
@@ -1782,13 +2290,18 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
       type: MessageType.text,
       isForwarded: true, status: MessageStatus.sent,
     );
+    if (_connection == null || !_wsLive) {
+      _enqueue(fwd);
+      return;
+    }
     setState(() {
       _msgs.add(fwd);
       _pending.add(fwd);
     });
     _scrollDown();
     try {
-      await _connection!.sendText(text);
+      final sendId = await _connection!.sendText(text);
+      _sendIds[sendId] = fwd;
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() {
@@ -1796,6 +2309,44 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
         _pending.remove(fwd);
       });
       _toast(e.message);
+    }
+  }
+
+  /// Forward to ANOTHER room: open a short-lived connection to the
+  /// target room, wait for the handshake, send the content as a new
+  /// message there, then close it.
+  Future<void> _forwardToOtherRoom(ChatConversation target, String text) async {
+    ChatRoomConnection? conn;
+    try {
+      conn = await ChatService.instance.connectRoom(target.id);
+      if (conn.currentState == ChatConnectionState.failed) {
+        _toast('Could not connect to ${target.name}. Please try again.');
+        return;
+      }
+      if (conn.currentState != ChatConnectionState.connected) {
+        // Wait for the handshake (up to 20s) — sendText refuses
+        // before `connected`.
+        final state = await conn.states
+            .firstWhere(
+              (s) =>
+                  s == ChatConnectionState.connected ||
+                  s == ChatConnectionState.failed,
+            )
+            .timeout(
+              const Duration(seconds: 20),
+              onTimeout: () => ChatConnectionState.failed,
+            );
+        if (state != ChatConnectionState.connected) {
+          _toast('Could not connect to ${target.name}. Please try again.');
+          return;
+        }
+      }
+      await conn.sendText(text);
+      if (mounted) _toast('Forwarded to ${target.name}');
+    } catch (_) {
+      if (mounted) _toast('Could not forward to ${target.name}.');
+    } finally {
+      await conn?.close();
     }
   }
 
@@ -1808,6 +2359,10 @@ class _ChatThreadScreenState extends State<ChatThreadScreen>
             Container(width: 40, height: 4, margin: const EdgeInsets.only(bottom: 16),
                 decoration: BoxDecoration(color: _txtSub.withOpacity(0.3), borderRadius: BorderRadius.circular(4))),
             Text('Delete Message?', style: GoogleFonts.dmSans(fontSize: 17, fontWeight: FontWeight.w800, color: _txtMain)),
+            const SizedBox(height: 8),
+            Text('This only deletes the message on this device. It stays on the server and for the other person.',
+                textAlign: TextAlign.center,
+                style: GoogleFonts.dmSans(fontSize: 13, color: _txtSub)),
             const SizedBox(height: 20),
             _delBtn('Delete for me', const Color(0xFFE05C5C), () {
               // Local only: there is no server delete endpoint, so
@@ -1868,4 +2423,14 @@ class _FullScreenImageView extends StatelessWidget {
       ),
     ),
   );
+}
+
+/// One queued outgoing send: the optimistic message plus the reply
+/// context to send with it when the queue flushes.
+class _QueuedSend {
+  final ChatMessage message;
+  final String? replyToId;
+  final String? replyToText;
+
+  _QueuedSend({required this.message, this.replyToId, this.replyToText});
 }
