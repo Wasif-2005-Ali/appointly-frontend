@@ -9,6 +9,13 @@ import 'api_config.dart';
 import 'call_service.dart';
 import 'token_storage.dart';
 
+/// Thrown when the user dismisses the Google account picker without
+/// choosing an account. Cancelling is not an error, so callers should
+/// stay silent (no error snackbar) when they catch this.
+class GoogleSignInCancelledException implements Exception {
+  const GoogleSignInCancelledException();
+}
+
 /// High-level auth operations against `/api/v1/auth/`.
 ///
 /// Throws [ApiException] with a user-friendly message on failure.
@@ -49,6 +56,11 @@ class AuthService {
 
   /// POST /register/ — creates the account and returns the user map.
   /// Note: register does NOT return tokens, so call [login] afterwards.
+  /// Once this returns, the account EXISTS — if the follow-up [login]
+  /// then fails (e.g. a network blip), callers must send the user to
+  /// the login screen ("Account created — please sign in"), never
+  /// report "Registration failed" (retrying register would then fail
+  /// with "email already exists").
   Future<Map<String, dynamic>> register({
     required String fullName,
     required String email,
@@ -79,8 +91,9 @@ class AuthService {
 
   /// POST /google/ — Google Sign-In. Gets an ID token from the Google
   /// SDK and exchanges it for the JWT pair. Returns the user map, like
-  /// [login]. Throws [ApiException] when the user cancels or when the
-  /// backend rejects the token.
+  /// [login]. Throws [GoogleSignInCancelledException] when the user
+  /// dismisses the picker (not an error — stay silent), or
+  /// [ApiException] when the backend rejects the token.
   Future<Map<String, dynamic>> signInWithGoogle({String? profession}) async {
     if (ApiConfig.googleServerClientId.isEmpty) {
       throw const ApiException(
@@ -99,7 +112,8 @@ class AuthService {
       );
     }
     if (account == null) {
-      throw const ApiException('Google Sign-In was cancelled.');
+      // The user dismissed the picker — not an error.
+      throw const GoogleSignInCancelledException();
     }
     // Fetching the token can fail (e.g. no network) — keep it inside
     // the try/catch so the friendly Google error is shown, not the

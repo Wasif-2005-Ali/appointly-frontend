@@ -25,6 +25,21 @@ class SessionExpiredException extends ApiException {
     : super('Your session has expired. Please log in again.');
 }
 
+/// Outcome of a token refresh attempt.
+enum _RefreshResult {
+  /// New tokens were stored.
+  ok,
+
+  /// The refresh token was rejected (401) or is missing — the session
+  /// is really over and the stored tokens were cleared.
+  expired,
+
+  /// The refresh request failed for a non-auth reason (server 5xx,
+  /// dropped connection, ...). The stored tokens were kept: the
+  /// session may still be valid, so this must NOT log the user out.
+  transient,
+}
+
 /// Thin HTTP wrapper over the Appointly backend.
 ///
 /// - Attaches the stored access token as `Authorization: Bearer ...`.
@@ -43,8 +58,16 @@ class ApiClient {
 
   final http.Client _http = http.Client();
 
+  /// Called when a token refresh fails with 401, i.e. the session is
+  /// really over (not on transient refresh failures — those keep the
+  /// stored tokens). Registered by the app shell in `main.dart`, which
+  /// clears the session and sends the user to the login screen. A
+  /// callback (rather than a direct navigation) keeps this service
+  /// free of screen imports and avoids import cycles.
+  static void Function()? onSessionExpired;
+
   /// In-flight refresh, shared so parallel 401s only refresh once.
-  Future<bool>? _refreshFuture;
+  Future<_RefreshResult>? _refreshFuture;
 
   Map<String, String> get _jsonHeaders => {
     'Content-Type': 'application/json',
@@ -172,19 +195,41 @@ class ApiClient {
     final t = timeout ?? _timeout;
     var res = await _guarded(request, timeout: t);
     if (res.statusCode == 401 && retryOnAuth) {
-      final refreshed = await _refreshAccessToken();
-      if (!refreshed) throw const SessionExpiredException();
+      final result = await _refreshAccessToken();
+      if (result != _RefreshResult.ok) {
+        if (result == _RefreshResult.expired) {
+          // The session is really over — tell the app shell so it
+          // can clear the session and show the login screen.
+          onSessionExpired?.call();
+          throw const SessionExpiredException();
+        }
+        // Transient refresh failure (server 5xx, dropped
+        // connection): the tokens were kept, so this is not a
+        // session expiry — just a failed request.
+        throw const ApiException(
+          'Could not refresh your session. Please try again.',
+        );
+      }
       res = await _guarded(request, timeout: t);
-      if (res.statusCode == 401) throw const SessionExpiredException();
+      if (res.statusCode == 401) {
+        // Even a freshly refreshed token was rejected: the session
+        // is dead. Clear the tokens so nothing keeps retrying with
+        // them, and send the user back to login.
+        await TokenStorage.instance.clear();
+        onSessionExpired?.call();
+        throw const SessionExpiredException();
+      }
     }
     return res;
   }
 
   /// Runs [request] and converts transport failures into [ApiException].
-  /// A timeout is retried ONCE before throwing: the free-tier backend
-  /// takes ~30s to wake from a cold start, so the first call after idle
-  /// would otherwise always fail. (No retry on the 401 path — that is
-  /// handled by the token refresh in [_send].)
+  /// A timeout or a dropped connection is retried ONCE before throwing:
+  /// the free-tier backend takes ~30s to wake from a cold start, and
+  /// Render also drops connections mid-request fairly often, so the
+  /// first attempt after idle (or mid-request) would otherwise always
+  /// fail. (No retry on the 401 path — that is handled by the token
+  /// refresh in [_send] — and no retry on 4xx/5xx responses.)
   Future<http.Response> _guarded(
     Future<http.Response> Function() request, {
     Duration? timeout,
@@ -200,13 +245,20 @@ class ApiClient {
         }
         // First timeout — retry once (likely a cold start).
       } on SocketException {
-        throw const ApiException(
-          'Could not reach the server. Make sure the backend is running.',
-        );
+        if (attempt == 1) {
+          throw const ApiException(
+            'Connection dropped. Please try again.',
+          );
+        }
+        // First drop — retry once (Render drops connections
+        // mid-request on the free tier).
       } on http.ClientException {
-        throw const ApiException(
-          'Could not reach the server. Make sure the backend is running.',
-        );
+        if (attempt == 1) {
+          throw const ApiException(
+            'Connection dropped. Please try again.',
+          );
+        }
+        // First drop — retry once, as for SocketException.
       }
     }
     throw const ApiException(
@@ -214,14 +266,18 @@ class ApiClient {
     );
   }
 
-  Future<bool> _refreshAccessToken() {
+  Future<_RefreshResult> _refreshAccessToken() {
     _refreshFuture ??= _doRefresh().whenComplete(() => _refreshFuture = null);
     return _refreshFuture!;
   }
 
-  Future<bool> _doRefresh() async {
+  /// Refreshes the access token. Only a 401 clears the stored tokens:
+  /// any other failure (server 5xx, dropped connection, malformed
+  /// body) keeps them, because the session may still be valid and a
+  /// transient Render blip must not destroy it.
+  Future<_RefreshResult> _doRefresh() async {
     final refresh = await TokenStorage.instance.refreshToken;
-    if (refresh == null || refresh.isEmpty) return false;
+    if (refresh == null || refresh.isEmpty) return _RefreshResult.expired;
     try {
       final res = await _http
           .post(
@@ -230,13 +286,17 @@ class ApiClient {
             body: jsonEncode({'refresh': refresh}),
           )
           .timeout(_timeout);
-      if (res.statusCode != 200) {
+      if (res.statusCode == 401) {
         await TokenStorage.instance.clear();
-        return false;
+        return _RefreshResult.expired;
+      }
+      if (res.statusCode != 200) {
+        // Transient server failure — keep the tokens.
+        return _RefreshResult.transient;
       }
       final data = jsonDecode(res.body) as Map<String, dynamic>;
       final access = data['access'] as String?;
-      if (access == null || access.isEmpty) return false;
+      if (access == null || access.isEmpty) return _RefreshResult.transient;
       // Refresh-token rotation is enabled: store the new refresh token too.
       final newRefresh = data['refresh'] as String?;
       if (newRefresh != null && newRefresh.isNotEmpty) {
@@ -247,9 +307,10 @@ class ApiClient {
       } else {
         await TokenStorage.instance.saveAccessToken(access);
       }
-      return true;
+      return _RefreshResult.ok;
     } catch (_) {
-      return false;
+      // Dropped connection / timeout — keep the tokens.
+      return _RefreshResult.transient;
     }
   }
 

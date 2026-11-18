@@ -518,10 +518,14 @@ class CallService {
         queryParameters: {'token': token},
       );
       channel = WebSocketChannel.connect(uri);
-      // Give the socket a moment to open, then reject.
-      await Future.delayed(const Duration(milliseconds: 500));
+      // Wait for the handshake to complete before rejecting: on a
+      // slow network a fixed delay can fire before the socket is
+      // open, and the reject is then lost (the caller times out and
+      // the call shows as missed instead of rejected).
+      await channel.ready.timeout(const Duration(seconds: 10));
       channel.sink.add(jsonEncode({'type': 'call.reject'}));
-      await Future.delayed(const Duration(milliseconds: 500));
+      // Closing the sink flushes the queued frame before the close
+      // handshake, so the reject reaches the server (see finally).
     } catch (_) {
       // Best-effort — the caller's timeout handles the rest.
     } finally {
@@ -711,7 +715,7 @@ class CallConnection {
   // ------------------------------------------------------------------
 
   Future<void> _startOutgoing() async {
-    _connectSocket();
+    await _connectSocket();
     await _acquireMedia();
     _send({
       'type': 'call.initiate',
@@ -736,7 +740,7 @@ class CallConnection {
     // Get media first: if the camera/mic is unavailable there is no
     // point accepting the call.
     await _acquireMedia();
-    _connectSocket();
+    await _connectSocket();
     _send({'type': 'call.accept'});
     final completer = Completer<void>();
     _acceptCompleter = completer;
@@ -753,14 +757,26 @@ class CallConnection {
     await _createPeerConnection();
   }
 
-  void _connectSocket() {
-    _channel = WebSocketChannel.connect(_wsUri);
-    _subscription = _channel!.stream.listen(
+  /// Connects the call socket and waits for the handshake to
+  /// complete, so the first frame (`call.initiate` / `call.accept`)
+  /// is never sent on a socket that is still connecting. Throws
+  /// [ApiException] when the handshake does not complete in time.
+  Future<void> _connectSocket() async {
+    final channel = WebSocketChannel.connect(_wsUri);
+    _channel = channel;
+    _subscription = channel.stream.listen(
       _onData,
       onError: (_) => _onSocketClosed(),
       onDone: _onSocketClosed,
       cancelOnError: false,
     );
+    try {
+      await channel.ready.timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      throw const ApiException(
+        'Could not connect to the call server. Please try again.',
+      );
+    }
   }
 
   Future<void> _acquireMedia() async {
@@ -1080,8 +1096,30 @@ class CallConnection {
       return;
     }
     // Unexpected drop mid-call: the peer connection cannot be
-    // resumed without renegotiation, so end the call.
+    // resumed without renegotiation, so end the call. Tell the
+    // server first (best-effort) so the session does not stay live
+    // and the peer is not left hanging, then clean up locally.
+    unawaited(_endOnServerThenFinish());
+  }
+
+  Future<void> _endOnServerThenFinish() async {
+    await _endSessionOnServer();
     _finishWithReason(CallEndReason.connectionLost);
+  }
+
+  /// End the session server-side via REST, for when the signalling
+  /// socket is already gone. Best-effort and capped at 10s so a slow
+  /// backend never strands the local UI; any failure (offline,
+  /// already ended) is swallowed and local cleanup still proceeds.
+  Future<void> _endSessionOnServer() async {
+    if (!_sessionStarted) return;
+    try {
+      await ApiClient.instance
+          .post('${CallService._callRest}/$callId/end/')
+          .timeout(const Duration(seconds: 10));
+    } catch (_) {
+      // Offline or already ended — local cleanup still proceeds.
+    }
   }
 
   int? get _closeCode {
